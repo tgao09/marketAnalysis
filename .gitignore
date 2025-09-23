@@ -1,0 +1,8 @@
+.claude
+.venv
+arimaxresults
+dataset/stock_dataset.csv
+dataset/stock_dataset_with_lags.csv
+training_stocks.txt
+ClAUDE.md
+arimaxmodels
