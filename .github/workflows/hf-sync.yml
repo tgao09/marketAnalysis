@@ -23,6 +23,6 @@ jobs:
           git clone https://huggingface.co/spaces/tgao09/marketAnalysis hf-space
           rsync -av --delete --exclude='.git' ./ hf-space/
           cd hf-space
-          git add .
+          git add ./greenfield/arimax/
           git commit -m "Sync from GitHub repo" || echo "No changes to commit"
           git push https://user:$HF_TOKEN@huggingface.co/spaces/<USERNAME>/<SPACE_NAME> main
