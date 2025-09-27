@@ -228,7 +228,7 @@ if __name__ == "__main__":
     dataset = compile_stock_dataset(
         tickers_file='training_stocks.txt',
         years=3,
-        output_file='greenfield/dataset/stock_dataset.csv',
+        output_file='stock_dataset.csv',
         normalize=True
     )
 

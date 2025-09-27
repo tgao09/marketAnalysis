@@ -164,9 +164,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description='Create lagged features for time series analysis')
-    parser.add_argument('--input-file', type=str, default='greenfield/dataset/stock_dataset.csv',
+    parser.add_argument('--input-file', type=str, default='stock_dataset.csv',
                        help='Path to input CSV file (default: stock_dataset.csv)')
-    parser.add_argument('--output-file', type=str, default='greenfield/dataset/stock_dataset_with_lags.csv',
+    parser.add_argument('--output-file', type=str, default='stock_dataset_with_lags.csv',
                        help='Path to output CSV file (default: stock_dataset_with_lags.csv)')
     parser.add_argument('--n-lags', type=int, default=3,
                        help='Number of lag steps to create (default: 3)')
