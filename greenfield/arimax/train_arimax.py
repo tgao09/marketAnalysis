@@ -84,6 +84,11 @@ def prepare_training_data(data_file: str = '../dataset/stock_dataset_with_lags.c
     Returns:
         Loaded DataFrame
     """
+    # Handle relative paths - make them relative to script directory
+    if not os.path.isabs(data_file):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        data_file = os.path.join(script_dir, data_file)
+
     logger.info(f"Loading training data from {data_file}")
 
     if not os.path.exists(data_file):
@@ -162,8 +167,9 @@ def train_all_models(data_file: str = '../dataset/stock_dataset_with_lags.csv',
         valid_stocks = valid_stocks[:sample_stocks]
         logger.info(f"Training on sample of {sample_stocks} stocks: {valid_stocks}")
 
-    # Prepare arguments for parallel processing
-    training_args = [(ticker, df, train_size, models_dir, use_cv) for ticker in valid_stocks]
+    # Prepare arguments for parallel processing - filter data per ticker to reduce memory usage
+    training_args = [(ticker, df[df['ticker'] == ticker].copy(), train_size, models_dir, use_cv)
+                     for ticker in valid_stocks]
 
     # Train models in parallel
     results = []

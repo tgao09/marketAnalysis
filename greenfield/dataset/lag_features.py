@@ -6,7 +6,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def load_dataset(file_path: str = 'stock_dataset.csv') -> pd.DataFrame:
+def load_dataset(file_path: str = 'dataset/stock_dataset.csv') -> pd.DataFrame:
     """Load and validate the stock dataset CSV file."""
     try:
         df = pd.read_csv(file_path)
@@ -58,10 +58,10 @@ def validate_lag_parameters(n_lags: int, features_to_lag: List[str], df_columns:
     if invalid_features:
         raise ValueError(f"Cannot lag reserved columns: {invalid_features}")
 
-def create_lag_features(input_file: str = 'stock_dataset.csv',
+def create_lag_features(input_file: str = 'dataset/stock_dataset.csv',
                        n_lags: int = 3,
                        features_to_lag: List[str] = None,
-                       output_file: str = 'stock_dataset_with_lags.csv') -> pd.DataFrame:
+                       output_file: str = 'dataset/stock_dataset_with_lags.csv') -> pd.DataFrame:
     """
     Create lagged features for time series analysis.
 
@@ -164,10 +164,10 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description='Create lagged features for time series analysis')
-    parser.add_argument('--input-file', type=str, default='stock_dataset.csv',
-                       help='Path to input CSV file (default: stock_dataset.csv)')
-    parser.add_argument('--output-file', type=str, default='stock_dataset_with_lags.csv',
-                       help='Path to output CSV file (default: stock_dataset_with_lags.csv)')
+    parser.add_argument('--input-file', type=str, default='dataset/stock_dataset.csv',
+                       help='Path to input CSV file (default: dataset/stock_dataset.csv)')
+    parser.add_argument('--output-file', type=str, default='dataset/stock_dataset_with_lags.csv',
+                       help='Path to output CSV file (default: dataset/stock_dataset_with_lags.csv)')
     parser.add_argument('--n-lags', type=int, default=3,
                        help='Number of lag steps to create (default: 3)')
     parser.add_argument('--features', type=str, nargs='*',

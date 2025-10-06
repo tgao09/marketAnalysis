@@ -130,7 +130,7 @@ def normalize_features_per_stock(df: pd.DataFrame, features_to_normalize: List[s
 
 def compile_stock_dataset(tickers_file: str = 'training_stocks.txt',
                          years: int = 3,
-                         output_file: str = 'stock_dataset.csv',
+                         output_file: str = 'dataset/stock_dataset.csv',
                          normalize: bool = True) -> pd.DataFrame:
     """
     Compile weekly stock dataset for multiple tickers over specified years.
@@ -228,7 +228,7 @@ if __name__ == "__main__":
     dataset = compile_stock_dataset(
         tickers_file='training_stocks.txt',
         years=3,
-        output_file='stock_dataset.csv',
+        output_file='dataset/stock_dataset.csv',
         normalize=True
     )
 

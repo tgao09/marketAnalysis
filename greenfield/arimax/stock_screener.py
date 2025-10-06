@@ -78,7 +78,7 @@ class StockScreener:
         df['ci_width'] = np.maximum(df['ci_width'], 0.001)  # Minimum width to avoid division by zero
 
         # Signal-to-noise ratio
-        df['signal_to_noise'] = np.abs(df['predicted_return']) / df['ci_width']
+        df['precision_ratio'] = np.abs(df['predicted_return']) / df['ci_width']
 
         # Directional confidence - how confident we are in the direction
         # If CI includes zero, confidence is low
@@ -94,7 +94,7 @@ class StockScreener:
         # Overall screening score (combination of magnitude, signal-to-noise, and direction confidence)
         df['screening_score'] = (
             np.abs(df['predicted_return']) *  # Magnitude
-            df['signal_to_noise'] *           # Signal clarity
+            df['precision_ratio'] *           # Signal clarity
             (1 + df['direction_confidence'])  # Direction confidence boost
         )
 
@@ -153,7 +153,7 @@ class StockScreener:
             'long_positions': len(long_positions),
             'short_positions': len(short_positions),
             'avg_predicted_return': positions['predicted_return'].mean(),
-            'avg_signal_to_noise': positions['signal_to_noise'].mean(),
+            'avg_precision_ratio': positions['precision_ratio'].mean(),
             'avg_direction_confidence': positions['direction_confidence'].mean(),
             'return_range': {
                 'min': positions['predicted_return'].min(),
@@ -167,7 +167,7 @@ class StockScreener:
             summary['top_long_pick'] = {
                 'ticker': long_positions.loc[best_long_idx, 'ticker'],
                 'predicted_return': long_positions.loc[best_long_idx, 'predicted_return'],
-                'signal_to_noise': long_positions.loc[best_long_idx, 'signal_to_noise'],
+                'precision_ratio': long_positions.loc[best_long_idx, 'precision_ratio'],
                 'direction_confidence': long_positions.loc[best_long_idx, 'direction_confidence']
             }
 
@@ -176,7 +176,7 @@ class StockScreener:
             summary['top_short_pick'] = {
                 'ticker': short_positions.loc[best_short_idx, 'ticker'],
                 'predicted_return': short_positions.loc[best_short_idx, 'predicted_return'],
-                'signal_to_noise': short_positions.loc[best_short_idx, 'signal_to_noise'],
+                'precision_ratio': short_positions.loc[best_short_idx, 'precision_ratio'],
                 'direction_confidence': short_positions.loc[best_short_idx, 'direction_confidence']
             }
 
@@ -226,7 +226,7 @@ def format_position_output(positions: pd.DataFrame) -> None:
         print(f"\n{direction:>5} | {row['ticker']:>6} | Date: {row['future_date'].strftime('%Y-%m-%d')}")
         print(f"      | Predicted Return: {return_pct:>8.2f}%")
         print(f"      | Confidence Int:   [{row['ci_lower']*100:>7.2f}%, {row['ci_upper']*100:>7.2f}%]")
-        print(f"      | Signal/Noise:     {row['signal_to_noise']:>8.2f}")
+        print(f"      | Signal/Noise:     {row['precision_ratio']:>8.2f}")
         print(f"      | Direction Conf:   {confidence_pct:>8.1f}%")
         print(f"      | Overall Score:    {row['screening_score']:>8.4f}")
 
@@ -297,7 +297,7 @@ Examples:
             print(f"Long Positions: {summary['long_positions']}")
             print(f"Short Positions: {summary['short_positions']}")
             print(f"Average Predicted Return: {summary['avg_predicted_return']*100:.2f}%")
-            print(f"Average Signal-to-Noise: {summary['avg_signal_to_noise']:.2f}")
+            print(f"Average Signal-to-Noise: {summary['avg_precision_ratio']:.2f}")
             print(f"Average Direction Confidence: {summary['avg_direction_confidence']*100:.1f}%")
             print(f"Return Range: {summary['return_range']['min']*100:.2f}% to {summary['return_range']['max']*100:.2f}%")
             print(f"Next Trading Date: {summary['next_trading_date']}")
@@ -305,18 +305,18 @@ Examples:
             if 'top_long_pick' in summary:
                 pick = summary['top_long_pick']
                 print(f"Best Long Pick: {pick['ticker']} ({pick['predicted_return']*100:.2f}%, "
-                      f"S/N: {pick['signal_to_noise']:.2f}, Conf: {pick['direction_confidence']*100:.1f}%)")
+                      f"S/N: {pick['precision_ratio']:.2f}, Conf: {pick['direction_confidence']*100:.1f}%)")
 
             if 'top_short_pick' in summary:
                 pick = summary['top_short_pick']
                 print(f"Best Short Pick: {pick['ticker']} ({pick['predicted_return']*100:.2f}%, "
-                      f"S/N: {pick['signal_to_noise']:.2f}, Conf: {pick['direction_confidence']*100:.1f}%)")
+                      f"S/N: {pick['precision_ratio']:.2f}, Conf: {pick['direction_confidence']*100:.1f}%)")
 
         # Export if requested
         if args.export and not top_positions.empty:
             # Select relevant columns for export
             export_columns = ['ticker', 'future_date', 'predicted_return', 'ci_lower', 'ci_upper',
-                            'signal_to_noise', 'direction_confidence', 'screening_score']
+                            'precision_ratio', 'direction_confidence', 'screening_score']
             export_df = top_positions[export_columns].copy()
             export_df.to_csv(args.export, index=False)
             print(f"\nResults exported to: {args.export}")
