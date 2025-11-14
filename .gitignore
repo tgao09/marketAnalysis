@@ -1,10 +1,11 @@
 .claude
 .venv
 training_stocks.txt
-ClAUDE.md
+CLAUDE.md
 *.pyc
 *.csv
 __pycache__/
 .ipynb_checkpoints/
 .env
 *.pkl
+.devcontainer
