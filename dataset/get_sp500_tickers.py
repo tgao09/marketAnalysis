@@ -1,26 +1,43 @@
-import requests
-import pandas as pd
+from typing import List
 
-def get_sp500_tickers():
-    
+import requests
+from bs4 import BeautifulSoup
+
+def get_sp500_tickers() -> List[str]:
+
     try:
         # read s&p 500 companies from wikipedia
         url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-        tables = pd.read_html(url)
-        
-        # the first table contains the current s&p 500 companies
-        sp500_table = tables[0]
-        
-        # extract ticker symbols
-        tickers = sp500_table['Symbol'].tolist()
-        
-        # clean up tickers (remove any whitespace)
-        tickers = [ticker.strip() for ticker in tickers if ticker.strip()]
-        
+        headers = {
+            'User-Agent': (
+                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+            )
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        table = soup.find('table', id='constituents')
+        if table is None:
+            tables = soup.find_all('table')
+            if not tables:
+                raise ValueError('Could not find any tables on the Wikipedia page.')
+            table = tables[0]
+
+        tickers = []
+        for row in table.select('tbody tr'):
+            cells = row.find_all('td')
+            if not cells:
+                continue
+            ticker = cells[0].get_text(strip=True)
+            if ticker:
+                tickers.append(ticker)
+
         print(f"Found {len(tickers)} S&P 500 tickers")
-        
+
         return tickers
-        
+
     except Exception as e:
         print(f"Error fetching S&P 500 tickers: {e}")
         return []

@@ -1,6 +1,5 @@
 .claude
 .venv
-training_stocks.txt
 CLAUDE.md
 *.pyc
 *.csv
