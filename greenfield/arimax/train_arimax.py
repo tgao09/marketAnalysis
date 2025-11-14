@@ -9,7 +9,7 @@ import warnings
 import time
 from tqdm import tqdm
 
-# Add the arimax directory to the path
+# add the arimax directory to the path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from arimax_model import StockARIMAX
@@ -18,31 +18,24 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def train_single_stock(args: tuple) -> Dict[str, Any]:
-    """
-    Train ARIMAX model for a single stock.
-
-    Args:
-        args: Tuple of (ticker, df, train_size, models_dir, use_cv)
-
-    Returns:
-        Training results dictionary
-    """
-    ticker, df, train_size, models_dir, use_cv = args
+    
+    ticker, df, train_size, models_dir, use_cv, selected_features = args
 
     try:
         logger.info(f"Training model for {ticker} with {'CV' if use_cv else 'AIC'} selection")
 
-        # Create model instance
-        model = StockARIMAX(ticker=ticker, max_p=6, max_d=2, max_q=6)
+        # create model instance
+        model = StockARIMAX(ticker=ticker, max_p=6, max_d=2, max_q=6,
+                           selected_features=selected_features)
 
-        # Fit the model with optional cross-validation
+        # fit the model with optional cross-validation
         results = model.fit(df, train_size=train_size, use_cv=use_cv)
 
-        # Save the model
+        # save the model
         model_path = os.path.join(models_dir, f"{ticker}_arimax.pkl")
         model.save_model(model_path)
 
-        # Add model path to results
+        # add model path to results
         results['model_path'] = model_path
         results['status'] = 'success'
 
@@ -56,7 +49,7 @@ def train_single_stock(args: tuple) -> Dict[str, Any]:
         error_msg = str(e)
         logger.error(f"Failed to train {ticker}: {error_msg}")
 
-        # Add more specific error information
+        # add more specific error information
         import traceback
         logger.debug(f"Full traceback for {ticker}: {traceback.format_exc()}")
 
@@ -75,16 +68,8 @@ def train_single_stock(args: tuple) -> Dict[str, Any]:
         }
 
 def prepare_training_data(data_file: str = '../dataset/stock_dataset_with_lags.csv') -> pd.DataFrame:
-    """
-    Load and prepare the training dataset.
-
-    Args:
-        data_file: Path to the lagged dataset file
-
-    Returns:
-        Loaded DataFrame
-    """
-    # Handle relative paths - make them relative to script directory
+    
+    # handle relative paths - make them relative to script directory
     if not os.path.isabs(data_file):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         data_file = os.path.join(script_dir, data_file)
@@ -96,10 +81,10 @@ def prepare_training_data(data_file: str = '../dataset/stock_dataset_with_lags.c
 
     df = pd.read_csv(data_file)
 
-    # Convert Date column to datetime
+    # convert date column to datetime
     df['Date'] = pd.to_datetime(df['Date'])
 
-    # Sort by ticker and date
+    # sort by ticker and date
     df = df.sort_values(['ticker', 'Date']).reset_index(drop=True)
 
     logger.info(f"Loaded {len(df)} records for {df['ticker'].nunique()} unique stocks")
@@ -108,16 +93,7 @@ def prepare_training_data(data_file: str = '../dataset/stock_dataset_with_lags.c
     return df
 
 def filter_stocks_for_training(df: pd.DataFrame, min_observations: int = 50) -> List[str]:
-    """
-    Filter stocks that have sufficient data for training.
-
-    Args:
-        df: Full dataset
-        min_observations: Minimum number of observations required per stock
-
-    Returns:
-        List of tickers suitable for training
-    """
+    
     stock_counts = df.groupby('ticker').size()
     valid_stocks = stock_counts[stock_counts >= min_observations].index.tolist()
 
@@ -133,45 +109,31 @@ def train_all_models(data_file: str = '../dataset/stock_dataset_with_lags.csv',
                     max_workers: int = 4,
                     min_observations: int = 50,
                     sample_stocks: int = None,
-                    use_cv: bool = True) -> pd.DataFrame:
-    """
-    Train ARIMAX models for all stocks in parallel with optional cross-validation.
-
-    Args:
-        data_file: Path to the lagged dataset
-        models_dir: Directory to save trained models
-        results_dir: Directory to save results
-        train_size: Proportion of data for training
-        max_workers: Number of parallel processes
-        min_observations: Minimum observations required per stock
-        sample_stocks: If specified, train only on this many stocks (for testing)
-        use_cv: Whether to use cross-validation for model selection
-
-    Returns:
-        DataFrame with training results for all stocks
-    """
+                    use_cv: bool = True,
+                    selected_features: List[str] = None) -> pd.DataFrame:
+    
     start_time = time.time()
 
-    # Create directories
+    # create directories
     os.makedirs(models_dir, exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
 
-    # Load data
+    # load data
     df = prepare_training_data(data_file)
 
-    # Filter stocks
+    # filter stocks
     valid_stocks = filter_stocks_for_training(df, min_observations)
 
-    # Sample stocks if requested (useful for testing)
+    # sample stocks if requested (useful for testing)
     if sample_stocks and sample_stocks < len(valid_stocks):
         valid_stocks = valid_stocks[:sample_stocks]
         logger.info(f"Training on sample of {sample_stocks} stocks: {valid_stocks}")
 
-    # Prepare arguments for parallel processing - filter data per ticker to reduce memory usage
-    training_args = [(ticker, df[df['ticker'] == ticker].copy(), train_size, models_dir, use_cv)
+    # prepare arguments for parallel processing - filter data per ticker to reduce memory usage
+    training_args = [(ticker, df[df['ticker'] == ticker].copy(), train_size, models_dir, use_cv, selected_features)
                      for ticker in valid_stocks]
 
-    # Train models in parallel
+    # train models in parallel
     results = []
     failed_count = 0
 
@@ -179,13 +141,13 @@ def train_all_models(data_file: str = '../dataset/stock_dataset_with_lags.csv',
     logger.info(f"Starting training for {len(valid_stocks)} stocks using {max_workers} workers {cv_info}")
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all training jobs
+        # submit all training jobs
         future_to_ticker = {
             executor.submit(train_single_stock, args): args[0]
             for args in training_args
         }
 
-        # Collect results as they complete
+        # collect results as they complete
         for future in tqdm(as_completed(future_to_ticker), total=len(future_to_ticker),
                           desc="Training models", unit="stock"):
             ticker = future_to_ticker[future]
@@ -205,14 +167,14 @@ def train_all_models(data_file: str = '../dataset/stock_dataset_with_lags.csv',
                 })
                 failed_count += 1
 
-    # Convert results to DataFrame
+    # convert results to dataframe
     results_df = pd.DataFrame(results)
 
-    # Save results summary
+    # save results summary
     summary_file = os.path.join(results_dir, 'model_summary.csv')
     results_df.to_csv(summary_file, index=False)
 
-    # Calculate summary statistics
+    # calculate summary statistics
     successful_models = len(results_df[results_df['status'] == 'success'])
     total_time = time.time() - start_time
 
@@ -221,7 +183,7 @@ def train_all_models(data_file: str = '../dataset/stock_dataset_with_lags.csv',
     logger.info(f"Failed: {failed_count}/{len(valid_stocks)} models")
     logger.info(f"Results saved to: {summary_file}")
 
-    # Display summary statistics for successful models
+    # display summary statistics for successful models
     if successful_models > 0:
         successful_df = results_df[results_df['status'] == 'success']
 
@@ -235,7 +197,7 @@ def train_all_models(data_file: str = '../dataset/stock_dataset_with_lags.csv',
         print(f"Training time: {total_time:.1f} seconds")
         print(f"Model selection: {'Cross-validation' if use_cv else 'AIC criterion'}")
 
-        # Show breakdown by selection method if CV was attempted
+        # show breakdown by selection method if cv was attempted
         if 'selection_method' in successful_df.columns:
             method_counts = successful_df['selection_method'].value_counts()
             print(f"\nSelection Method Breakdown:")
@@ -260,7 +222,7 @@ def train_all_models(data_file: str = '../dataset/stock_dataset_with_lags.csv',
     return results_df
 
 def main():
-    """Main training script."""
+    
     import argparse
 
     parser = argparse.ArgumentParser(description='Train ARIMAX models for all stocks')
@@ -280,11 +242,20 @@ def main():
                        help='Train only on this many stocks (for testing)')
     parser.add_argument('--no-cv', action='store_true',
                        help='Disable cross-validation and use AIC for model selection')
+    parser.add_argument('--features-file', type=str, default=None,
+                       help='Path to file with selected features (one per line)')
 
     args = parser.parse_args()
 
-    # Suppress warnings during training
+    # suppress warnings during training
     warnings.filterwarnings('ignore')
+
+    # load selected features if specified
+    selected_features = None
+    if args.features_file:
+        with open(args.features_file, 'r') as f:
+            selected_features = [line.strip() for line in f if line.strip()]
+        logger.info(f"Loaded {len(selected_features)} selected features from {args.features_file}")
 
     try:
         results_df = train_all_models(
@@ -295,7 +266,8 @@ def main():
             max_workers=args.max_workers,
             min_observations=args.min_observations,
             sample_stocks=args.sample_stocks,
-            use_cv=not args.no_cv
+            use_cv=not args.no_cv,
+            selected_features=selected_features
         )
 
         print(f"\nTraining completed successfully!")

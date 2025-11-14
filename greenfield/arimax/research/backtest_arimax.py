@@ -8,7 +8,7 @@ import warnings
 from datetime import datetime, timedelta
 from tqdm import tqdm
 
-# Add the arimax directory to the path
+# add the arimax directory to the path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from arimax_model import StockARIMAX
@@ -17,24 +17,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class ARIMAXPredictor:
-    """
-    Generate predictions using trained ARIMAX models.
-    """
+    
 
     def __init__(self, models_dir: str = 'arimaxmodels', results_dir: str = 'arimaxresults'):
-        """
-        Initialize predictor.
-
-        Args:
-            models_dir: Directory containing trained models
-            results_dir: Directory to save prediction results
-        """
+        
         self.models_dir = models_dir
         self.results_dir = results_dir
         self.available_models = self._discover_models()
 
     def _discover_models(self) -> List[str]:
-        """Discover available trained models."""
+        
         if not os.path.exists(self.models_dir):
             logger.warning(f"Models directory not found: {self.models_dir}")
             return []
@@ -47,52 +39,41 @@ class ARIMAXPredictor:
 
     def predict_single_stock(self, ticker: str, data_file: str, periods: int = 4,
                            return_confidence: bool = True) -> Dict[str, Any]:
-        """
-        Generate predictions for a single stock.
-
-        Args:
-            ticker: Stock ticker to predict
-            data_file: Path to the dataset with latest data
-            periods: Number of periods to predict
-            return_confidence: Whether to include confidence intervals
-
-        Returns:
-            Prediction results dictionary
-        """
+        
         if ticker not in self.available_models:
             raise ValueError(f"No trained model found for {ticker}")
 
-        # Load model
+        # load model
         model_path = os.path.join(self.models_dir, f"{ticker}_arimax.pkl")
         model = StockARIMAX.load_model(model_path)
 
-        # Load data
+        # load data
         df = pd.read_csv(data_file)
         df['Date'] = pd.to_datetime(df['Date'])
 
-        # Prepare data for this stock
+        # prepare data for this stock
         target, exog = model.prepare_data(df)
 
         if len(target) == 0:
             raise ValueError(f"No data available for {ticker}")
 
-        # Get the most recent data for prediction (backtesting on last N periods)
+        # get the most recent data for prediction (backtesting on last n periods)
         latest_exog = exog.tail(periods).copy()
 
         if len(latest_exog) < periods:
             logger.warning(f"{ticker}: Only {len(latest_exog)} periods available for prediction (requested {periods})")
             periods = len(latest_exog)
 
-        # Get the actual historical dates corresponding to the exog data being used
+        # get the actual historical dates corresponding to the exog data being used
         stock_data = df[df['ticker'] == ticker].copy()
         stock_data = stock_data.sort_values('Date').reset_index(drop=True)
 
-        # Get the dates for the last N periods (the ones we're "predicting")
+        # get the dates for the last n periods (the ones we're "predicting")
         actual_dates = stock_data['Date'].tail(periods).tolist()
         actual_date_strings = [date.strftime('%Y-%m-%d') for date in actual_dates]
 
         try:
-            # Generate predictions (actually backtesting on recent historical data)
+            # generate predictions (actually backtesting on recent historical data)
             if return_confidence:
                 predictions, conf_intervals = model.predict(
                     latest_exog, steps=periods, return_conf_int=True
@@ -120,7 +101,7 @@ class ARIMAXPredictor:
                     'model_aic': model.aic_score
                 }
 
-            # Use actual historical dates (these are backtesting results, not future predictions)
+            # use actual historical dates (these are backtesting results, not future predictions)
             result['prediction_dates'] = actual_date_strings
             result['backtest_note'] = "These are backtesting results on historical data, not future predictions"
 
@@ -137,18 +118,7 @@ class ARIMAXPredictor:
 
     def predict_multiple_stocks(self, tickers: List[str], data_file: str, periods: int = 4,
                               return_confidence: bool = True) -> pd.DataFrame:
-        """
-        Generate predictions for multiple stocks.
-
-        Args:
-            tickers: List of stock tickers to predict
-            data_file: Path to the dataset with latest data
-            periods: Number of periods to predict
-            return_confidence: Whether to include confidence intervals
-
-        Returns:
-            DataFrame with predictions for all stocks
-        """
+        
         results = []
 
         for ticker in tqdm(tickers, desc="Generating predictions", unit="stock"):
@@ -158,15 +128,15 @@ class ARIMAXPredictor:
                 )
 
                 if 'error' not in result:
-                    # Convert to flat format for DataFrame
+                    # convert to flat format for dataframe
                     for i in range(periods):
                         row = {
                             'ticker': ticker,
-                            'historical_date': result['prediction_dates'][i],  # Renamed to be clear
+                            'historical_date': result['prediction_dates'][i],  # renamed to be clear
                             'predicted_return': result['predictions'][i],
                             'model_order': str(result['model_order']),
                             'model_aic': result['model_aic'],
-                            'analysis_type': 'backtest'  # Clear labeling
+                            'analysis_type': 'backtest'  # clear labeling
                         }
 
                         if return_confidence and 'confidence_intervals' in result:
@@ -184,17 +154,7 @@ class ARIMAXPredictor:
 
     def predict_all_available(self, data_file: str, periods: int = 4,
                             return_confidence: bool = True) -> pd.DataFrame:
-        """
-        Generate predictions for all available models.
-
-        Args:
-            data_file: Path to the dataset with latest data
-            periods: Number of periods to predict
-            return_confidence: Whether to include confidence intervals
-
-        Returns:
-            DataFrame with predictions for all available stocks
-        """
+        
         logger.info(f"Generating predictions for {len(self.available_models)} stocks")
 
         return self.predict_multiple_stocks(
@@ -202,15 +162,7 @@ class ARIMAXPredictor:
         )
 
     def create_prediction_summary(self, predictions_df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Create summary statistics for predictions.
-
-        Args:
-            predictions_df: DataFrame with predictions
-
-        Returns:
-            Summary statistics dictionary
-        """
+        
         if predictions_df.empty:
             return {'error': 'No predictions available'}
 
@@ -224,7 +176,7 @@ class ARIMAXPredictor:
             }
         }
 
-        # Return statistics
+        # return statistics
         if 'predicted_return' in predictions_df.columns:
             return_stats = predictions_df['predicted_return'].describe()
             summary['return_statistics'] = {
@@ -235,7 +187,7 @@ class ARIMAXPredictor:
                 'max': return_stats['max']
             }
 
-            # Directional predictions
+            # directional predictions
             positive_predictions = (predictions_df['predicted_return'] > 0).sum()
             summary['directional_split'] = {
                 'positive_predictions': positive_predictions,
@@ -243,7 +195,7 @@ class ARIMAXPredictor:
                 'positive_percentage': positive_predictions / len(predictions_df) * 100
             }
 
-            # Top/bottom predicted performers
+            # top/bottom predicted performers
             latest_predictions = predictions_df.groupby('ticker')['predicted_return'].first()
             summary['top_predicted_performers'] = latest_predictions.nlargest(10).to_dict()
             summary['bottom_predicted_performers'] = latest_predictions.nsmallest(10).to_dict()
@@ -251,16 +203,7 @@ class ARIMAXPredictor:
         return summary
 
     def save_predictions(self, predictions_df: pd.DataFrame, filename: str = None) -> str:
-        """
-        Save backtest results to CSV file.
-
-        Args:
-            predictions_df: DataFrame with backtest results
-            filename: Custom filename (optional)
-
-        Returns:
-            Path to saved file
-        """
+        
         if filename is None:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"backtest_results_{timestamp}.csv"
@@ -275,20 +218,10 @@ class ARIMAXPredictor:
 
     def generate_prediction_report(self, data_file: str, periods: int = 4,
                                  save_results: bool = True) -> Dict[str, Any]:
-        """
-        Generate comprehensive backtest report.
-
-        Args:
-            data_file: Path to the dataset with historical data
-            periods: Number of recent periods to backtest
-            save_results: Whether to save results to file
-
-        Returns:
-            Complete backtest report
-        """
+        
         logger.info(f"Generating backtest report for {periods} recent periods")
 
-        # Generate backtest results (not future predictions)
+        # generate backtest results (not future predictions)
         predictions_df = self.predict_all_available(
             data_file, periods, return_confidence=True
         )
@@ -296,15 +229,15 @@ class ARIMAXPredictor:
         if predictions_df.empty:
             return {'error': 'No backtest results could be generated'}
 
-        # Create summary
+        # create summary
         summary = self.create_prediction_summary(predictions_df)
 
-        # Save results if requested
+        # save results if requested
         saved_file = None
         if save_results:
             saved_file = self.save_predictions(predictions_df)
 
-        # Combine into report
+        # combine into report
         report = {
             'generation_time': datetime.now().isoformat(),
             'summary': summary,
@@ -316,7 +249,7 @@ class ARIMAXPredictor:
         return report
 
 def main():
-    """Main backtest script."""
+    
     import argparse
 
     parser = argparse.ArgumentParser(description='Generate backtest results using trained ARIMAX models')
@@ -337,14 +270,14 @@ def main():
 
     args = parser.parse_args()
 
-    # Suppress warnings
+    # suppress warnings
     warnings.filterwarnings('ignore')
 
     predictor = ARIMAXPredictor(args.models_dir, args.results_dir)
 
     try:
         if args.ticker:
-            # Backtest single stock
+            # backtest single stock
             print(f"Generating backtest results for {args.ticker}...")
 
             result = predictor.predict_single_stock(
@@ -367,7 +300,7 @@ def main():
                 print(line)
 
         else:
-            # Generate comprehensive report
+            # generate comprehensive report
             print("Generating backtest results for all available models...")
 
             report = predictor.generate_prediction_report(

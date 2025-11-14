@@ -13,25 +13,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class StockARIMAX:
-    """
-    ARIMAX model for individual stock time series forecasting.
-    Excludes target variable's own lags to prevent data leakage.
-    """
+    
 
-    def __init__(self, ticker: str, max_p: int = 5, max_d: int = 2, max_q: int = 5):
-        """
-        Initialize ARIMAX model for a specific stock.
-
-        Args:
-            ticker: Stock symbol
-            max_p: Maximum AR order to test
-            max_d: Maximum differencing order to test
-            max_q: Maximum MA order to test
-        """
+    def __init__(self, ticker: str, max_p: int = 5, max_d: int = 2, max_q: int = 5,
+                 selected_features: List[str] = None):
+        
         self.ticker = ticker
         self.max_p = max_p
         self.max_d = max_d
         self.max_q = max_q
+        self.selected_features = selected_features
         self.model = None
         self.fitted_model = None
         self.best_order = None
@@ -40,65 +31,61 @@ class StockARIMAX:
         self.is_fitted = False
 
     def prepare_data(self, df: pd.DataFrame) -> Tuple[pd.Series, pd.DataFrame]:
-        """
-        Prepare data for ARIMAX model, excluding target's own lags.
-
-        Args:
-            df: DataFrame with lagged features for the stock
-
-        Returns:
-            target: Target variable (weekly_return)
-            exog: Exogenous variables (all except target's lags)
-        """
-        # Ensure we have data for this ticker
+        
+        # ensure we have data for this ticker
         stock_data = df[df['ticker'] == self.ticker].copy()
 
         if stock_data.empty:
             raise ValueError(f"No data found for ticker {self.ticker}")
 
-        # Sort by date to ensure proper time series order
+        # sort by date to ensure proper time series order
         stock_data = stock_data.sort_values('Date').reset_index(drop=True)
 
-        # Target variable
+        # target variable
         target = stock_data['weekly_return']
 
-        # Exclude target's own lags and non-feature columns
+        # exclude target's own lags, non-feature columns, and contemporaneous features (data leakage)
         exclude_columns = [
             'ticker', 'Date', 'weekly_return',
             'weekly_return_lag_1', 'weekly_return_lag_2', 'weekly_return_lag_3',
-            'weekly_return_lag_4', 'weekly_return_lag_5'
+            'weekly_return_lag_4', 'weekly_return_lag_5',
+            # exclude contemporaneous features from same week as target (data leakage)
+            'high_return', 'low_return', 'volume_change', 'volatility'
         ]
 
-        # Get all available columns
+        # get all available columns
         all_columns = stock_data.columns.tolist()
 
-        # Select exogenous variables (everything except excluded columns)
+        # select exogenous variables (everything except excluded columns)
         exog_columns = [col for col in all_columns if col not in exclude_columns]
         exog = stock_data[exog_columns]
 
-        # Store feature columns for later use
-        self.feature_columns = exog_columns
+        # drop columns that are entirely nan (e.g., missing tickers like ^vix)
+        exog = exog.dropna(axis=1, how='all')
 
-        # Remove rows with NaN values and reset indices
+        # filter to selected features if specified
+        if self.selected_features is not None:
+            available_features = [f for f in self.selected_features if f in exog.columns]
+            if len(available_features) < len(self.selected_features):
+                missing = set(self.selected_features) - set(available_features)
+                logger.warning(f"{self.ticker}: {len(missing)} selected features not found in data")
+            exog = exog[available_features]
+            logger.info(f"{self.ticker}: Using {len(available_features)} selected features")
+
+        # update feature columns after filtering
+        self.feature_columns = exog.columns.tolist()
+
+        # remove rows with nan values and reset indices
         valid_indices = (~target.isna()) & (~exog.isna().any(axis=1))
         target = target[valid_indices].reset_index(drop=True)
         exog = exog[valid_indices].reset_index(drop=True)
 
-        logger.info(f"{self.ticker}: Prepared {len(target)} observations with {len(exog_columns)} exogenous variables")
+        logger.info(f"{self.ticker}: Prepared {len(target)} observations with {len(self.feature_columns)} exogenous variables")
 
         return target, exog
 
     def check_stationarity(self, series: pd.Series, alpha: float = 0.05) -> bool:
-        """
-        Check if time series is stationary using Augmented Dickey-Fuller test.
-
-        Args:
-            series: Time series to test
-            alpha: Significance level
-
-        Returns:
-            True if stationary, False otherwise
-        """
+        
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -111,30 +98,19 @@ class StockARIMAX:
 
     def time_series_cv_split(self, target: pd.Series, exog: pd.DataFrame,
                             n_splits: int = 5, min_train_size: int = 30) -> List[Tuple[np.ndarray, np.ndarray]]:
-        """
-        Generate time series cross-validation splits with expanding window.
-
-        Args:
-            target: Target time series
-            exog: Exogenous variables
-            n_splits: Number of CV splits
-            min_train_size: Minimum training size for first split
-
-        Returns:
-            List of (train_indices, test_indices) tuples
-        """
+        
         n_samples = len(target)
 
         if n_samples < min_train_size + n_splits:
             raise ValueError(f"{self.ticker}: Not enough data for {n_splits} CV splits")
 
-        # Calculate test size for each split
+        # calculate test size for each split
         available_for_testing = n_samples - min_train_size
         test_size = max(1, available_for_testing // n_splits)
 
         splits = []
         for i in range(n_splits):
-            # Expanding window: train size grows with each split
+            # expanding window: train size grows with each split
             train_end = min_train_size + i * test_size
             test_start = train_end
             test_end = min(test_start + test_size, n_samples)
@@ -145,7 +121,7 @@ class StockARIMAX:
             train_indices = np.arange(0, train_end)
             test_indices = np.arange(test_start, test_end)
 
-            # Ensure we have at least 1 test sample
+            # ensure we have at least 1 test sample
             if len(test_indices) > 0:
                 splits.append((train_indices, test_indices))
 
@@ -153,18 +129,8 @@ class StockARIMAX:
         return splits
 
     def find_optimal_order(self, target: pd.Series, exog: pd.DataFrame, use_cv: bool = True) -> Tuple[int, int, int]:
-        """
-        Find optimal ARIMA order using grid search with cross-validation or AIC criterion.
-
-        Args:
-            target: Target time series
-            exog: Exogenous variables
-            use_cv: Whether to use cross-validation for model selection
-
-        Returns:
-            Optimal (p, d, q) order
-        """
-        # Determine max differencing needed
+        
+        # determine max differencing needed
         max_d_needed = 0
         temp_series = target.copy()
 
@@ -177,17 +143,17 @@ class StockARIMAX:
 
         logger.info(f"{self.ticker}: Testing ARIMA orders up to ({self.max_p}, {max_d_needed}, {self.max_q})")
 
-        if use_cv and len(target) >= 50:  # Use CV only if we have sufficient data
+        if use_cv and len(target) >= 50:  # use cv only if we have sufficient data
             return self._find_optimal_order_cv(target, exog, max_d_needed)
         else:
             return self._find_optimal_order_aic(target, exog, max_d_needed)
 
     def _find_optimal_order_aic(self, target: pd.Series, exog: pd.DataFrame, max_d_needed: int) -> Tuple[int, int, int]:
-        """Find optimal order using AIC criterion (original method)."""
+        
         best_aic = np.inf
-        best_order = (1, 0, 1)  # Default fallback
+        best_order = (1, 0, 1)  # default fallback
 
-        # Grid search over (p, d, q)
+        # grid search over (p, d, q)
         for p in range(self.max_p + 1):
             for d in range(min(max_d_needed + 1, self.max_d + 1)):
                 for q in range(self.max_q + 1):
@@ -195,29 +161,29 @@ class StockARIMAX:
                         with warnings.catch_warnings():
                             warnings.simplefilter("ignore")
 
-                            # Ensure target and exog have consistent indices and clean data
+                            # ensure target and exog have consistent indices and clean data
                             target_clean = target.copy().reset_index(drop=True)
                             exog_clean = exog.copy().reset_index(drop=True)
 
-                            # Convert to numpy arrays to avoid pandas index issues
+                            # convert to numpy arrays to avoid pandas index issues
                             target_array = target_clean.values
                             exog_array = exog_clean.values
 
-                            # Validate data shapes and types
+                            # validate data shapes and types
                             if len(target_array) != len(exog_array):
                                 continue
 
-                            # Fit ARIMA model with numpy arrays
+                            # fit arima model with numpy arrays
                             model = ARIMA(target_array, exog=exog_array, order=(p, d, q))
                             fitted = model.fit()
 
-                            # Check if AIC is better
+                            # check if aic is better
                             if fitted.aic < best_aic:
                                 best_aic = fitted.aic
                                 best_order = (p, d, q)
 
                     except Exception as e:
-                        # Skip this combination if it fails
+                        # skip this combination if it fails
                         logger.debug(f"{self.ticker}: Failed to fit order ({p},{d},{q}): {str(e)[:50]}")
                         continue
 
@@ -225,52 +191,52 @@ class StockARIMAX:
         return best_order
 
     def _find_optimal_order_cv(self, target: pd.Series, exog: pd.DataFrame, max_d_needed: int) -> Tuple[int, int, int]:
-        """Find optimal order using time series cross-validation."""
+        
         best_cv_score = np.inf
-        best_order = (1, 0, 1)  # Default fallback
+        best_order = (1, 0, 1)  # default fallback
 
-        # Create CV splits
+        # create cv splits
         try:
             cv_splits = self.time_series_cv_split(target, exog, n_splits=3, min_train_size=30)
         except ValueError as e:
             logger.warning(f"{self.ticker}: CV failed, falling back to AIC: {e}")
             return self._find_optimal_order_aic(target, exog, max_d_needed)
 
-        # Grid search over (p, d, q) with CV
+        # grid search over (p, d, q) with cv
         for p in range(self.max_p + 1):
             for d in range(min(max_d_needed + 1, self.max_d + 1)):
                 for q in range(self.max_q + 1):
                     cv_scores = []
 
-                    # Evaluate on each CV fold
+                    # evaluate on each cv fold
                     for train_idx, test_idx in cv_splits:
                         try:
                             with warnings.catch_warnings():
                                 warnings.simplefilter("ignore")
 
-                                # Split data for this fold
+                                # split data for this fold
                                 train_target = target.iloc[train_idx].values
                                 train_exog = exog.iloc[train_idx].values
                                 test_target = target.iloc[test_idx].values
                                 test_exog = exog.iloc[test_idx].values
 
-                                # Fit model on training fold
+                                # fit model on training fold
                                 model = ARIMA(train_target, exog=train_exog, order=(p, d, q))
                                 fitted = model.fit()
 
-                                # Predict on test fold
+                                # predict on test fold
                                 pred = fitted.forecast(steps=len(test_target), exog=test_exog)
 
-                                # Calculate RMSE for this fold
+                                # calculate rmse for this fold
                                 rmse = np.sqrt(mean_squared_error(test_target, pred))
                                 cv_scores.append(rmse)
 
                         except Exception as e:
-                            # If this fold fails, assign high penalty score
+                            # if this fold fails, assign high penalty score
                             cv_scores.append(np.inf)
                             logger.debug(f"{self.ticker}: CV fold failed for order ({p},{d},{q}): {str(e)[:50]}")
 
-                    # Calculate mean CV score (skip if all folds failed)
+                    # calculate mean cv score (skip if all folds failed)
                     if cv_scores and any(score < np.inf for score in cv_scores):
                         mean_cv_score = np.mean([s for s in cv_scores if s < np.inf])
 
@@ -282,45 +248,35 @@ class StockARIMAX:
         return best_order
 
     def fit(self, df: pd.DataFrame, train_size: float = 0.8, use_cv: bool = True) -> Dict[str, Any]:
-        """
-        Fit ARIMAX model to stock data with optional cross-validation.
-
-        Args:
-            df: DataFrame with lagged features
-            train_size: Proportion of data for training
-            use_cv: Whether to use cross-validation for model selection
-
-        Returns:
-            Fitting results and diagnostics
-        """
-        # Prepare data
+        
+        # prepare data
         target, exog = self.prepare_data(df)
 
         if len(target) < 20:
             raise ValueError(f"{self.ticker}: Insufficient data for modeling (need at least 20 observations)")
 
-        # Split data
+        # split data
         split_idx = int(len(target) * train_size)
         train_target = target[:split_idx].copy()
         train_exog = exog[:split_idx].copy()
         test_target = target[split_idx:].copy()
         test_exog = exog[split_idx:].copy()
 
-        # Reset indices to ensure clean data
+        # reset indices to ensure clean data
         train_target = train_target.reset_index(drop=True)
         train_exog = train_exog.reset_index(drop=True)
         test_target = test_target.reset_index(drop=True)
         test_exog = test_exog.reset_index(drop=True)
 
-        # Find optimal order with optional CV
+        # find optimal order with optional cv
         self.best_order = self.find_optimal_order(train_target, train_exog, use_cv=use_cv)
 
-        # Fit final model
+        # fit final model
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
 
-                # Convert to numpy arrays to avoid pandas series comparison issues
+                # convert to numpy arrays to avoid pandas series comparison issues
                 train_target_array = train_target.values
                 train_exog_array = train_exog.values
 
@@ -336,7 +292,7 @@ class StockARIMAX:
             logger.error(f"{self.ticker}: Model fitting failed: {e}")
             raise
 
-        # Validate on test set if available
+        # validate on test set if available
         results = {
             'ticker': self.ticker,
             'order': self.best_order,
@@ -348,15 +304,15 @@ class StockARIMAX:
         }
 
         if len(test_target) > 0:
-            # Generate predictions for test set
+            # generate predictions for test set
             test_pred = self.predict(test_exog, steps=len(test_target))
 
-            # Calculate test metrics
+            # calculate test metrics
             results['test_mae'] = mean_absolute_error(test_target, test_pred)
             results['test_rmse'] = np.sqrt(mean_squared_error(test_target, test_pred))
             results['test_mape'] = np.mean(np.abs((test_target - test_pred) / test_target)) * 100
 
-            # Directional accuracy
+            # directional accuracy
             direction_correct = np.sign(test_target) == np.sign(test_pred)
             results['directional_accuracy'] = np.mean(direction_correct) * 100
 
@@ -366,17 +322,7 @@ class StockARIMAX:
         return results
 
     def predict(self, exog: pd.DataFrame, steps: int = 1, return_conf_int: bool = False) -> np.ndarray:
-        """
-        Generate predictions using fitted model.
-
-        Args:
-            exog: Exogenous variables for prediction period
-            steps: Number of steps to predict
-            return_conf_int: Whether to return confidence intervals
-
-        Returns:
-            Predictions array (and confidence intervals if requested)
-        """
+        
         if not self.is_fitted:
             raise ValueError(f"{self.ticker}: Model must be fitted before prediction")
 
@@ -384,14 +330,14 @@ class StockARIMAX:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
 
-                # Convert exog to numpy array if it's a DataFrame
+                # convert exog to numpy array if it's a dataframe
                 if hasattr(exog, 'values'):
                     exog_array = exog[:steps].values
                 else:
                     exog_array = exog[:steps]
 
                 if return_conf_int:
-                    # Use get_forecast for confidence intervals
+                    # use get_forecast for confidence intervals
                     forecast_result = self.fitted_model.get_forecast(steps=steps, exog=exog_array)
                     pred = forecast_result.predicted_mean
                     conf_int = forecast_result.conf_int()
@@ -405,7 +351,7 @@ class StockARIMAX:
             raise
 
     def save_model(self, filepath: str) -> None:
-        """Save fitted model to file."""
+        
         if not self.is_fitted:
             raise ValueError(f"{self.ticker}: Cannot save unfitted model")
 
@@ -422,14 +368,14 @@ class StockARIMAX:
 
     @classmethod
     def load_model(cls, filepath: str) -> 'StockARIMAX':
-        """Load fitted model from file."""
+        
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Model file not found: {filepath}")
 
         model_data = joblib.load(filepath)
 
-        # Create instance
-        instance = cls(model_data['ticker'])
+        # create instance with selected_features from saved model
+        instance = cls(model_data['ticker'], selected_features=model_data['feature_columns'])
         instance.fitted_model = model_data['fitted_model']
         instance.best_order = model_data['best_order']
         instance.aic_score = model_data['aic_score']
@@ -440,18 +386,13 @@ class StockARIMAX:
         return instance
 
     def get_feature_importance(self) -> pd.DataFrame:
-        """
-        Get feature importance from fitted model coefficients.
-
-        Returns:
-            DataFrame with feature names and coefficients
-        """
+        
         if not self.is_fitted:
             raise ValueError(f"{self.ticker}: Model must be fitted first")
 
-        # Get exogenous variable coefficients
+        # get exogenous variable coefficients
         if hasattr(self.fitted_model, 'params') and len(self.feature_columns) > 0:
-            # Find exog coefficients (skip ARIMA parameters)
+            # find exog coefficients (skip arima parameters)
             total_params = len(self.fitted_model.params)
             arima_params = self.best_order[0] + self.best_order[2]  # p + q parameters
 
@@ -466,31 +407,21 @@ class StockARIMAX:
 
                 return importance_df
 
-        return pd.DataFrame()  # Return empty if no exog variables
+        return pd.DataFrame()  # return empty if no exog variables
 
     def cross_validate_model(self, df: pd.DataFrame, n_splits: int = 5,
                            min_train_size: int = 30) -> Dict[str, Any]:
-        """
-        Perform comprehensive cross-validation analysis.
-
-        Args:
-            df: DataFrame with lagged features
-            n_splits: Number of CV splits
-            min_train_size: Minimum training size for first split
-
-        Returns:
-            Detailed CV results including metrics per fold
-        """
-        # Prepare data
+        
+        # prepare data
         target, exog = self.prepare_data(df)
 
         if len(target) < min_train_size + n_splits:
             raise ValueError(f"{self.ticker}: Insufficient data for {n_splits} CV splits")
 
-        # Create CV splits
+        # create cv splits
         cv_splits = self.time_series_cv_split(target, exog, n_splits, min_train_size)
 
-        # Find optimal order using CV (if not already done)
+        # find optimal order using cv (if not already done)
         if self.best_order is None:
             self.best_order = self._find_optimal_order_cv(target, exog, max_d_needed=2)
 
@@ -506,31 +437,31 @@ class StockARIMAX:
         all_mape = []
         all_direction_acc = []
 
-        # Evaluate model on each fold
+        # evaluate model on each fold
         for fold_idx, (train_idx, test_idx) in enumerate(cv_splits):
             try:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
 
-                    # Split data for this fold
+                    # split data for this fold
                     train_target = target.iloc[train_idx].values
                     train_exog = exog.iloc[train_idx].values
                     test_target = target.iloc[test_idx].values
                     test_exog = exog.iloc[test_idx].values
 
-                    # Fit model on training fold
+                    # fit model on training fold
                     model = ARIMA(train_target, exog=train_exog, order=self.best_order)
                     fitted = model.fit()
 
-                    # Predict on test fold
+                    # predict on test fold
                     pred = fitted.forecast(steps=len(test_target), exog=test_exog)
 
-                    # Calculate metrics for this fold
+                    # calculate metrics for this fold
                     fold_rmse = np.sqrt(mean_squared_error(test_target, pred))
                     fold_mae = mean_absolute_error(test_target, pred)
                     fold_mape = np.mean(np.abs((test_target - pred) / test_target)) * 100
 
-                    # Directional accuracy
+                    # directional accuracy
                     direction_correct = np.sign(test_target) == np.sign(pred)
                     fold_direction_acc = np.mean(direction_correct) * 100
 
@@ -557,9 +488,9 @@ class StockARIMAX:
 
             except Exception as e:
                 logger.warning(f"{self.ticker} Fold {fold_idx + 1} failed: {e}")
-                # Skip this fold but continue with others
+                # skip this fold but continue with others
 
-        # Calculate aggregate CV metrics
+        # calculate aggregate cv metrics
         if all_rmse:
             cv_results['cv_metrics'] = {
                 'mean_rmse': np.mean(all_rmse),

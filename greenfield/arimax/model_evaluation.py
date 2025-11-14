@@ -9,7 +9,7 @@ import seaborn as sns
 from scipy import stats
 import warnings
 
-# Add the arimax directory to the path
+# add the arimax directory to the path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from arimax_model import StockARIMAX
@@ -18,24 +18,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class ModelEvaluator:
-    """
-    Comprehensive evaluation of trained ARIMAX models.
-    """
+    
 
     def __init__(self, results_dir: str = 'arimaxresults', models_dir: str = 'arimaxmodels'):
-        """
-        Initialize model evaluator.
-
-        Args:
-            results_dir: Directory containing training results
-            models_dir: Directory containing trained models
-        """
+        
         self.results_dir = results_dir
         self.models_dir = models_dir
         self.summary_df = None
 
     def load_training_results(self) -> pd.DataFrame:
-        """Load training results summary."""
+        
         summary_file = os.path.join(self.results_dir, 'model_summary.csv')
 
         if not os.path.exists(summary_file):
@@ -47,17 +39,8 @@ class ModelEvaluator:
         return self.summary_df
 
     def evaluate_single_model(self, ticker: str, data_file: str) -> Dict[str, Any]:
-        """
-        Detailed evaluation of a single model.
-
-        Args:
-            ticker: Stock ticker to evaluate
-            data_file: Path to the test dataset
-
-        Returns:
-            Detailed evaluation metrics
-        """
-        # Load model
+        
+        # load model
         model_path = os.path.join(self.models_dir, f"{ticker}_arimax.pkl")
 
         if not os.path.exists(model_path):
@@ -65,14 +48,14 @@ class ModelEvaluator:
 
         model = StockARIMAX.load_model(model_path)
 
-        # Load test data
+        # load test data
         df = pd.read_csv(data_file)
         df['Date'] = pd.to_datetime(df['Date'])
 
-        # Prepare data for this stock
+        # prepare data for this stock
         target, exog = model.prepare_data(df)
 
-        # Split into train/test
+        # split into train/test
         split_idx = int(len(target) * 0.8)
         test_target = target[split_idx:]
         test_exog = exog[split_idx:]
@@ -80,13 +63,13 @@ class ModelEvaluator:
         if len(test_target) == 0:
             return {'error': 'No test data available'}
 
-        # Generate predictions
+        # generate predictions
         try:
             predictions = model.predict(test_exog, steps=len(test_target))
             pred_with_conf, conf_intervals = model.predict(test_exog, steps=len(test_target),
                                                           return_conf_int=True)
 
-            # Calculate detailed metrics
+            # calculate detailed metrics
             residuals = test_target - predictions
 
             metrics = {
@@ -101,20 +84,20 @@ class ModelEvaluator:
                 'min_residual': np.min(residuals),
                 'max_residual': np.max(residuals),
 
-                # Directional accuracy
+                # directional accuracy
                 'directional_accuracy': np.mean(np.sign(test_target) == np.sign(predictions)) * 100,
 
-                # Statistical tests
+                # statistical tests
                 'residual_normality_pvalue': stats.jarque_bera(residuals)[1],
                 'residual_autocorr': self._ljung_box_test(residuals),
 
-                # Confidence interval coverage
+                # confidence interval coverage
                 'ci_coverage_95': self._calculate_coverage(test_target, conf_intervals, 0.95),
 
-                # Feature importance
+                # feature importance
                 'feature_importance': model.get_feature_importance().to_dict('records') if not model.get_feature_importance().empty else [],
 
-                # Model info
+                # model info
                 'arima_order': model.best_order,
                 'aic': model.aic_score,
                 'num_features': len(model.feature_columns)
@@ -127,36 +110,17 @@ class ModelEvaluator:
             return {'ticker': ticker, 'error': str(e)}
 
     def _ljung_box_test(self, residuals: np.ndarray, lags: int = 10) -> float:
-        """
-        Ljung-Box test for residual autocorrelation.
-
-        Args:
-            residuals: Model residuals
-            lags: Number of lags to test
-
-        Returns:
-            P-value of the test
-        """
+        
         try:
             from statsmodels.stats.diagnostic import acorr_ljungbox
             result = acorr_ljungbox(residuals, lags=lags, return_df=False)
-            return result[1][-1]  # P-value for the last lag
+            return result[1][-1]  # p-value for the last lag
         except Exception:
             return np.nan
 
     def _calculate_coverage(self, actual: np.ndarray, conf_intervals: np.ndarray,
                           confidence_level: float) -> float:
-        """
-        Calculate confidence interval coverage.
-
-        Args:
-            actual: Actual values
-            conf_intervals: Confidence intervals
-            confidence_level: Confidence level (e.g., 0.95)
-
-        Returns:
-            Coverage percentage
-        """
+        
         try:
             lower_bound = conf_intervals[:, 0]
             upper_bound = conf_intervals[:, 1]
@@ -167,16 +131,7 @@ class ModelEvaluator:
 
     def generate_performance_report(self, data_file: str = '../dataset/stock_dataset_with_lags.csv',
                                   top_n: int = 10) -> Dict[str, Any]:
-        """
-        Generate comprehensive performance report for all models.
-
-        Args:
-            data_file: Path to the test dataset
-            top_n: Number of top/bottom performers to highlight
-
-        Returns:
-            Performance report dictionary
-        """
+        
         if self.summary_df is None:
             self.load_training_results()
 
@@ -192,7 +147,7 @@ class ModelEvaluator:
             'success_rate': len(successful_models) / len(self.summary_df) * 100
         }
 
-        # Performance statistics
+        # performance statistics
         if 'test_rmse' in successful_models.columns:
             rmse_stats = successful_models['test_rmse'].describe()
             report['rmse_statistics'] = {
@@ -205,13 +160,13 @@ class ModelEvaluator:
                 'q75': rmse_stats['75%']
             }
 
-            # Top and bottom performers
+            # top and bottom performers
             report['best_performers'] = successful_models.nsmallest(top_n, 'test_rmse')[
                 ['ticker', 'test_rmse', 'directional_accuracy', 'order']].to_dict('records')
             report['worst_performers'] = successful_models.nlargest(top_n, 'test_rmse')[
                 ['ticker', 'test_rmse', 'directional_accuracy', 'order']].to_dict('records')
 
-        # Directional accuracy statistics
+        # directional accuracy statistics
         if 'directional_accuracy' in successful_models.columns:
             da_stats = successful_models['directional_accuracy'].describe()
             report['directional_accuracy_statistics'] = {
@@ -222,12 +177,12 @@ class ModelEvaluator:
                 'max': da_stats['max']
             }
 
-        # ARIMA order distribution
+        # arima order distribution
         if 'order' in successful_models.columns:
             order_counts = successful_models['order'].value_counts().head(10)
             report['popular_arima_orders'] = order_counts.to_dict()
 
-        # AIC distribution
+        # aic distribution
         if 'aic' in successful_models.columns:
             aic_stats = successful_models['aic'].describe()
             report['aic_statistics'] = {
@@ -241,12 +196,7 @@ class ModelEvaluator:
         return report
 
     def create_performance_plots(self, output_dir: str = None) -> None:
-        """
-        Create visualization plots for model performance.
-
-        Args:
-            output_dir: Directory to save plots (defaults to results_dir)
-        """
+        
         if output_dir is None:
             output_dir = self.results_dir
 
@@ -259,15 +209,15 @@ class ModelEvaluator:
             logger.warning("No successful models to plot")
             return
 
-        # Set up the plotting style
+        # set up the plotting style
         plt.style.use('default')
         sns.set_palette("husl")
 
-        # Create subplots
+        # create subplots
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
         fig.suptitle('ARIMAX Model Performance Analysis', fontsize=16, fontweight='bold')
 
-        # Plot 1: RMSE distribution
+        # plot 1: rmse distribution
         if 'test_rmse' in successful_models.columns:
             axes[0, 0].hist(successful_models['test_rmse'], bins=30, alpha=0.7, edgecolor='black')
             axes[0, 0].set_xlabel('Test RMSE')
@@ -277,7 +227,7 @@ class ModelEvaluator:
                               linestyle='--', label=f"Mean: {successful_models['test_rmse'].mean():.4f}")
             axes[0, 0].legend()
 
-        # Plot 2: Directional accuracy distribution
+        # plot 2: directional accuracy distribution
         if 'directional_accuracy' in successful_models.columns:
             axes[0, 1].hist(successful_models['directional_accuracy'], bins=20, alpha=0.7, edgecolor='black')
             axes[0, 1].set_xlabel('Directional Accuracy (%)')
@@ -287,7 +237,7 @@ class ModelEvaluator:
                               linestyle='--', label=f"Mean: {successful_models['directional_accuracy'].mean():.1f}%")
             axes[0, 1].legend()
 
-        # Plot 3: RMSE vs Directional Accuracy scatter plot
+        # plot 3: rmse vs directional accuracy scatter plot
         if 'test_rmse' in successful_models.columns and 'directional_accuracy' in successful_models.columns:
             scatter = axes[1, 0].scatter(successful_models['test_rmse'], successful_models['directional_accuracy'],
                                        alpha=0.6)
@@ -295,13 +245,13 @@ class ModelEvaluator:
             axes[1, 0].set_ylabel('Directional Accuracy (%)')
             axes[1, 0].set_title('RMSE vs Directional Accuracy')
 
-            # Add correlation coefficient
+            # add correlation coefficient
             corr = successful_models['test_rmse'].corr(successful_models['directional_accuracy'])
             axes[1, 0].text(0.05, 0.95, f'Correlation: {corr:.3f}',
                            transform=axes[1, 0].transAxes, fontsize=10,
                            bbox=dict(boxstyle="round", facecolor='wheat', alpha=0.5))
 
-        # Plot 4: AIC distribution
+        # plot 4: aic distribution
         if 'aic' in successful_models.columns:
             axes[1, 1].hist(successful_models['aic'], bins=30, alpha=0.7, edgecolor='black')
             axes[1, 1].set_xlabel('AIC Score')
@@ -313,7 +263,7 @@ class ModelEvaluator:
 
         plt.tight_layout()
 
-        # Save plot
+        # save plot
         plot_file = os.path.join(output_dir, 'performance_analysis.png')
         plt.savefig(plot_file, dpi=300, bbox_inches='tight')
         plt.close()
@@ -321,7 +271,7 @@ class ModelEvaluator:
         logger.info(f"Performance plots saved to: {plot_file}")
 
     def print_summary_report(self, data_file: str = '../dataset/stock_dataset_with_lags.csv') -> None:
-        """Print formatted summary report to console."""
+        
         report = self.generate_performance_report(data_file)
 
         print("\n" + "="*80)
@@ -363,7 +313,7 @@ class ModelEvaluator:
         print("="*80)
 
 def main():
-    """Main evaluation script."""
+    
     import argparse
 
     parser = argparse.ArgumentParser(description='Evaluate trained ARIMAX models')
@@ -380,14 +330,14 @@ def main():
 
     args = parser.parse_args()
 
-    # Suppress warnings
+    # suppress warnings
     warnings.filterwarnings('ignore')
 
     evaluator = ModelEvaluator(args.results_dir, args.models_dir)
 
     try:
         if args.ticker:
-            # Evaluate single model
+            # evaluate single model
             print(f"Evaluating model for {args.ticker}...")
             result = evaluator.evaluate_single_model(args.ticker, args.data_file)
 
@@ -401,7 +351,7 @@ def main():
                         print(f"{key}: {value}")
 
         else:
-            # Evaluate all models
+            # evaluate all models
             print("Evaluating all models...")
             evaluator.load_training_results()
             evaluator.print_summary_report(args.data_file)

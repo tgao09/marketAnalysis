@@ -1,10 +1,5 @@
-#!/usr/bin/env python3
-"""
-True ARIMAX Predictor
+# !/usr/bin/env python3
 
-This module extends the original ARIMAX predictor to enable genuine future
-forecasting by integrating exogenous variable forecasting.
-"""
 
 import pandas as pd
 import numpy as np
@@ -15,123 +10,161 @@ import logging
 import warnings
 from datetime import datetime, timedelta
 
-# Add the arimax directory to the path
+# add the arimax directory to the path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from arimax_model import StockARIMAX
-from exogenous_forecaster import ExogenousForecaster, create_forecaster
-from research.backtest_arimax import ARIMAXPredictor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore')
 
-class TrueARIMAXPredictor(ARIMAXPredictor):
-    """
-    Extended ARIMAX predictor that can generate true future predictions
-    by forecasting exogenous variables.
-    """
+class ARIMAXPredictor:
+    
 
-    def __init__(self, models_dir: str = 'arimaxmodels', results_dir: str = 'arimaxresults'):
-        """
-        Initialize the true ARIMAX predictor.
+    def __init__(self, models_dir: str = 'arimax/arimaxmodels', results_dir: str = 'arimax/arimaxresults'):
+        
+        self.models_dir = models_dir
+        self.results_dir = results_dir
 
-        Args:
-            models_dir: Directory containing trained ARIMAX models
-            results_dir: Directory to save prediction results
-        """
-        super().__init__(models_dir, results_dir)
-        self.exogenous_forecasters = {}  # Store forecasters per ticker
+        # discover available models
+        self.available_models = self._discover_models()
+        logger.info(f"Discovered {len(self.available_models)} trained models")
 
-    def fit_exogenous_forecaster(self, ticker: str, data_file: str,
-                                forecasting_mode: str = 'individual') -> None:
-        """
-        Fit exogenous variable forecaster for a specific ticker.
+    def _discover_models(self) -> List[str]:
+        
+        if not os.path.exists(self.models_dir):
+            logger.warning(f"Models directory not found: {self.models_dir}")
+            return []
 
-        Args:
-            ticker: Stock ticker
-            data_file: Path to historical data
-            forecasting_mode: 'individual' or 'var'
-        """
-        # Load data
-        df = pd.read_csv(data_file)
-        df['Date'] = pd.to_datetime(df['Date'])
+        models = []
+        for filename in os.listdir(self.models_dir):
+            if filename.endswith('_arimax.pkl'):
+                ticker = filename.replace('_arimax.pkl', '')
+                models.append(ticker)
 
-        # Create and fit forecaster
-        forecaster = create_forecaster(mode=forecasting_mode)
-        forecaster.fit(df, ticker)
+        return sorted(models)
 
-        self.exogenous_forecasters[ticker] = forecaster
-        logger.info(f"Exogenous forecaster fitted for {ticker}")
+    def _shift_lags_for_forecast(self, current_exog: pd.DataFrame,
+                                  new_prediction: float,
+                                  feature_columns: List[str]) -> pd.DataFrame:
+        
+        next_exog = current_exog.copy()
+
+        # identify stock-specific lag groups (weekly_return, high_return, low_return, volume_change, volatility)
+        stock_features = ['weekly_return', 'high_return', 'low_return', 'volume_change', 'volatility']
+
+        for base_feature in stock_features:
+            # find all lags for this feature (e.g., weekly_return_lag_1, weekly_return_lag_2, weekly_return_lag_3)
+            lag_cols = [col for col in feature_columns if col.startswith(f'{base_feature}_lag_')]
+
+            if not lag_cols:
+                continue
+
+            # extract lag numbers and sort in descending order
+            lag_numbers = []
+            for col in lag_cols:
+                try:
+                    lag_num = int(col.split('_lag_')[-1])
+                    lag_numbers.append((lag_num, col))
+                except ValueError:
+                    continue
+
+            lag_numbers.sort(reverse=True)  # start from highest lag
+
+            # shift: lag_3 <- lag_2, lag_2 <- lag_1
+            for i in range(len(lag_numbers) - 1):
+                higher_lag_num, higher_lag_col = lag_numbers[i]
+                lower_lag_num, lower_lag_col = lag_numbers[i + 1]
+
+                if lower_lag_col in next_exog.columns:
+                    next_exog[higher_lag_col] = next_exog[lower_lag_col].values
+
+            # set lag_1 to new prediction (for weekly_return only)
+            if base_feature == 'weekly_return':
+                lag_1_col = f'{base_feature}_lag_1'
+                if lag_1_col in next_exog.columns:
+                    next_exog[lag_1_col] = new_prediction
+
+        return next_exog
 
     def predict_future_single_stock(self, ticker: str, data_file: str, periods: int = 4,
-                                   return_confidence: bool = True,
-                                   forecasting_mode: str = 'individual') -> Dict[str, Any]:
-        """
-        Generate true future predictions for a single stock.
-
-        Args:
-            ticker: Stock ticker to predict
-            data_file: Path to the dataset with latest data
-            periods: Number of future periods to predict
-            return_confidence: Whether to include confidence intervals
-            forecasting_mode: Mode for exogenous forecasting
-
-        Returns:
-            Prediction results dictionary with future dates
-        """
+                                   return_confidence: bool = True) -> Dict[str, Any]:
+        
         if ticker not in self.available_models:
             raise ValueError(f"No trained ARIMAX model found for {ticker}")
 
-        # Load ARIMAX model
+        # load arimax model
         model_path = os.path.join(self.models_dir, f"{ticker}_arimax.pkl")
         arimax_model = StockARIMAX.load_model(model_path)
 
-        # Fit exogenous forecaster if not already done
-        if ticker not in self.exogenous_forecasters:
-            self.fit_exogenous_forecaster(ticker, data_file, forecasting_mode)
-
-        forecaster = self.exogenous_forecasters[ticker]
-
         try:
-            # Generate exogenous variable forecasts
-            exog_features, uncertainty_info = forecaster.forecast_exogenous_features(
-                periods, confidence_level=0.95
-            )
-
-            logger.info(f"{ticker}: Generated exogenous forecasts for {periods} periods")
-
-            # Use ARIMAX model with forecasted exogenous variables
-            if return_confidence:
-                predictions, conf_intervals = arimax_model.predict(
-                    exog_features, steps=periods, return_conf_int=True
-                )
-
-                result = {
-                    'ticker': ticker,
-                    'periods': periods,
-                    'predictions': predictions.tolist(),
-                    'confidence_intervals': {
-                        'lower': conf_intervals[:, 0].tolist(),
-                        'upper': conf_intervals[:, 1].tolist()
-                    },
-                    'model_order': arimax_model.best_order,
-                    'model_aic': arimax_model.aic_score
-                }
-            else:
-                predictions = arimax_model.predict(exog_features, steps=periods)
-
-                result = {
-                    'ticker': ticker,
-                    'periods': periods,
-                    'predictions': predictions.tolist(),
-                    'model_order': arimax_model.best_order,
-                    'model_aic': arimax_model.aic_score
-                }
-
-            # Generate true future dates
+            # load historical data
             df = pd.read_csv(data_file)
             df['Date'] = pd.to_datetime(df['Date'])
+
+            # prepare data to get lagged features (only uses historical data)
+            target, exog = arimax_model.prepare_data(df)
+
+            if len(exog) == 0:
+                raise ValueError(f"No feature data available for {ticker}")
+
+            # iterative forecasting: shift lags at each step to simulate real-time forecasting
+            # this prevents assuming lags remain constant across forecast horizon
+            logger.info(f"{ticker}: Using iterative lag shifting for {periods} period forecast")
+
+            predictions_list = []
+            lower_bounds = []
+            upper_bounds = []
+
+            # get latest exogenous features
+            current_exog = exog.tail(1).copy().reset_index(drop=True)
+
+            for step in range(periods):
+                # predict next step using current lagged features
+                if return_confidence:
+                    step_pred, step_conf = arimax_model.predict(
+                        current_exog, steps=1, return_conf_int=True
+                    )
+                    predictions_list.append(step_pred[0])
+                    lower_bounds.append(step_conf[0, 0])
+                    upper_bounds.append(step_conf[0, 1])
+                else:
+                    step_pred = arimax_model.predict(current_exog, steps=1)
+                    predictions_list.append(step_pred[0])
+
+                # shift lags for next iteration: lag_2 <- lag_1, lag_1 <- current prediction
+                # identify lag columns (e.g., feature_lag_1, feature_lag_2, feature_lag_3)
+                if step < periods - 1:  # don't shift on last iteration
+                    current_exog = self._shift_lags_for_forecast(
+                        current_exog, step_pred[0], arimax_model.feature_columns
+                    )
+
+            # package results
+            if return_confidence:
+                result = {
+                    'ticker': ticker,
+                    'periods': periods,
+                    'predictions': predictions_list,
+                    'confidence_intervals': {
+                        'lower': lower_bounds,
+                        'upper': upper_bounds
+                    },
+                    'model_order': arimax_model.best_order,
+                    'model_aic': arimax_model.aic_score,
+                    'forecasting_mode': 'iterative'
+                }
+            else:
+                result = {
+                    'ticker': ticker,
+                    'periods': periods,
+                    'predictions': predictions_list,
+                    'model_order': arimax_model.best_order,
+                    'model_aic': arimax_model.aic_score,
+                    'forecasting_mode': 'iterative'
+                }
+
+            # generate true future dates
             last_date = df[df['ticker'] == ticker]['Date'].max()
 
             future_dates = []
@@ -141,12 +174,14 @@ class TrueARIMAXPredictor(ARIMAXPredictor):
 
             result['future_dates'] = future_dates
             result['prediction_type'] = 'future_forecast'
-            result['exogenous_forecasting_mode'] = forecasting_mode
-            result['exogenous_uncertainty'] = uncertainty_info
+            result['forecast_valid'] = True  # simple validation - features exist
 
-            # Add validation information
-            validation_results = forecaster.validate_forecasts(exog_features)
-            result['forecast_validation'] = validation_results
+            # extract latest sharpe_ratio_3m if available (stock quality metric)
+            ticker_df = df[df['ticker'] == ticker]
+            if 'sharpe_ratio_3m' in ticker_df.columns:
+                result['sharpe_ratio_3m'] = ticker_df['sharpe_ratio_3m'].iloc[-1]
+            else:
+                result['sharpe_ratio_3m'] = None
 
             logger.info(f"{ticker}: Generated {periods} future predictions")
             return result
@@ -161,31 +196,18 @@ class TrueARIMAXPredictor(ARIMAXPredictor):
             }
 
     def predict_future_multiple_stocks(self, tickers: List[str], data_file: str,
-                                     periods: int = 4, return_confidence: bool = True,
-                                     forecasting_mode: str = 'individual') -> pd.DataFrame:
-        """
-        Generate future predictions for multiple stocks.
-
-        Args:
-            tickers: List of stock tickers to predict
-            data_file: Path to the dataset with latest data
-            periods: Number of future periods to predict
-            return_confidence: Whether to include confidence intervals
-            forecasting_mode: Mode for exogenous forecasting
-
-        Returns:
-            DataFrame with future predictions for all stocks
-        """
+                                     periods: int = 4, return_confidence: bool = True) -> pd.DataFrame:
+        
         results = []
 
         for ticker in tickers:
             try:
                 result = self.predict_future_single_stock(
-                    ticker, data_file, periods, return_confidence, forecasting_mode
+                    ticker, data_file, periods, return_confidence
                 )
 
                 if 'error' not in result:
-                    # Convert to flat format for DataFrame
+                    # convert to flat format for dataframe
                     for i in range(periods):
                         row = {
                             'ticker': ticker,
@@ -194,16 +216,18 @@ class TrueARIMAXPredictor(ARIMAXPredictor):
                             'model_order': str(result['model_order']),
                             'model_aic': result['model_aic'],
                             'prediction_type': 'future_forecast',
-                            'exogenous_mode': forecasting_mode
                         }
 
                         if return_confidence and 'confidence_intervals' in result:
                             row['ci_lower'] = result['confidence_intervals']['lower'][i]
                             row['ci_upper'] = result['confidence_intervals']['upper'][i]
 
-                        # Add validation flags
-                        validation = result.get('forecast_validation', {})
-                        row['forecast_valid'] = all(validation.values()) if validation else False
+                        # add validation flag
+                        row['forecast_valid'] = result.get('forecast_valid', False)
+
+                        # add sharpe_ratio_3m (stock quality metric)
+                        if 'sharpe_ratio_3m' in result:
+                            row['sharpe_ratio_3m'] = result['sharpe_ratio_3m']
 
                         results.append(row)
                 else:
@@ -217,62 +241,42 @@ class TrueARIMAXPredictor(ARIMAXPredictor):
     def generate_future_forecast_report(self, data_file: str, periods: int = 4,
                                       forecasting_mode: str = 'individual',
                                       save_results: bool = True) -> Dict[str, Any]:
-        """
-        Generate comprehensive future forecast report.
-
-        Args:
-            data_file: Path to the dataset with latest data
-            periods: Number of future periods to predict
-            forecasting_mode: Mode for exogenous forecasting
-            save_results: Whether to save results to file
-
-        Returns:
-            Complete future forecast report
-        """
+        
         logger.info(f"Generating future forecast report for {periods} periods")
 
-        # Generate future predictions
+        # generate future predictions
         predictions_df = self.predict_future_multiple_stocks(
             self.available_models, data_file, periods, return_confidence=True,
-            forecasting_mode=forecasting_mode
+            
         )
 
         if predictions_df.empty:
             return {'error': 'No future predictions could be generated'}
 
-        # Create summary
+        # create summary
         summary = self.create_future_forecast_summary(predictions_df)
 
-        # Save results if requested
+        # save results if requested
         saved_file = None
         if save_results:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"future_forecasts_{timestamp}.csv"
             saved_file = self.save_predictions(predictions_df, filename)
 
-        # Combine into report
+        # combine into report
         report = {
             'generation_time': datetime.now().isoformat(),
             'summary': summary,
             'forecasts_file': saved_file,
             'model_count': len(self.available_models),
             'successful_forecasts': predictions_df['ticker'].nunique(),
-            'forecasting_mode': forecasting_mode,
             'periods_ahead': periods
         }
 
         return report
 
     def create_future_forecast_summary(self, predictions_df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Create summary statistics for future forecasts.
-
-        Args:
-            predictions_df: DataFrame with future predictions
-
-        Returns:
-            Summary statistics dictionary
-        """
+        
         if predictions_df.empty:
             return {'error': 'No predictions available'}
 
@@ -287,7 +291,7 @@ class TrueARIMAXPredictor(ARIMAXPredictor):
             'valid_forecasts': predictions_df['forecast_valid'].sum() if 'forecast_valid' in predictions_df.columns else len(predictions_df)
         }
 
-        # Return statistics
+        # return statistics
         if 'predicted_return' in predictions_df.columns:
             return_stats = predictions_df['predicted_return'].describe()
             summary['return_statistics'] = {
@@ -298,7 +302,7 @@ class TrueARIMAXPredictor(ARIMAXPredictor):
                 'max': return_stats['max']
             }
 
-            # Directional predictions
+            # directional predictions
             positive_predictions = (predictions_df['predicted_return'] > 0).sum()
             summary['directional_split'] = {
                 'positive_predictions': positive_predictions,
@@ -306,7 +310,7 @@ class TrueARIMAXPredictor(ARIMAXPredictor):
                 'positive_percentage': positive_predictions / len(predictions_df) * 100
             }
 
-            # Top/bottom predicted performers (next week only)
+            # top/bottom predicted performers (next week only)
             next_week_predictions = predictions_df.groupby('ticker')['predicted_return'].first()
             summary['top_predicted_performers'] = next_week_predictions.nlargest(10).to_dict()
             summary['bottom_predicted_performers'] = next_week_predictions.nsmallest(10).to_dict()
@@ -314,16 +318,7 @@ class TrueARIMAXPredictor(ARIMAXPredictor):
         return summary
 
     def save_predictions(self, predictions_df: pd.DataFrame, filename: str = None) -> str:
-        """
-        Save future predictions to CSV file.
-
-        Args:
-            predictions_df: DataFrame with predictions
-            filename: Custom filename (optional)
-
-        Returns:
-            Path to saved file
-        """
+        
         if filename is None:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"future_forecasts_{timestamp}.csv"
@@ -337,23 +332,20 @@ class TrueARIMAXPredictor(ARIMAXPredictor):
         return filepath
 
 def main():
-    """Main future prediction script."""
+    
     import argparse
 
     parser = argparse.ArgumentParser(description='Generate true future predictions using ARIMAX models')
     parser.add_argument('--ticker', type=str, default=None,
                        help='Predict specific ticker and save to CSV (default: predict all)')
-    parser.add_argument('--data-file', type=str, default='../dataset/stock_dataset_with_lags.csv',
-                       help='Path to the dataset with historical data')
+    parser.add_argument('--data-file', type=str, default='dataset/stock_dataset_with_lags.csv',
+                       help='Path to the dataset with historical data (relative to greenfield/ directory)')
     parser.add_argument('--periods', type=int, default=4,
                        help='Number of future periods to predict (default: 4)')
-    parser.add_argument('--models-dir', type=str, default='arimaxmodels',
+    parser.add_argument('--models-dir', type=str, default='arimax/arimaxmodels',
                        help='Directory containing trained models')
-    parser.add_argument('--results-dir', type=str, default='arimaxresults',
+    parser.add_argument('--results-dir', type=str, default='arimax/arimaxresults',
                        help='Directory to save forecast results')
-    parser.add_argument('--forecasting-mode', type=str, default='individual',
-                       choices=['individual', 'var'],
-                       help='Exogenous forecasting mode (default: individual)')
     parser.add_argument('--no-confidence', action='store_true',
                        help='Skip confidence interval calculation')
     parser.add_argument('--no-save', action='store_true',
@@ -361,20 +353,20 @@ def main():
 
     args = parser.parse_args()
 
-    # Suppress warnings
+    # suppress warnings
     warnings.filterwarnings('ignore')
 
-    predictor = TrueARIMAXPredictor(args.models_dir, args.results_dir)
+    predictor = ARIMAXPredictor(args.models_dir, args.results_dir)
 
     try:
         if args.ticker:
-            # Predict single stock
+            # predict single stock
             print(f"Generating future forecasts for {args.ticker}...")
 
             result = predictor.predict_future_single_stock(
                 args.ticker, args.data_file, args.periods,
                 return_confidence=not args.no_confidence,
-                forecasting_mode=args.forecasting_mode
+                
             )
 
             if 'error' in result:
@@ -391,26 +383,22 @@ def main():
                     line += f" [{ci_low:.4f}, {ci_high:.4f}]"
                 print(line)
 
-            # Print forecast validation
-            validation = result.get('forecast_validation', {})
-            if validation:
-                print(f"\nForecast Validation:")
-                for check, passed in validation.items():
-                    status = "PASS" if passed else "FAIL"
-                    print(f"  {check}: {status}")
+            # print forecast validation status
+            if result.get('forecast_valid'):
+                print(f"\nForecast Status: VALID")
 
-            # Save single stock results to CSV file (unless --no-save specified)
+            # save single stock results to csv file (unless --no-save specified)
             if not args.no_save:
                 try:
-                    # Convert single stock result to DataFrame format
+                    # convert single stock result to dataframe format
                     single_stock_df = predictor.predict_future_multiple_stocks(
                         [args.ticker], args.data_file, args.periods,
                         return_confidence=not args.no_confidence,
-                        forecasting_mode=args.forecasting_mode
+                        
                     )
 
                     if not single_stock_df.empty:
-                        # Generate filename with ticker and timestamp
+                        # generate filename with ticker and timestamp
                         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                         filename = f"future_forecasts_{args.ticker}_{timestamp}.csv"
                         saved_file = predictor.save_predictions(single_stock_df, filename)
@@ -425,11 +413,11 @@ def main():
                 print(f"\nNote: Results not saved (--no-save flag specified)")
 
         else:
-            # Generate comprehensive report
+            # generate comprehensive report
             print("Generating future forecasts for all available models...")
 
             report = predictor.generate_future_forecast_report(
-                args.data_file, args.periods, args.forecasting_mode, save_results=True
+                args.data_file, args.periods, save_results=True
             )
 
             if 'error' in report:
@@ -445,7 +433,7 @@ def main():
             print(f"Total forecasts: {summary['total_forecasts']}")
             print(f"Forecast period: {summary['date_range']['start']} to {summary['date_range']['end']}")
             print(f"Valid forecasts: {summary['valid_forecasts']}")
-            print(f"Exogenous forecasting mode: {report['forecasting_mode']}")
+            print()
 
             if 'return_statistics' in summary:
                 stats = summary['return_statistics']

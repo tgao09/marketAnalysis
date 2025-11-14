@@ -2,3 +2,9 @@
 .venv
 training_stocks.txt
 ClAUDE.md
+*.pyc
+*.csv
+__pycache__/
+.ipynb_checkpoints/
+.env
+*.pkl

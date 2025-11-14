@@ -7,24 +7,24 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def load_dataset(file_path: str = 'dataset/stock_dataset.csv') -> pd.DataFrame:
-    """Load and validate the stock dataset CSV file."""
+    
     try:
         df = pd.read_csv(file_path)
 
-        # Clean column names (remove extra spaces)
+        # clean column names (remove extra spaces)
         df.columns = df.columns.str.strip()
 
-        # Validate required columns (updated for normalized returns dataset)
+        # validate required columns (updated for normalized returns dataset)
         required_columns = ['ticker', 'Date', 'weekly_return', 'high_return', 'low_return', 'volume_change', 'volatility']
         missing_columns = [col for col in required_columns if col not in df.columns]
 
         if missing_columns:
             raise ValueError(f"Missing required columns: {missing_columns}")
 
-        # Convert Date column to datetime
+        # convert date column to datetime
         df['Date'] = pd.to_datetime(df['Date'])
 
-        # Sort by ticker and Date to ensure proper chronological order
+        # sort by ticker and date to ensure proper chronological order
         df = df.sort_values(['ticker', 'Date']).reset_index(drop=True)
 
         logger.info(f"Loaded dataset with {len(df)} records for {df['ticker'].nunique()} stocks")
@@ -40,19 +40,19 @@ def load_dataset(file_path: str = 'dataset/stock_dataset.csv') -> pd.DataFrame:
         raise
 
 def validate_lag_parameters(n_lags: int, features_to_lag: List[str], df_columns: List[str]) -> None:
-    """Validate lag parameters before processing."""
+    
     if n_lags < 1:
         raise ValueError("n_lags must be at least 1")
 
     if n_lags > 50:
         logger.warning(f"Large number of lags ({n_lags}) may create a very wide dataset")
 
-    # Check if features_to_lag exist in the dataset
+    # check if features_to_lag exist in the dataset
     missing_features = [feature for feature in features_to_lag if feature not in df_columns]
     if missing_features:
         raise ValueError(f"Features not found in dataset: {missing_features}")
 
-    # Warn about non-numeric features
+    # warn about non-numeric features
     reserved_columns = ['ticker', 'Date']
     invalid_features = [feature for feature in features_to_lag if feature in reserved_columns]
     if invalid_features:
@@ -62,55 +62,71 @@ def create_lag_features(input_file: str = 'dataset/stock_dataset.csv',
                        n_lags: int = 3,
                        features_to_lag: List[str] = None,
                        output_file: str = 'dataset/stock_dataset_with_lags.csv') -> pd.DataFrame:
-    """
-    Create lagged features for time series analysis.
-
-    Args:
-        input_file: Path to input CSV file
-        n_lags: Number of time steps to lag
-        features_to_lag: List of column names to create lags for
-        output_file: Path to save the output CSV file
-
-    Returns:
-        pandas.DataFrame: Dataset with original and lagged features
-    """
-    # Set default features to lag if not specified (updated for normalized returns)
-    if features_to_lag is None:
-        features_to_lag = ['weekly_return', 'high_return', 'low_return', 'volume_change', 'volatility']
-
-    # Load the dataset
+    
+    # load the dataset first
     df = load_dataset(input_file)
 
-    # Validate parameters
+    # set default features to lag if not specified (updated for market + momentum features)
+    # note: sharpe_ratio_3m is excluded - it's a stock quality metric that should not be lagged
+    if features_to_lag is None:
+        features_to_lag = [
+            'weekly_return', 'high_return', 'low_return', 'volume_change', 'volatility',
+            # market features
+            'SPY_return', '^VIX_return', 'XLF_return', 'XLK_return', 'XLE_return',
+            'XLV_return', 'XLI_return', 'XLY_return', 'XLP_return', 'XLU_return', 'XLRE_return',
+            'SPY_volatility', '^VIX_volatility', 'XLF_volatility', 'XLK_volatility', 'XLE_volatility',
+            'XLV_volatility', 'XLI_volatility', 'XLY_volatility', 'XLP_volatility', 'XLU_volatility', 'XLRE_volatility',
+            # momentum features
+            'momentum_4w', 'momentum_12w', 'momentum_52w', 'price_to_52w_high'
+            # sharpe_ratio_3m is intentionally excluded - passed through without lagging
+        ]
+
+        # filter to only include features that exist in the dataset
+        features_to_lag = [f for f in features_to_lag if f in df.columns]
+        logger.info(f"Auto-detected {len(features_to_lag)} features to lag from dataset")
+
+        # check if sharpe_ratio_3m exists and log it's being passed through
+        if 'sharpe_ratio_3m' in df.columns:
+            logger.info("sharpe_ratio_3m found - will be passed through without lagging")
+
+    # validate parameters
     validate_lag_parameters(n_lags, features_to_lag, df.columns.tolist())
 
     logger.info(f"Creating {n_lags} lag features for: {features_to_lag}")
 
-    # Create lagged features
+    # create lagged features
     lagged_dfs = []
 
     for ticker in df['ticker'].unique():
         ticker_data = df[df['ticker'] == ticker].copy()
 
-        # Create lag features for this ticker
+        # create lag features for this ticker
         for feature in features_to_lag:
             for lag in range(1, n_lags + 1):
                 lag_column_name = f"{feature}_lag_{lag}"
                 ticker_data[lag_column_name] = ticker_data[feature].shift(lag)
 
+        # fill nan values in lagged momentum features (first n_lags rows will be nan due to shifting)
+        # base momentum features are already filled in construct_dataset.py
+        lagged_momentum_cols = [col for col in ticker_data.columns
+                               if '_lag_' in col and ('momentum' in col or 'price_to_52w' in col)]
+        if lagged_momentum_cols:
+            # forward fill: use the first available value for early lags
+            ticker_data[lagged_momentum_cols] = ticker_data[lagged_momentum_cols].bfill()
+
         lagged_dfs.append(ticker_data)
         logger.debug(f"Processed lags for {ticker}")
 
-    # Combine all ticker data
+    # combine all ticker data
     result_df = pd.concat(lagged_dfs, ignore_index=True)
 
-    # Sort by ticker and Date
+    # sort by ticker and date
     result_df = result_df.sort_values(['ticker', 'Date']).reset_index(drop=True)
 
-    # Save to file
+    # save to file
     result_df.to_csv(output_file, index=False)
 
-    # Log summary
+    # log summary
     total_features = len(features_to_lag) * n_lags
     original_rows = len(df)
     rows_with_complete_data = len(result_df.dropna())
@@ -123,22 +139,22 @@ def create_lag_features(input_file: str = 'dataset/stock_dataset.csv',
     return result_df
 
 def get_lag_info(df: pd.DataFrame, n_lags: int, features_to_lag: List[str]) -> Dict[str, Any]:
-    """Get summary information about the lagged dataset."""
+    
     if df.empty:
         return {"error": "Dataset is empty"}
 
-    # Identify lag columns
+    # identify lag columns
     lag_columns = []
     for feature in features_to_lag:
         for lag in range(1, n_lags + 1):
             lag_columns.append(f"{feature}_lag_{lag}")
 
-    # Calculate statistics
+    # calculate statistics
     total_rows = len(df)
     complete_rows = len(df.dropna())
     missing_data_pct = ((total_rows - complete_rows) / total_rows) * 100
 
-    # Missing data by stock (first n_lags rows per stock will have NaN)
+    # missing data by stock (first n_lags rows per stock will have nan)
     stocks_count = df['ticker'].nunique()
     expected_missing = stocks_count * n_lags
 
@@ -171,14 +187,14 @@ if __name__ == "__main__":
     parser.add_argument('--n-lags', type=int, default=3,
                        help='Number of lag steps to create (default: 3)')
     parser.add_argument('--features', type=str, nargs='*',
-                       default=['weekly_return', 'high_return', 'low_return', 'volume_change', 'volatility'],
-                       help='Features to create lags for (default: all return features)')
+                       default=None,  # use none to trigger default list with market + momentum features
+                       help='Features to create lags for (default: all features including market and momentum)')
 
     args = parser.parse_args()
 
     print(f"Creating {args.n_lags} lagged features for normalized returns dataset...")
 
-    # Create dataset with specified lag steps
+    # create dataset with specified lag steps
     lagged_dataset = create_lag_features(
         input_file=args.input_file,
         n_lags=args.n_lags,
@@ -186,11 +202,16 @@ if __name__ == "__main__":
         output_file=args.output_file
     )
 
-    # Display summary information
+    # get the actual features that were lagged (from the dataset)
+    actual_features = [col.replace('_lag_1', '').replace('_lag_2', '').replace('_lag_3', '')
+                      for col in lagged_dataset.columns if '_lag_' in col]
+    actual_features = list(set(actual_features))  # remove duplicates
+
+    # display summary information
     lag_info = get_lag_info(
         lagged_dataset,
         n_lags=args.n_lags,
-        features_to_lag=args.features
+        features_to_lag=actual_features
     )
 
     print("\nLag Features Summary:")
@@ -201,7 +222,7 @@ if __name__ == "__main__":
     print(f"Stocks processed: {lag_info['stocks_processed']}")
     print(f"Date range: {lag_info['date_range']['start']} to {lag_info['date_range']['end']}")
 
-    # Show sample of lagged data
+    # show sample of lagged data
     print(f"\nSample of dataset with lag features:")
     sample_cols = ['ticker', 'Date', 'weekly_return', 'weekly_return_lag_1', 'weekly_return_lag_2', 'volume_change', 'volume_change_lag_1']
     available_cols = [col for col in sample_cols if col in lagged_dataset.columns]
