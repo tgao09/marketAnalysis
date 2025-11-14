@@ -70,7 +70,7 @@ def get_sp500_tickers_from_alternatives() -> FetchResult:
     )
 
 
-def save_tickers_to_file(tickers: Iterable[str], filename: str = "training_stocks.txt") -> None:
+def save_tickers_to_file(tickers: Iterable[str], filename: str = "dataset/training_stocks.txt") -> None:
     tickers_list = list(tickers)
     if not tickers_list:
         raise ValueError("Ticker list is empty; nothing to write.")
