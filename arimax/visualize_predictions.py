@@ -11,7 +11,7 @@ import glob
 import yfinance as yf
 
 
-def get_all_prediction_files(predictions_dir="./arimaxresults", file_type="future"):
+def get_all_prediction_files(predictions_dir="./arimax/results", file_type="future"):
     
     if file_type == "future":
         pattern = os.path.join(predictions_dir, "future_forecasts_*.csv")
@@ -30,7 +30,7 @@ def get_all_prediction_files(predictions_dir="./arimaxresults", file_type="futur
     return sorted(files, key=os.path.getctime, reverse=True)  # most recent first
 
 
-def get_latest_prediction_file(predictions_dir="./arimaxresults", file_type="future"):
+def get_latest_prediction_file(predictions_dir="./arimax/results", file_type="future"):
     
     files = get_all_prediction_files(predictions_dir, file_type)
     return files[0] if files else None
@@ -385,7 +385,7 @@ def main():
     print("=== Stock Prediction Visualization ===\n")
 
     # configuration
-    predictions_dir = "arimaxresults"
+    predictions_dir = "arimax/results"
 
     # ask user for file type preference
     print("What type of predictions would you like to visualize?")
@@ -513,7 +513,7 @@ def plot_ticker_from_cmdline(ticker='AAPL', file_type='future'):
     
     try:
         # get prediction files
-        files = get_all_prediction_files('arimaxresults', file_type)
+        files = get_all_prediction_files('arimax/results', file_type)
         if not files:
             print(f"No {file_type} prediction files found")
             return

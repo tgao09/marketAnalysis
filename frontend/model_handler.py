@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Model Handler for ARIMAX Frontend
-Handles loading ARIMAX models and managing predictions
+Model Handler for Forecasting Frontend
+Supports loading ARIMAX and XGBoost models and managing predictions
 """
 
 import os
@@ -17,47 +17,71 @@ from datetime import datetime, timedelta
 project_root = os.path.join(os.path.dirname(__file__), '..')
 sys.path.append(os.path.join(project_root, 'greenfield', 'arimax'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'greenfield', 'dataset'))
+sys.path.append(os.path.join(project_root, 'xgboost'))
 logger = logging.getLogger(__name__)
 
 class ModelHandler:
     """
-    Handles ARIMAX model operations and prediction loading
+    Handles model operations and prediction loading for supported model types
     """
 
-    def __init__(self):
+    SUPPORTED_MODELS = ('arimax', 'xgboost')
+
+    def __init__(self, model_type: str = 'arimax'):
         """Initialize the model handler with project paths"""
         self.project_root = os.path.join(os.path.dirname(__file__), '..')
-        self.models_dir = os.path.join(self.project_root, 'greenfield', 'arimax', 'arimaxmodels')
-        self.results_dir = os.path.join(self.project_root, 'greenfield', 'arimax', 'arimaxresults')
         self.dataset_dir = os.path.join(self.project_root, 'greenfield', 'dataset')
+        self.model_type = model_type.lower()
 
+        if self.model_type not in self.SUPPORTED_MODELS:
+            raise ValueError(f"Unsupported model type '{model_type}'. Supported: {self.SUPPORTED_MODELS}")
+
+        if self.model_type == 'arimax':
+            self.models_dir = os.path.join(self.project_root, 'greenfield', 'arimax', 'arimaxmodels')
+            self.results_dir = os.path.join(self.project_root, 'greenfield', 'arimax', 'arimaxresults')
+        else:
+            # Tuned XGBoost models live in the dedicated directory
+            self.models_dir = os.path.join(self.project_root, 'xgboost', 'xgboostmodels_tuned')
+            self.results_dir = os.path.join(self.project_root, 'xgboost', 'xgboostresults')
+            os.makedirs(self.results_dir, exist_ok=True)
+        
+        
         # Cache for loaded predictions
         self._predictions_cache = {}
         self._cache_timestamp = None
 
     def get_available_tickers(self) -> List[str]:
         """
-        Get list of tickers with trained ARIMAX models
+        Get list of tickers with trained models for current model type
 
         Returns:
             List of ticker symbols
         """
         try:
-            if not os.path.exists(self.models_dir):
-                logger.warning(f"Models directory not found: {self.models_dir}")
+            if self.model_type == 'arimax':
+                if not os.path.exists(self.models_dir):
+                    logger.warning(f"Models directory not found: {self.models_dir}")
+                    return []
+
+                # Find all model files
+                model_files = glob.glob(os.path.join(self.models_dir, '*_arimax.pkl'))
+
+                # Extract ticker symbols from filenames
+                tickers = []
+                for model_file in model_files:
+                    filename = os.path.basename(model_file)
+                    ticker = filename.replace('_arimax.pkl', '')
+                    tickers.append(ticker)
+
+                return sorted(tickers)
+
+            # XGBoost models are cross-sectional; discover tickers from latest predictions
+            predictions_df = self.get_latest_predictions()
+            if predictions_df is None or predictions_df.empty:
+                logger.warning("No XGBoost predictions available to determine tickers")
                 return []
 
-            # Find all model files
-            model_files = glob.glob(os.path.join(self.models_dir, '*_arimax.pkl'))
-
-            # Extract ticker symbols from filenames
-            tickers = []
-            for model_file in model_files:
-                filename = os.path.basename(model_file)
-                ticker = filename.replace('_arimax.pkl', '')
-                tickers.append(ticker)
-
-            return sorted(tickers)
+            return sorted(predictions_df['ticker'].dropna().unique().tolist())
 
         except Exception as e:
             logger.error(f"Error getting available tickers: {e}")
@@ -75,8 +99,13 @@ class ModelHandler:
                 logger.warning(f"Results directory not found: {self.results_dir}")
                 return None
 
+            if self.model_type == 'arimax':
+                pattern = 'future_forecasts_*.csv'
+            else:
+                pattern = 'forecasts_*.csv'
+
             # Find prediction files
-            forecast_files = glob.glob(os.path.join(self.results_dir, 'future_forecasts_*.csv'))
+            forecast_files = glob.glob(os.path.join(self.results_dir, pattern))
 
             if not forecast_files:
                 logger.warning("No prediction files found")
@@ -90,12 +119,25 @@ class ModelHandler:
             df = pd.read_csv(latest_file)
 
             # Standardize date column
-            if 'future_date' in df.columns:
-                df['future_date'] = pd.to_datetime(df['future_date'])
-                df['date'] = df['future_date']
-            elif 'prediction_date' in df.columns:
-                df['prediction_date'] = pd.to_datetime(df['prediction_date'])
-                df['date'] = df['prediction_date']
+            if self.model_type == 'arimax':
+                if 'future_date' in df.columns:
+                    df['future_date'] = pd.to_datetime(df['future_date'])
+                    df['date'] = df['future_date']
+                elif 'prediction_date' in df.columns:
+                    df['prediction_date'] = pd.to_datetime(df['prediction_date'])
+                    df['date'] = df['prediction_date']
+            else:
+                if 'forecast_date' in df.columns:
+                    df['forecast_date'] = pd.to_datetime(df['forecast_date'])
+                    df['date'] = df['forecast_date']
+                elif 'date' in df.columns:
+                    df['date'] = pd.to_datetime(df['date'])
+
+                if 'latest_date' in df.columns:
+                    df['latest_date'] = pd.to_datetime(df['latest_date'])
+
+            if 'predicted_return' in df.columns:
+                df['predicted_return'] = pd.to_numeric(df['predicted_return'], errors='coerce')
 
             return df
 
@@ -134,19 +176,59 @@ class ModelHandler:
 
             ticker_predictions = self._predictions_cache[ticker].copy()
 
-            # Limit to requested periods
+            # Sort predictions chronologically and by horizon if available
+            sort_columns: List[str] = []
+            if self.model_type == 'xgboost' and 'horizon_weeks' in ticker_predictions.columns:
+                sort_columns.append('horizon_weeks')
+            if 'date' in ticker_predictions.columns:
+                sort_columns.append('date')
+
+            if sort_columns:
+                ticker_predictions = ticker_predictions.sort_values(sort_columns).reset_index(drop=True)
+
+            # For XGBoost, multiple horizons may exist; limit entries based on requested periods
             if len(ticker_predictions) > periods:
                 ticker_predictions = ticker_predictions.head(periods)
 
-            # Sort by date
-            if 'date' in ticker_predictions.columns:
-                ticker_predictions = ticker_predictions.sort_values('date').reset_index(drop=True)
+            if 'predicted_return' in ticker_predictions.columns:
+                ticker_predictions = ticker_predictions.dropna(subset=['predicted_return']).reset_index(drop=True)
+
+            ticker_predictions = self.convert_returns_to_prices(ticker_predictions, ticker)
 
             return ticker_predictions
 
         except Exception as e:
             logger.error(f"Error getting predictions for {ticker}: {e}")
             return None
+
+    def _discover_xgboost_models(self) -> Dict[int, str]:
+        """Discover available XGBoost models keyed by prediction horizon"""
+        models = {}
+
+        try:
+            if not os.path.exists(self.models_dir):
+                return models
+
+            for filename in os.listdir(self.models_dir):
+                if not filename.endswith('.pkl') or 'xgboost_' not in filename:
+                    continue
+
+                parts = filename.split('_')
+                if len(parts) < 2:
+                    continue
+
+                horizon_str = parts[1].replace('w', '')
+                try:
+                    horizon = int(horizon_str)
+                except ValueError:
+                    continue
+
+                models[horizon] = os.path.join(self.models_dir, filename)
+
+        except Exception as e:
+            logger.debug(f"Error discovering XGBoost models: {e}")
+
+        return models
 
     def get_historical_data(self, ticker: str, periods: int = 28) -> Optional[pd.DataFrame]:
         """
@@ -214,6 +296,10 @@ class ModelHandler:
                 return predictions_df
 
             df = predictions_df.copy()
+
+            if 'predicted_return' not in df.columns:
+                logger.debug("No predicted_return column available for price conversion")
+                return df
 
             # Get starting price from current market data
             starting_price = self._get_current_price(ticker)
@@ -329,10 +415,17 @@ class ModelHandler:
             Dict with model information
         """
         try:
-            model_path = os.path.join(self.models_dir, f"{ticker}_arimax.pkl")
+            if self.model_type == 'arimax':
+                model_path = os.path.join(self.models_dir, f"{ticker}_arimax.pkl")
 
-            if not os.path.exists(model_path):
-                return {'exists': False, 'error': f'Model not found for {ticker}'}
+                if not os.path.exists(model_path):
+                    return {'exists': False, 'error': f'Model not found for {ticker}'}
+            else:
+                # XGBoost uses cross-sectional models named by horizon
+                horizon_models = self._discover_xgboost_models()
+                if not horizon_models:
+                    return {'exists': False, 'error': 'No XGBoost models found'}
+                model_path = list(horizon_models.values())[0]
 
             # Get file stats
             stat = os.stat(model_path)
@@ -347,15 +440,19 @@ class ModelHandler:
 
             # Try to load model to get more details
             try:
-                import joblib
-                model_data = joblib.load(model_path)
+                if self.model_type == 'arimax':
+                    import joblib
+                    model_data = joblib.load(model_path)
 
-                if isinstance(model_data, dict):
-                    info.update({
-                        'model_order': model_data.get('best_order'),
-                        'aic_score': model_data.get('aic_score'),
-                        'feature_columns': model_data.get('feature_columns', [])
-                    })
+                    if isinstance(model_data, dict):
+                        info.update({
+                            'model_order': model_data.get('best_order'),
+                            'aic_score': model_data.get('aic_score'),
+                            'feature_columns': model_data.get('feature_columns', [])
+                        })
+                else:
+                    info['model_type'] = 'xgboost'
+                    info['available_horizons'] = sorted(self._discover_xgboost_models().keys())
 
             except Exception as e:
                 logger.debug(f"Could not load model details for {ticker}: {e}")
@@ -374,9 +471,11 @@ class ModelHandler:
             Dict with summary information
         """
         try:
+            available_tickers = self.get_available_tickers()
             summary = {
-                'available_models': len(self.get_available_tickers()),
-                'tickers': self.get_available_tickers()
+                'model_type': self.model_type,
+                'available_models': len(available_tickers),
+                'tickers': available_tickers
             }
 
             # Get predictions info

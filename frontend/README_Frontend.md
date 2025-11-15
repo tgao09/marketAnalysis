@@ -67,8 +67,8 @@ The frontend integrates with your existing ARIMAX pipeline:
 
 - **Dataset Updates**: Calls `greenfield/dataset/construct_dataset.py` + `lag_features.py`
 - **Prediction Generation**: Executes `greenfield/arimax/forecast_arimax.py`
-- **Model Loading**: Reads from `greenfield/arimax/arimaxmodels/`
-- **Results Display**: Shows data from `greenfield/arimax/arimaxresults/`
+- **Model Loading**: Reads from `greenfield/arimax/models/`
+- **Results Display**: Shows data from `greenfield/arimax/results/`
 
 ## Architecture
 
@@ -118,7 +118,7 @@ python -m pytest test_frontend.py::test_app_loads -v
 
 If you see "No trained models found":
 
-1. Ensure trained models exist in `greenfield/arimax/arimaxmodels/`
+1. Ensure trained models exist in `greenfield/arimax/models/`
 2. Models should be named like `{TICKER}_arimax.pkl`
 3. Run model training first if needed
 

@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 
 def create_prediction_chart(predictions_df: pd.DataFrame, ticker: str,
                           show_confidence: bool = True,
-                          show_historical: bool = True) -> go.Figure:
+                          show_historical: bool = True,
+                          model_type: str = 'arimax') -> go.Figure:
     """
     Create interactive prediction chart with Plotly
 
@@ -235,10 +236,14 @@ def create_prediction_chart(predictions_df: pd.DataFrame, ticker: str,
                     )
 
         # Customize layout
+        model_label = 'ARIMAX' if model_type.lower() == 'arimax' else 'XGBoost'
+
         fig.update_layout(
             title=dict(
-                text=f'<b>{ticker} Stock Price Forecast</b><br>' +
-                     '<sub>Historical Data + ARIMAX Predictions</sub>',
+                text=(
+                    f'<b>{ticker} Stock Price Forecast</b><br>'
+                    f'<sub>Historical Data + {model_label} Predictions</sub>'
+                ),
                 x=0.5,
                 font=dict(size=20)
             ),
@@ -345,6 +350,12 @@ def create_summary_table(predictions_df: pd.DataFrame) -> pd.DataFrame:
                 'Predicted Return': f"{row['predicted_return']:.4f}" if 'predicted_return' in row else 'N/A',
                 'Return %': f"{row['predicted_return']*100:.2f}%" if 'predicted_return' in row else 'N/A'
             }
+
+            if 'horizon_weeks' in row:
+                try:
+                    row_data['Horizon (w)'] = int(row['horizon_weeks'])
+                except (ValueError, TypeError):
+                    row_data['Horizon (w)'] = row['horizon_weeks']
 
             # Add price if available
             if 'stock_price' in row:

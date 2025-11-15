@@ -23,7 +23,7 @@ class WalkForwardTester:
     
 
     def __init__(self,
-                 model_dir: str = "arimax/arimaxmodels",
+                 model_dir: str = "arimax/models",
                  data_file: str = "dataset/stock_dataset_with_lags.csv",
                  n_models: int = 10,
                  test_weeks: int = 12,
@@ -505,7 +505,8 @@ class WalkForwardTester:
 
         # save results
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = f"arimax/arimaxresults/walk_forward_test_{timestamp}.csv"
+        output_file = f"arimax/results/walk_forward_test_{timestamp}.csv"
+        Path(output_file).parent.mkdir(parents=True, exist_ok=True)
         results_df.to_csv(output_file, index=False)
         print(f"\nResults saved to: {output_file}")
 

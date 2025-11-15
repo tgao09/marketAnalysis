@@ -22,7 +22,7 @@ warnings.filterwarnings('ignore')
 class ARIMAXPredictor:
     
 
-    def __init__(self, models_dir: str = 'arimax/arimaxmodels', results_dir: str = 'arimax/arimaxresults'):
+    def __init__(self, models_dir: str = 'arimax/models', results_dir: str = 'arimax/results'):
         
         self.models_dir = models_dir
         self.results_dir = results_dir
@@ -342,9 +342,9 @@ def main():
                        help='Path to the dataset with historical data (relative to greenfield/ directory)')
     parser.add_argument('--periods', type=int, default=4,
                        help='Number of future periods to predict (default: 4)')
-    parser.add_argument('--models-dir', type=str, default='arimax/arimaxmodels',
+    parser.add_argument('--models-dir', type=str, default='arimax/models',
                        help='Directory containing trained models')
-    parser.add_argument('--results-dir', type=str, default='arimax/arimaxresults',
+    parser.add_argument('--results-dir', type=str, default='arimax/results',
                        help='Directory to save forecast results')
     parser.add_argument('--no-confidence', action='store_true',
                        help='Skip confidence interval calculation')

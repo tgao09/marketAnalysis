@@ -7,7 +7,7 @@ print("="*60)
 
 # determine file path
 script_dir = os.path.dirname(os.path.abspath(__file__))
-results_file = os.path.join(script_dir, 'arimaxresults', 'model_summary.csv')
+results_file = os.path.join(script_dir, 'arimax/results', 'model_summary.csv')
 
 # load new results
 new_results = pd.read_csv(results_file)

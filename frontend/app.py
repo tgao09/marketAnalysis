@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ARIMAX Stock Forecasting Frontend
-Streamlit web application for interactive stock predictions using ARIMAX models
+Stock Forecasting Frontend
+Streamlit web application for interactive stock predictions using ARIMAX or XGBoost models
 """
 
 import streamlit as st
@@ -15,6 +15,7 @@ import logging
 # Add paths for importing modules
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'greenfield', 'arimax'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'greenfield', 'dataset'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'xgboost'))
 sys.path.append(os.path.join(os.path.dirname(__file__)))
 
 try:
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 # Page configuration
 st.set_page_config(
-    page_title="ARIMAX Stock Forecasting",
+    page_title="Stock Forecasting Dashboard",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -40,8 +41,10 @@ st.set_page_config(
 # Initialize session state
 if 'data_controller' not in st.session_state:
     st.session_state.data_controller = DataController()
+if 'model_type' not in st.session_state:
+    st.session_state.model_type = 'arimax'
 if 'model_handler' not in st.session_state:
-    st.session_state.model_handler = ModelHandler()
+    st.session_state.model_handler = ModelHandler(model_type=st.session_state.model_type)
 if 'last_update_time' not in st.session_state:
     st.session_state.last_update_time = None
 if 'last_prediction_time' not in st.session_state:
@@ -50,9 +53,24 @@ if 'last_prediction_time' not in st.session_state:
 def main():
     """Main Streamlit application"""
 
+    # Sidebar controls
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        selected_model = st.radio(
+            "Model Family",
+            options=["ARIMAX", "XGBoost"],
+            index=0 if st.session_state.model_type == 'arimax' else 1,
+            help="Choose between per-ticker ARIMAX models or tuned cross-sectional XGBoost models"
+        )
+
+    if selected_model.lower() != st.session_state.model_type:
+        st.session_state.model_type = selected_model.lower()
+        st.session_state.model_handler = ModelHandler(model_type=st.session_state.model_type)
+
     # Header
-    st.title("📈 ARIMAX Stock Forecasting")
-    st.markdown("Interactive stock price predictions using ARIMAX time series models")
+    st.title("📈 Stock Forecasting Dashboard")
+    model_description = "ARIMAX time series" if st.session_state.model_type == 'arimax' else "tuned XGBoost cross-sectional"
+    st.markdown(f"Interactive stock price predictions using **{model_description}** models")
 
     # Prediction Settings (moved up to define periods before it's used)
     st.subheader("🎛️ Prediction Settings")
@@ -94,26 +112,58 @@ def main():
             selected_ticker = st.selectbox(
                 "Select a stock ticker:",
                 options=[""] + sorted(available_tickers),
-                help="Choose from trained ARIMAX models"
+                help="Choose from available trained models"
             )
         else:
-            st.warning("⚠️ No trained models found. Please update dataset and generate predictions first.")
+            st.warning("⚠️ No trained predictions found. Please generate forecasts first.")
             selected_ticker = ""
 
     with col2:
         # Align button with selectbox by adding some vertical spacing
         st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
-        if st.button("🎯 Generate Forecast", disabled=not selected_ticker, help=f"Generate forecast for {selected_ticker}" if selected_ticker else "Select a ticker first", use_container_width=True):
-            if selected_ticker:
-                with st.spinner(f"Generating forecast for {selected_ticker}..."):
+        button_help = (
+            f"Generate {selected_model.upper()} forecast for {selected_ticker}" if selected_ticker
+            else (
+                "Generate tuned XGBoost forecasts" if st.session_state.model_type == 'xgboost'
+                else "Select a ticker first"
+            )
+        )
+        button_disabled = (
+            st.session_state.model_type == 'arimax' and not selected_ticker
+        )
+        if st.button("🎯 Generate Forecast", disabled=button_disabled,
+                     help=button_help, use_container_width=True):
+            if st.session_state.model_type == 'arimax' and not selected_ticker:
+                st.error("Please select a ticker before generating forecasts.")
+            else:
+                spinner_text = (
+                    f"Generating forecast for {selected_ticker}..."
+                    if st.session_state.model_type == 'arimax'
+                    else "Generating XGBoost forecasts..."
+                )
+                with st.spinner(spinner_text):
                     try:
-                        # Use the new ticker-specific forecast generation method
-                        result = st.session_state.data_controller.generate_ticker_forecast(selected_ticker, periods)
+                        if st.session_state.model_type == 'arimax':
+                            result = st.session_state.data_controller.generate_ticker_forecast(selected_ticker, periods)
+                        else:
+                            # Generate cross-sectional forecasts using tuned XGBoost models
+                            result = st.session_state.data_controller.generate_xgboost_forecasts(periods)
                         if result['success']:
                             st.session_state.last_prediction_time = datetime.now()
                             # Reload model handler to pick up new predictions
-                            st.session_state.model_handler = ModelHandler()
-                            st.success(f"✅ Forecast generated for {selected_ticker} - {result.get('periods', 'unknown')} periods")
+                            st.session_state.model_handler = ModelHandler(model_type=st.session_state.model_type)
+                            if st.session_state.model_type == 'arimax':
+                                success_message = (
+                                    f"✅ Forecast generated for {selected_ticker} - {result.get('periods', 'unknown')} periods"
+                                )
+                            else:
+                                horizons = ', '.join(str(h) for h in result.get('horizons', []))
+                                if not horizons:
+                                    horizons = 'all tuned horizons'
+                                success_message = (
+                                    f"✅ XGBoost forecasts updated (horizons: {horizons})"
+                                )
+                            st.success(success_message)
                         else:
                             st.error(f"❌ Forecast generation failed: {result.get('error', 'Unknown error')}")
                     except Exception as e:
@@ -158,6 +208,7 @@ def main():
         # Show system status
         if available_tickers:
             st.metric("Available Models", len(available_tickers))
+        st.metric("Model Family", selected_model.upper())
 
     with col3:
         # Show last update time
@@ -183,7 +234,8 @@ def main():
                 if predictions is not None and not predictions.empty:
                     # Create visualization
                     fig = create_prediction_chart(
-                        predictions, ticker, show_confidence, show_historical
+                        predictions, ticker, show_confidence, show_historical,
+                        model_type=st.session_state.model_type
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
@@ -198,12 +250,33 @@ def main():
                         col1, col2, col3 = st.columns(3)
 
                         with col1:
-                            st.metric("Model Order", model_info.get('model_order', 'Unknown'))
+                            if st.session_state.model_type == 'arimax':
+                                st.metric("Model Order", model_info.get('model_order', 'Unknown'))
+                            else:
+                                horizon = model_info.get('horizon_weeks') or periods
+                                horizon_display = f"{int(horizon)}w" if horizon else 'N/A'
+                                st.metric("Forecast Horizon", horizon_display)
                         with col2:
-                            st.metric("Model AIC", f"{model_info.get('model_aic', 0):.2f}")
+                            if st.session_state.model_type == 'arimax':
+                                model_aic = model_info.get('model_aic')
+                                st.metric("Model AIC", f"{model_aic:.2f}" if model_aic is not None else "N/A")
+                            else:
+                                latest_date = model_info.get('latest_date')
+                                if hasattr(latest_date, 'strftime'):
+                                    latest_display = latest_date.strftime('%Y-%m-%d')
+                                else:
+                                    latest_display = latest_date if latest_date else 'N/A'
+                                st.metric("Latest Data", latest_display)
                         with col3:
-                            forecast_valid = model_info.get('forecast_valid', False)
-                            st.metric("Forecast Valid", "✅ Yes" if forecast_valid else "❌ No")
+                            if st.session_state.model_type == 'arimax':
+                                forecast_valid = model_info.get('forecast_valid', False)
+                                st.metric("Forecast Valid", "✅ Yes" if forecast_valid else "❌ No")
+                            else:
+                                predicted_return = model_info.get('predicted_return')
+                                return_display = (
+                                    f"{predicted_return * 100:.2f}%" if predicted_return is not None else 'N/A'
+                                )
+                                st.metric("Predicted Return", return_display)
 
                 else:
                     st.error(f"❌ No predictions available for {ticker}")
@@ -220,7 +293,7 @@ def main():
     # Footer
     st.markdown("---")
     st.markdown(
-        "🤖 **ARIMAX Stock Forecasting** | "
+        "🤖 **Stock Forecasting Dashboard** | "
         "Built with Streamlit | "
         f"Models: {len(available_tickers) if available_tickers else 0} | "
         f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"

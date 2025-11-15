@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Data Controller for ARIMAX Frontend
-Handles dataset updates and prediction generation
+Data Controller for Forecasting Frontend
+Handles dataset updates and prediction generation for ARIMAX and XGBoost models
 """
 
 import os
 import sys
 import subprocess
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List
 from datetime import datetime
 
 # Add paths for importing modules
@@ -19,9 +19,7 @@ sys.path.append(os.path.join(project_root, 'greenfield', 'dataset'))
 logger = logging.getLogger(__name__)
 
 class DataController:
-    """
-    Handles data pipeline operations for the ARIMAX frontend
-    """
+    """Handles data pipeline operations for the forecasting frontend"""
 
     def __init__(self):
         """Initialize the data controller with project paths"""
@@ -29,9 +27,13 @@ class DataController:
         self.dataset_dir = os.path.join(self.project_root, 'greenfield', 'dataset')
         self.arimax_dir = os.path.join(self.project_root, 'greenfield', 'arimax')
         self.results_dir = os.path.join(self.arimax_dir, 'arimaxresults')
+        self.xgboost_dir = os.path.join(self.project_root, 'xgboost')
+        self.xgboost_models_dir = os.path.join(self.xgboost_dir, 'xgboostmodels_tuned')
+        self.xgboost_results_dir = os.path.join(self.xgboost_dir, 'xgboostresults')
 
-        # Ensure results directory exists
+        # Ensure results directories exist
         os.makedirs(self.results_dir, exist_ok=True)
+        os.makedirs(self.xgboost_results_dir, exist_ok=True)
 
     def update_dataset(self) -> Dict[str, Any]:
         """
@@ -304,7 +306,7 @@ class DataController:
                     sys.executable, forecast_script,
                     '--data-file', dataset_file,
                     '--periods', '4',
-                    '--models-dir', os.path.join(self.arimax_dir, 'arimaxmodels'),
+                    '--models-dir', os.path.join(self.arimax_dir, 'models'),
                     '--results-dir', self.results_dir,
                     '--forecasting-mode', 'individual'
                 ],
@@ -509,7 +511,7 @@ class DataController:
                     '--ticker', ticker,
                     '--data-file', dataset_file,
                     '--periods', str(periods),
-                    '--models-dir', os.path.join(self.arimax_dir, 'arimaxmodels'),
+                    '--models-dir', os.path.join(self.arimax_dir, 'models'),
                     '--results-dir', self.results_dir,
                     '--forecasting-mode', 'individual'
                 ],
@@ -555,6 +557,136 @@ class DataController:
             }
         except Exception as e:
             logger.error(f"Forecast generation failed for {ticker}: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+
+    def _discover_xgboost_horizons(self) -> List[int]:
+        """Discover available XGBoost horizons based on tuned models"""
+        horizons: List[int] = []
+
+        try:
+            if not os.path.exists(self.xgboost_models_dir):
+                return horizons
+
+            for filename in os.listdir(self.xgboost_models_dir):
+                if not filename.endswith('.pkl') or 'xgboost_' not in filename:
+                    continue
+
+                parts = filename.split('_')
+                if len(parts) < 2:
+                    continue
+
+                horizon_str = parts[1].replace('w', '')
+                try:
+                    horizon = int(horizon_str)
+                except ValueError:
+                    continue
+
+                horizons.append(horizon)
+
+        except Exception as e:
+            logger.debug(f"Error discovering XGBoost horizons: {e}")
+
+        return sorted(set(horizons))
+
+    def generate_xgboost_forecasts(self, periods: int = 4,
+                                   recompute_technical: bool = True) -> Dict[str, Any]:
+        """
+        Generate XGBoost forecasts using tuned models
+
+        Args:
+            periods: Desired number of future periods (used to filter horizons)
+            recompute_technical: Whether to recompute technical indicators
+
+        Returns:
+            Dict containing success status and details
+        """
+
+        try:
+            logger.info("Starting XGBoost forecast generation...")
+
+            forecast_script = os.path.join(self.xgboost_dir, 'forecast_xgboost.py')
+
+            if not os.path.exists(forecast_script):
+                return {
+                    'success': False,
+                    'error': f'Forecast script not found: {forecast_script}'
+                }
+
+            data_file = os.path.join(self.xgboost_dir, 'features_engineered.csv')
+            if not os.path.exists(data_file):
+                return {
+                    'success': False,
+                    'error': f'Features dataset not found: {data_file}'
+                }
+
+            horizons = self._discover_xgboost_horizons()
+            if periods > 0:
+                horizons = [h for h in horizons if h <= periods] or horizons
+
+            if not horizons:
+                return {
+                    'success': False,
+                    'error': 'No tuned XGBoost models available'
+                }
+
+            command: List[str] = [
+                sys.executable,
+                forecast_script,
+                '--data-file', data_file,
+                '--models-dir', self.xgboost_models_dir,
+                '--results-dir', self.xgboost_results_dir
+            ]
+
+            if not recompute_technical:
+                command.append('--no-recompute-technical')
+
+            command.extend(['--horizons'] + [str(h) for h in horizons])
+
+            logger.info(f"Running XGBoost forecast with horizons: {horizons}")
+
+            result = subprocess.run(
+                command,
+                cwd=self.xgboost_dir,
+                capture_output=True,
+                text=True,
+                timeout=180
+            )
+
+            if result.returncode != 0:
+                return {
+                    'success': False,
+                    'error': f'XGBoost forecast failed: {result.stderr}',
+                    'stdout': result.stdout
+                }
+
+            import glob
+            forecast_files = glob.glob(os.path.join(self.xgboost_results_dir, 'forecasts_*.csv'))
+            if not forecast_files:
+                return {
+                    'success': False,
+                    'error': 'No forecast file was generated'
+                }
+
+            latest_file = max(forecast_files, key=os.path.getctime)
+            logger.info(f"XGBoost forecasts generated: {latest_file}")
+
+            return {
+                'success': True,
+                'file': latest_file,
+                'horizons': horizons,
+                'timestamp': datetime.now().isoformat()
+            }
+
+        except subprocess.TimeoutExpired:
+            return {
+                'success': False,
+                'error': 'XGBoost forecast generation timed out'
+            }
+        except Exception as e:
+            logger.error(f"XGBoost forecast generation failed: {e}")
             return {
                 'success': False,
                 'error': str(e)

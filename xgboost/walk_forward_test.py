@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class XGBoostWalkForwardTester:
     
 
-    def __init__(self, models_dir: str = 'xgboost/xgboostmodels',
+    def __init__(self, models_dir: str = 'xgboost/models',
                  data_file: str = 'xgboost/features_engineered.csv',
                  initial_capital: float = 10000.0,
                  transaction_cost: float = 0.001,

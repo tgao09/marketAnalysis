@@ -194,10 +194,10 @@ def analyze_feature_categories(feature_names: List[str]) -> Dict[str, int]:
 def main():
     parser = argparse.ArgumentParser(description='Feature selection for ARIMAX models')
     parser.add_argument('--input-file', type=str,
-                       default='greenfield/dataset/stock_dataset_with_lags.csv',
+                       default='dataset/stock_dataset_with_lags.csv',
                        help='Path to dataset with lagged features')
     parser.add_argument('--output-file', type=str,
-                       default='greenfield/dataset/selected_features.txt',
+                       default='dataset/selected_features.txt',
                        help='Output file for selected features')
     parser.add_argument('--top-n', type=int, default=30,
                        help='Number of features to select (default: 30)')
