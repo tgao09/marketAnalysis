@@ -404,8 +404,8 @@ Examples:
     )
 
     parser.add_argument('forecast_file', help='Path to future_forecasts CSV file')
-    parser.add_argument('model_summary_file', nargs='?', default='arimax/arimaxresults/model_summary.csv',
-                       help='Path to model_summary CSV file (default: arimax/arimaxresults/model_summary.csv)')
+    parser.add_argument('model_summary_file', nargs='?', default='arimax/results/model_summary.csv',
+                       help='Path to model_summary CSV file (default: arimax/results/model_summary.csv)')
     parser.add_argument('-n', '--num', type=int, default=10,
                        help='Number of top opportunities (default: 10)')
     parser.add_argument('-m', '--min-return', type=float, default=0.01,

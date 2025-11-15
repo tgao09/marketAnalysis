@@ -27,8 +27,8 @@ class ModelHandler:
     def __init__(self):
         """Initialize the model handler with project paths"""
         self.project_root = os.path.join(os.path.dirname(__file__), '..')
-        self.models_dir = os.path.join(self.project_root, 'greenfield', 'arimax', 'arimaxmodels')
-        self.results_dir = os.path.join(self.project_root, 'greenfield', 'arimax', 'arimaxresults')
+        self.models_dir = os.path.join(self.project_root, 'greenfield', 'arimax', 'models')
+        self.results_dir = os.path.join(self.project_root, 'greenfield', 'arimax', 'results')
         self.dataset_dir = os.path.join(self.project_root, 'greenfield', 'dataset')
 
         # Cache for loaded predictions

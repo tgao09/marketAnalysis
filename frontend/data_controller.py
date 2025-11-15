@@ -28,7 +28,7 @@ class DataController:
         self.project_root = os.path.join(os.path.dirname(__file__), '..')
         self.dataset_dir = os.path.join(self.project_root, 'greenfield', 'dataset')
         self.arimax_dir = os.path.join(self.project_root, 'greenfield', 'arimax')
-        self.results_dir = os.path.join(self.arimax_dir, 'arimaxresults')
+        self.results_dir = os.path.join(self.arimax_dir, 'results')
 
         # Ensure results directory exists
         os.makedirs(self.results_dir, exist_ok=True)
@@ -304,7 +304,7 @@ class DataController:
                     sys.executable, forecast_script,
                     '--data-file', dataset_file,
                     '--periods', '4',
-                    '--models-dir', os.path.join(self.arimax_dir, 'arimaxmodels'),
+                    '--models-dir', os.path.join(self.arimax_dir, 'models'),
                     '--results-dir', self.results_dir,
                     '--forecasting-mode', 'individual'
                 ],
@@ -509,7 +509,7 @@ class DataController:
                     '--ticker', ticker,
                     '--data-file', dataset_file,
                     '--periods', str(periods),
-                    '--models-dir', os.path.join(self.arimax_dir, 'arimaxmodels'),
+                    '--models-dir', os.path.join(self.arimax_dir, 'models'),
                     '--results-dir', self.results_dir,
                     '--forecasting-mode', 'individual'
                 ],

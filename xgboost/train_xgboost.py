@@ -25,8 +25,8 @@ class XGBoostTrainingPipeline:
     
 
     def __init__(self, data_file: str = 'xgboost/features_engineered.csv',
-                 models_dir: str = 'xgboost/xgboostmodels',
-                 results_dir: str = 'xgboost/xgboostresults',
+                 models_dir: str = 'xgboost/models',
+                 results_dir: str = 'xgboost/results/training',
                  horizons: List[int] = [1, 2, 4, 8],
                  cross_sectional: bool = True):
         
@@ -361,9 +361,9 @@ def main():
     parser = argparse.ArgumentParser(description='Train XGBoost models for stock prediction')
     parser.add_argument('--data-file', type=str, default='xgboost/features_engineered.csv',
                        help='Path to engineered features CSV')
-    parser.add_argument('--models-dir', type=str, default='xgboost/xgboostmodels',
+    parser.add_argument('--models-dir', type=str, default='xgboost/models',
                        help='Directory to save trained models')
-    parser.add_argument('--results-dir', type=str, default='xgboost/xgboostresults',
+    parser.add_argument('--results-dir', type=str, default='xgboost/results/training',
                        help='Directory to save results')
     parser.add_argument('--horizons', type=int, nargs='+', default=[1, 2, 4, 8],
                        help='Prediction horizons in weeks (default: 1 2 4 8)')

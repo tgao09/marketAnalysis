@@ -25,8 +25,8 @@ class HyperparameterTuner:
     
 
     def __init__(self, data_file: str = 'xgboost/features_engineered.csv',
-                 models_dir: str = 'xgboost/xgboostmodels_tuned',
-                 results_dir: str = 'xgboost/tuning_results'):
+                 models_dir: str = 'xgboost/models/tuned',
+                 results_dir: str = 'xgboost/results/tuning'):
         
         self.data_file = data_file
         self.models_dir = models_dir

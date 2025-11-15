@@ -103,8 +103,8 @@ def filter_stocks_for_training(df: pd.DataFrame, min_observations: int = 50) -> 
     return valid_stocks
 
 def train_all_models(data_file: str = '../dataset/stock_dataset_with_lags.csv',
-                    models_dir: str = 'arimaxmodels',
-                    results_dir: str = 'arimaxresults',
+                    models_dir: str = 'arimax/models',
+                    results_dir: str = 'arimax/results',
                     train_size: float = 0.8,
                     max_workers: int = 4,
                     min_observations: int = 50,
@@ -228,9 +228,9 @@ def main():
     parser = argparse.ArgumentParser(description='Train ARIMAX models for all stocks')
     parser.add_argument('--data-file', type=str, default='../dataset/stock_dataset_with_lags.csv',
                        help='Path to the lagged dataset file')
-    parser.add_argument('--models-dir', type=str, default='arimaxmodels',
+    parser.add_argument('--models-dir', type=str, default='arimax/models',
                        help='Directory to save trained models')
-    parser.add_argument('--results-dir', type=str, default='arimaxresults',
+    parser.add_argument('--results-dir', type=str, default='arimax/results',
                        help='Directory to save results')
     parser.add_argument('--train-size', type=float, default=0.8,
                        help='Proportion of data for training (default: 0.8)')

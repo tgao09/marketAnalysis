@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class ARIMAXPredictor:
     
 
-    def __init__(self, models_dir: str = 'arimaxmodels', results_dir: str = 'arimaxresults'):
+    def __init__(self, models_dir: str = 'arimax/models', results_dir: str = 'arimax/results'):
         
         self.models_dir = models_dir
         self.results_dir = results_dir
@@ -259,9 +259,9 @@ def main():
                        help='Path to the dataset with historical data')
     parser.add_argument('--periods', type=int, default=4,
                        help='Number of recent periods to backtest (default: 4)')
-    parser.add_argument('--models-dir', type=str, default='arimaxmodels',
+    parser.add_argument('--models-dir', type=str, default='arimax/models',
                        help='Directory containing trained models')
-    parser.add_argument('--results-dir', type=str, default='arimaxresults',
+    parser.add_argument('--results-dir', type=str, default='arimax/results',
                        help='Directory to save backtest results')
     parser.add_argument('--no-confidence', action='store_true',
                        help='Skip confidence interval calculation')

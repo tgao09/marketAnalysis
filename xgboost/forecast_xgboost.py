@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 class XGBoostForecaster:
     
 
-    def __init__(self, models_dir: str = 'xgboost/xgboostmodels',
-                 results_dir: str = 'xgboost/xgboostresults',
+    def __init__(self, models_dir: str = 'xgboost/models',
+                 results_dir: str = 'xgboost/results/forecasts',
                  recompute_technical: bool = True):
         
         self.models_dir = models_dir
@@ -152,10 +152,10 @@ def main():
     parser = argparse.ArgumentParser(description='Generate XGBoost forecasts')
     parser.add_argument('--data-file', type=str, default='xgboost/features_engineered.csv',
                        help='Path to features dataset')
-    parser.add_argument('--models-dir', type=str, default='xgboost/xgboostmodels',
+    parser.add_argument('--models-dir', type=str, default='xgboost/models',
                        help='Directory with trained models')
-    parser.add_argument('--results-dir', type=str, default='xgboost/xgboostresults',
-                       help='Output directory')
+    parser.add_argument('--results-dir', type=str, default='xgboost/results/forecasts',
+                       help='Output directory for forecast files')
     parser.add_argument('--horizons', type=int, nargs='*', default=None,
                        help='Horizons to forecast (default: all available)')
     parser.add_argument('--no-recompute-technical', action='store_true',

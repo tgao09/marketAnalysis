@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class ModelEvaluator:
     
 
-    def __init__(self, results_dir: str = 'arimaxresults', models_dir: str = 'arimaxmodels'):
+    def __init__(self, results_dir: str = 'arimax/results', models_dir: str = 'arimax/models'):
         
         self.results_dir = results_dir
         self.models_dir = models_dir
@@ -321,9 +321,9 @@ def main():
                        help='Evaluate specific ticker (default: evaluate all)')
     parser.add_argument('--data-file', type=str, default='../dataset/stock_dataset_with_lags.csv',
                        help='Path to the test dataset')
-    parser.add_argument('--results-dir', type=str, default='arimaxresults',
+    parser.add_argument('--results-dir', type=str, default='arimax/results',
                        help='Directory containing results')
-    parser.add_argument('--models-dir', type=str, default='arimaxmodels',
+    parser.add_argument('--models-dir', type=str, default='arimax/models',
                        help='Directory containing trained models')
     parser.add_argument('--create-plots', action='store_true',
                        help='Create performance visualization plots')

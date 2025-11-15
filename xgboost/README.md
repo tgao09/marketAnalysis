@@ -69,7 +69,7 @@ python xgboost/forecast_xgboost.py \
     --data-file xgboost/features_engineered.csv
 ```
 
-Output: `xgboostresults/forecasts_YYYYMMDD_HHMMSS.csv`
+Output: `xgboost/results/forecasts/forecasts_YYYYMMDD_HHMMSS.csv`
 
 ### 4. Stock Screening
 
@@ -77,7 +77,7 @@ Screen opportunities using ensemble signals:
 
 ```bash
 python xgboost/stock_screener.py \
-    xgboostresults/forecasts_YYYYMMDD_HHMMSS.csv \
+    xgboost/results/forecasts/forecasts_YYYYMMDD_HHMMSS.csv \
     -n 20 \
     --min-return 0.01 \
     --min-sharpe 0.0
@@ -128,8 +128,11 @@ greenfield/xgboost/
 ├── stock_screener.py           # Multi-horizon screening
 ├── walk_forward_test.py        # Backtesting
 ├── requirements_xgboost.txt    # Additional dependencies
-├── xgboostmodels/             # Saved models (gitignored)
-└── xgboostresults/            # Forecasts and results
+├── models/                    # Saved models (gitignored)
+└── results/
+    ├── training/             # Training summaries
+    ├── forecasts/            # Forecast CSVs
+    └── tuning/               # Hyperparameter search outputs
 ```
 
 ## Dependencies
