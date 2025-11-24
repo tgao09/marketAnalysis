@@ -8,9 +8,21 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 import warnings
+from pathlib import Path
 
 # add the arimax directory to the path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_RESULTS_DIR = PROJECT_ROOT / "arimax" / "results"
+DEFAULT_MODELS_DIR = PROJECT_ROOT / "arimax" / "models"
+DEFAULT_DATA_FILE = PROJECT_ROOT / "dataset" / "stock_dataset_with_lags.csv"
+
+
+def resolve_path(path_str: str) -> Path:
+    
+    path = Path(path_str)
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 from arimax_model import StockARIMAX
 
@@ -20,17 +32,17 @@ logger = logging.getLogger(__name__)
 class ModelEvaluator:
     
 
-    def __init__(self, results_dir: str = 'arimax/results', models_dir: str = 'arimax/models'):
+    def __init__(self, results_dir: str = str(DEFAULT_RESULTS_DIR), models_dir: str = str(DEFAULT_MODELS_DIR)):
         
-        self.results_dir = results_dir
-        self.models_dir = models_dir
+        self.results_dir = resolve_path(results_dir)
+        self.models_dir = resolve_path(models_dir)
         self.summary_df = None
 
     def load_training_results(self) -> pd.DataFrame:
         
-        summary_file = os.path.join(self.results_dir, 'model_summary.csv')
+        summary_file = self.results_dir / 'model_summary.csv'
 
-        if not os.path.exists(summary_file):
+        if not summary_file.exists():
             raise FileNotFoundError(f"Training results not found: {summary_file}")
 
         self.summary_df = pd.read_csv(summary_file)
@@ -41,15 +53,16 @@ class ModelEvaluator:
     def evaluate_single_model(self, ticker: str, data_file: str) -> Dict[str, Any]:
         
         # load model
-        model_path = os.path.join(self.models_dir, f"{ticker}_arimax.pkl")
+        model_path = self.models_dir / f"{ticker}_arimax.pkl"
 
-        if not os.path.exists(model_path):
+        if not model_path.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
 
         model = StockARIMAX.load_model(model_path)
 
         # load test data
-        df = pd.read_csv(data_file)
+        data_path = resolve_path(data_file)
+        df = pd.read_csv(data_path)
         df['Date'] = pd.to_datetime(df['Date'])
 
         # prepare data for this stock
@@ -129,7 +142,7 @@ class ModelEvaluator:
         except Exception:
             return np.nan
 
-    def generate_performance_report(self, data_file: str = '../dataset/stock_dataset_with_lags.csv',
+    def generate_performance_report(self, data_file: str = str(DEFAULT_DATA_FILE),
                                   top_n: int = 10) -> Dict[str, Any]:
         
         if self.summary_df is None:
@@ -198,7 +211,9 @@ class ModelEvaluator:
     def create_performance_plots(self, output_dir: str = None) -> None:
         
         if output_dir is None:
-            output_dir = self.results_dir
+            output_dir_path = self.results_dir
+        else:
+            output_dir_path = resolve_path(str(output_dir))
 
         if self.summary_df is None:
             self.load_training_results()
@@ -208,6 +223,8 @@ class ModelEvaluator:
         if len(successful_models) == 0:
             logger.warning("No successful models to plot")
             return
+
+        os.makedirs(output_dir_path, exist_ok=True)
 
         # set up the plotting style
         plt.style.use('default')
@@ -264,13 +281,13 @@ class ModelEvaluator:
         plt.tight_layout()
 
         # save plot
-        plot_file = os.path.join(output_dir, 'performance_analysis.png')
+        plot_file = output_dir_path / 'performance_analysis.png'
         plt.savefig(plot_file, dpi=300, bbox_inches='tight')
         plt.close()
 
         logger.info(f"Performance plots saved to: {plot_file}")
 
-    def print_summary_report(self, data_file: str = '../dataset/stock_dataset_with_lags.csv') -> None:
+    def print_summary_report(self, data_file: str = str(DEFAULT_DATA_FILE)) -> None:
         
         report = self.generate_performance_report(data_file)
 
@@ -319,11 +336,11 @@ def main():
     parser = argparse.ArgumentParser(description='Evaluate trained ARIMAX models')
     parser.add_argument('--ticker', type=str, default=None,
                        help='Evaluate specific ticker (default: evaluate all)')
-    parser.add_argument('--data-file', type=str, default='../dataset/stock_dataset_with_lags.csv',
+    parser.add_argument('--data-file', type=str, default=str(DEFAULT_DATA_FILE),
                        help='Path to the test dataset')
-    parser.add_argument('--results-dir', type=str, default='arimax/results',
+    parser.add_argument('--results-dir', type=str, default=str(DEFAULT_RESULTS_DIR),
                        help='Directory containing results')
-    parser.add_argument('--models-dir', type=str, default='arimax/models',
+    parser.add_argument('--models-dir', type=str, default=str(DEFAULT_MODELS_DIR),
                        help='Directory containing trained models')
     parser.add_argument('--create-plots', action='store_true',
                        help='Create performance visualization plots')

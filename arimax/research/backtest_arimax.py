@@ -6,10 +6,21 @@ from typing import List, Dict, Any, Optional, Union
 import logging
 import warnings
 from datetime import datetime, timedelta
+from pathlib import Path
 from tqdm import tqdm
 
 # add the arimax directory to the path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_MODELS_DIR = PROJECT_ROOT / "arimax" / "models"
+DEFAULT_RESULTS_DIR = PROJECT_ROOT / "arimax" / "results"
+
+
+def resolve_path(path_str: str) -> Path:
+    
+    path = Path(path_str)
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 from arimax_model import StockARIMAX
 
@@ -19,20 +30,20 @@ logger = logging.getLogger(__name__)
 class ARIMAXPredictor:
     
 
-    def __init__(self, models_dir: str = 'arimax/models', results_dir: str = 'arimax/results'):
+    def __init__(self, models_dir: str = str(DEFAULT_MODELS_DIR), results_dir: str = str(DEFAULT_RESULTS_DIR)):
         
-        self.models_dir = models_dir
-        self.results_dir = results_dir
+        self.models_dir = resolve_path(models_dir)
+        self.results_dir = resolve_path(results_dir)
         self.available_models = self._discover_models()
 
     def _discover_models(self) -> List[str]:
         
-        if not os.path.exists(self.models_dir):
+        if not self.models_dir.exists():
             logger.warning(f"Models directory not found: {self.models_dir}")
             return []
 
-        model_files = [f for f in os.listdir(self.models_dir) if f.endswith('_arimax.pkl')]
-        tickers = [f.replace('_arimax.pkl', '') for f in model_files]
+        model_files = list(self.models_dir.glob("*_arimax.pkl"))
+        tickers = [f.stem.replace('_arimax', '') for f in model_files]
 
         logger.info(f"Found {len(tickers)} trained models")
         return tickers
@@ -44,11 +55,12 @@ class ARIMAXPredictor:
             raise ValueError(f"No trained model found for {ticker}")
 
         # load model
-        model_path = os.path.join(self.models_dir, f"{ticker}_arimax.pkl")
+        model_path = self.models_dir / f"{ticker}_arimax.pkl"
         model = StockARIMAX.load_model(model_path)
 
         # load data
-        df = pd.read_csv(data_file)
+        data_path = resolve_path(data_file)
+        df = pd.read_csv(data_path)
         df['Date'] = pd.to_datetime(df['Date'])
 
         # prepare data for this stock
@@ -208,8 +220,8 @@ class ARIMAXPredictor:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = f"backtest_results_{timestamp}.csv"
 
-        filepath = os.path.join(self.results_dir, filename)
-        os.makedirs(self.results_dir, exist_ok=True)
+        filepath = self.results_dir / filename
+        filepath.parent.mkdir(parents=True, exist_ok=True)
 
         predictions_df.to_csv(filepath, index=False)
         logger.info(f"Backtest results saved to: {filepath}")
@@ -255,13 +267,13 @@ def main():
     parser = argparse.ArgumentParser(description='Generate backtest results using trained ARIMAX models')
     parser.add_argument('--ticker', type=str, default=None,
                        help='Backtest specific ticker (default: backtest all)')
-    parser.add_argument('--data-file', type=str, default='../dataset/stock_dataset_with_lags.csv',
+    parser.add_argument('--data-file', type=str, default=str(PROJECT_ROOT / "dataset" / "stock_dataset_with_lags.csv"),
                        help='Path to the dataset with historical data')
     parser.add_argument('--periods', type=int, default=4,
                        help='Number of recent periods to backtest (default: 4)')
-    parser.add_argument('--models-dir', type=str, default='arimax/models',
+    parser.add_argument('--models-dir', type=str, default=str(DEFAULT_MODELS_DIR),
                        help='Directory containing trained models')
-    parser.add_argument('--results-dir', type=str, default='arimax/results',
+    parser.add_argument('--results-dir', type=str, default=str(DEFAULT_RESULTS_DIR),
                        help='Directory to save backtest results')
     parser.add_argument('--no-confidence', action='store_true',
                        help='Skip confidence interval calculation')

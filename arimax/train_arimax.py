@@ -7,10 +7,16 @@ import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import warnings
 import time
+from pathlib import Path
 from tqdm import tqdm
 
 # add the arimax directory to the path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DATA_FILE = PROJECT_ROOT / "dataset" / "stock_dataset_with_lags.csv"
+DEFAULT_MODELS_DIR = PROJECT_ROOT / "arimax" / "models"
+DEFAULT_RESULTS_DIR = PROJECT_ROOT / "arimax" / "results"
 
 from arimax_model import StockARIMAX
 
@@ -67,19 +73,18 @@ def train_single_stock(args: tuple) -> Dict[str, Any]:
             'selection_method': None
         }
 
-def prepare_training_data(data_file: str = '../dataset/stock_dataset_with_lags.csv') -> pd.DataFrame:
+def prepare_training_data(data_file: str = str(DEFAULT_DATA_FILE)) -> pd.DataFrame:
     
-    # handle relative paths - make them relative to script directory
-    if not os.path.isabs(data_file):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        data_file = os.path.join(script_dir, data_file)
+    data_path = Path(data_file)
+    if not data_path.is_absolute():
+        data_path = PROJECT_ROOT / data_path
 
-    logger.info(f"Loading training data from {data_file}")
+    logger.info(f"Loading training data from {data_path}")
 
-    if not os.path.exists(data_file):
-        raise FileNotFoundError(f"Training data file not found: {data_file}")
+    if not data_path.exists():
+        raise FileNotFoundError(f"Training data file not found: {data_path}")
 
-    df = pd.read_csv(data_file)
+    df = pd.read_csv(data_path)
 
     # convert date column to datetime
     df['Date'] = pd.to_datetime(df['Date'])
@@ -102,9 +107,9 @@ def filter_stocks_for_training(df: pd.DataFrame, min_observations: int = 50) -> 
 
     return valid_stocks
 
-def train_all_models(data_file: str = '../dataset/stock_dataset_with_lags.csv',
-                    models_dir: str = 'arimax/models',
-                    results_dir: str = 'arimax/results',
+def train_all_models(data_file: str = str(DEFAULT_DATA_FILE),
+                    models_dir: str = str(DEFAULT_MODELS_DIR),
+                    results_dir: str = str(DEFAULT_RESULTS_DIR),
                     train_size: float = 0.8,
                     max_workers: int = 4,
                     min_observations: int = 50,
@@ -115,8 +120,10 @@ def train_all_models(data_file: str = '../dataset/stock_dataset_with_lags.csv',
     start_time = time.time()
 
     # create directories
-    os.makedirs(models_dir, exist_ok=True)
-    os.makedirs(results_dir, exist_ok=True)
+    models_dir_path = Path(models_dir)
+    results_dir_path = Path(results_dir)
+    os.makedirs(models_dir_path, exist_ok=True)
+    os.makedirs(results_dir_path, exist_ok=True)
 
     # load data
     df = prepare_training_data(data_file)
@@ -130,7 +137,7 @@ def train_all_models(data_file: str = '../dataset/stock_dataset_with_lags.csv',
         logger.info(f"Training on sample of {sample_stocks} stocks: {valid_stocks}")
 
     # prepare arguments for parallel processing - filter data per ticker to reduce memory usage
-    training_args = [(ticker, df[df['ticker'] == ticker].copy(), train_size, models_dir, use_cv, selected_features)
+    training_args = [(ticker, df[df['ticker'] == ticker].copy(), train_size, str(models_dir_path), use_cv, selected_features)
                      for ticker in valid_stocks]
 
     # train models in parallel
@@ -171,7 +178,7 @@ def train_all_models(data_file: str = '../dataset/stock_dataset_with_lags.csv',
     results_df = pd.DataFrame(results)
 
     # save results summary
-    summary_file = os.path.join(results_dir, 'model_summary.csv')
+    summary_file = results_dir_path / 'model_summary.csv'
     results_df.to_csv(summary_file, index=False)
 
     # calculate summary statistics
@@ -226,11 +233,11 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='Train ARIMAX models for all stocks')
-    parser.add_argument('--data-file', type=str, default='../dataset/stock_dataset_with_lags.csv',
+    parser.add_argument('--data-file', type=str, default=str(DEFAULT_DATA_FILE),
                        help='Path to the lagged dataset file')
-    parser.add_argument('--models-dir', type=str, default='arimax/models',
+    parser.add_argument('--models-dir', type=str, default=str(DEFAULT_MODELS_DIR),
                        help='Directory to save trained models')
-    parser.add_argument('--results-dir', type=str, default='arimax/results',
+    parser.add_argument('--results-dir', type=str, default=str(DEFAULT_RESULTS_DIR),
                        help='Directory to save results')
     parser.add_argument('--train-size', type=float, default=0.8,
                        help='Proportion of data for training (default: 0.8)')
@@ -271,7 +278,8 @@ def main():
         )
 
         print(f"\nTraining completed successfully!")
-        print(f"Results saved to: {os.path.join(args.results_dir, 'model_summary.csv')}")
+        results_path = Path(args.results_dir)
+        print(f"Results saved to: {results_path / 'model_summary.csv'}")
 
     except Exception as e:
         logger.error(f"Training failed: {e}")

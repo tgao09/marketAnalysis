@@ -12,12 +12,13 @@ import glob
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
+from pathlib import Path
 
 # Add paths for importing modules
-project_root = os.path.join(os.path.dirname(__file__), '..')
-sys.path.append(os.path.join(project_root, 'greenfield', 'arimax'))
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'greenfield', 'dataset'))
-sys.path.append(os.path.join(project_root, 'xgboost'))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(PROJECT_ROOT / 'arimax'))
+sys.path.append(str(PROJECT_ROOT / 'dataset'))
+sys.path.append(str(PROJECT_ROOT / 'xgboost'))
 logger = logging.getLogger(__name__)
 
 class ModelHandler:
@@ -29,20 +30,20 @@ class ModelHandler:
 
     def __init__(self, model_type: str = 'arimax'):
         """Initialize the model handler with project paths"""
-        self.project_root = os.path.join(os.path.dirname(__file__), '..')
-        self.dataset_dir = os.path.join(self.project_root, 'greenfield', 'dataset')
+        self.project_root = PROJECT_ROOT
+        self.dataset_dir = self.project_root / 'dataset'
         self.model_type = model_type.lower()
 
         if self.model_type not in self.SUPPORTED_MODELS:
             raise ValueError(f"Unsupported model type '{model_type}'. Supported: {self.SUPPORTED_MODELS}")
 
         if self.model_type == 'arimax':
-            self.models_dir = os.path.join(self.project_root, 'greenfield', 'arimax', 'arimaxmodels')
-            self.results_dir = os.path.join(self.project_root, 'greenfield', 'arimax', 'arimaxresults')
+            self.models_dir = self.project_root / 'arimax' / 'arimaxmodels'
+            self.results_dir = self.project_root / 'arimax' / 'arimaxresults'
         else:
             # Tuned XGBoost models live in the dedicated directory
-            self.models_dir = os.path.join(self.project_root, 'xgboost', 'xgboostmodels_tuned')
-            self.results_dir = os.path.join(self.project_root, 'xgboost', 'xgboostresults')
+            self.models_dir = self.project_root / 'xgboost' / 'xgboostmodels_tuned'
+            self.results_dir = self.project_root / 'xgboost' / 'xgboostresults'
             os.makedirs(self.results_dir, exist_ok=True)
         
         

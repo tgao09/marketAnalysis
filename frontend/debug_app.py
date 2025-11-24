@@ -10,6 +10,7 @@ import os
 import sys
 from datetime import datetime, timedelta
 import logging
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -69,9 +70,9 @@ def main():
 
     # Test project paths
     st.subheader("Path Check")
-    current_dir = os.path.dirname(__file__)
-    project_root = os.path.join(current_dir, '..')
-    arimax_dir = os.path.join(project_root, 'greenfield', 'arimax')
+    current_dir = Path(__file__).resolve().parent
+    project_root = current_dir.parent
+    arimax_dir = project_root / 'arimax'
 
     st.write(f"Current directory: {current_dir}")
     st.write(f"Project root: {project_root}")
@@ -82,8 +83,8 @@ def main():
     st.subheader("Module Import Check")
 
     # Add paths
-    sys.path.append(os.path.join(project_root, 'greenfield', 'arimax'))
-    sys.path.append(current_dir)
+    sys.path.append(str(arimax_dir))
+    sys.path.append(str(current_dir))
 
     try:
         from data_controller import DataController

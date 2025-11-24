@@ -10,11 +10,12 @@ import subprocess
 import logging
 from typing import Dict, Any, List
 from datetime import datetime
+from pathlib import Path
 
 # Add paths for importing modules
-project_root = os.path.join(os.path.dirname(__file__), '..')
-sys.path.append(os.path.join(project_root, 'greenfield', 'arimax'))
-sys.path.append(os.path.join(project_root, 'greenfield', 'dataset'))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(PROJECT_ROOT / 'arimax'))
+sys.path.append(str(PROJECT_ROOT / 'dataset'))
 
 logger = logging.getLogger(__name__)
 
@@ -23,13 +24,13 @@ class DataController:
 
     def __init__(self):
         """Initialize the data controller with project paths"""
-        self.project_root = os.path.join(os.path.dirname(__file__), '..')
-        self.dataset_dir = os.path.join(self.project_root, 'greenfield', 'dataset')
-        self.arimax_dir = os.path.join(self.project_root, 'greenfield', 'arimax')
-        self.results_dir = os.path.join(self.arimax_dir, 'arimaxresults')
-        self.xgboost_dir = os.path.join(self.project_root, 'xgboost')
-        self.xgboost_models_dir = os.path.join(self.xgboost_dir, 'xgboostmodels_tuned')
-        self.xgboost_results_dir = os.path.join(self.xgboost_dir, 'xgboostresults')
+        self.project_root = PROJECT_ROOT
+        self.dataset_dir = self.project_root / 'dataset'
+        self.arimax_dir = self.project_root / 'arimax'
+        self.results_dir = self.arimax_dir / 'arimaxresults'
+        self.xgboost_dir = self.project_root / 'xgboost'
+        self.xgboost_models_dir = self.xgboost_dir / 'xgboostmodels_tuned'
+        self.xgboost_results_dir = self.xgboost_dir / 'xgboostresults'
 
         # Ensure results directories exist
         os.makedirs(self.results_dir, exist_ok=True)

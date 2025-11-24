@@ -1,14 +1,63 @@
 
 
-import pandas as pd
-import numpy as np
-import xgboost as xgb
-from typing import List, Dict, Tuple, Optional, Any
+import importlib.util
 import logging
-import warnings
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import joblib
 import os
+import sys
+import warnings
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+
+def _load_external_xgboost() -> Any:
+    """Load the installed xgboost package, avoiding this project's local package."""
+    current_pkg_path = Path(__file__).resolve().parent
+    original_sys_path = list(sys.path)
+
+    # Remove entries that would resolve to this repo (so we don't shadow the real package).
+    sanitized_path = []
+    for entry in original_sys_path:
+        resolved = Path(entry or ".").resolve()
+        skip = False
+        # Skip if this path is the package itself or an ancestor (e.g., repo root).
+        try:
+            current_pkg_path.relative_to(resolved)
+            skip = True
+        except ValueError:
+            pass
+
+        if skip or resolved == current_pkg_path:
+            continue
+
+        sanitized_path.append(entry)
+
+    try:
+        sys.path = sanitized_path
+        spec = importlib.util.find_spec("xgboost")
+        if spec is None or spec.origin is None:
+            raise ImportError
+
+        module = importlib.util.module_from_spec(spec)
+        # Ensure intra-package imports inside xgboost resolve to this loaded module.
+        sys.modules["xgboost"] = module
+        if spec.loader is None:
+            raise ImportError
+        spec.loader.exec_module(module)  # type: ignore[arg-type]
+        return module
+    except ImportError as exc:
+        raise ImportError(
+            "Installed xgboost package not found. Please install it via 'pip install xgboost'."
+        ) from exc
+    finally:
+        sys.path = original_sys_path
+
+
+xgb = _load_external_xgboost()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

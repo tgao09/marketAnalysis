@@ -11,12 +11,15 @@ import os
 import sys
 from datetime import datetime, timedelta
 import logging
+from pathlib import Path
 
-# Add paths for importing modules
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'greenfield', 'arimax'))
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'greenfield', 'dataset'))
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'xgboost'))
-sys.path.append(os.path.join(os.path.dirname(__file__)))
+# Add paths for importing modules relative to project root
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+FRONTEND_DIR = Path(__file__).resolve().parent
+sys.path.append(str(PROJECT_ROOT / 'arimax'))
+sys.path.append(str(PROJECT_ROOT / 'dataset'))
+sys.path.append(str(PROJECT_ROOT / 'xgboost'))
+sys.path.append(str(FRONTEND_DIR))
 
 try:
     from data_controller import DataController

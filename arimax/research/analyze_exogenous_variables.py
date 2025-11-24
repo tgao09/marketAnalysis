@@ -9,11 +9,23 @@ from statsmodels.tsa.stattools import adfuller, acf, pacf
 from statsmodels.stats.diagnostic import acorr_ljungbox
 from scipy import stats
 import warnings
+from pathlib import Path
 warnings.filterwarnings('ignore')
 
-def load_data(file_path='../dataset/stock_dataset_with_lags.csv'):
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DATA_FILE = PROJECT_ROOT / "dataset" / "stock_dataset_with_lags.csv"
+
+
+def resolve_path(path_str: str) -> Path:
     
-    df = pd.read_csv(file_path)
+    path = Path(path_str)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def load_data(file_path=str(DEFAULT_DATA_FILE)):
+    
+    data_path = resolve_path(file_path)
+    df = pd.read_csv(data_path)
     df['Date'] = pd.to_datetime(df['Date'])
     return df
 
