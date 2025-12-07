@@ -8,7 +8,9 @@ This module provides a masked LSTM pipeline that mirrors the XGBoost workflows. 
   - builds a one-week-ahead target via a per-ticker shift on `weekly_return`
   - forward/backward fills features per ticker, scales them (StandardScaler), and stores the scaler
   - converts each ticker history into left-padded sequences with explicit masking
-  - trains a `StockLSTM` (see `lstm/model.py`) using Smooth L1 loss and saves model weights, scaler, metadata, and a training history CSV
+  - clips extreme `target_return` values by percentile (override with `--disable-target-clipping` or adjust `--clip-target-quantiles`)
+  - optionally rebalances the sampler so long-history tickers do not dominate (`--balance-ticker-samples` / `--no-balance-ticker-samples`)
+  - trains a `StockLSTM` (see `lstm/model.py`) using the selected regression loss and saves model weights, scaler, metadata, and a training history CSV with loss + directional hit rate/R2/correlation metrics
 - `lstm/forecast_lstm.py`: loads the artifacts, reconstructs masked sequences from the latest data, and generates next-week forecasts relative to the time of execution (forecast window start = run timestamp, target week = run timestamp + 7 days). Results are saved under `lstm/results/forecasts`.
 - `lstm/data.py`: helper utilities for masking, scaler metadata, and ticker loading.
 
@@ -33,16 +35,20 @@ python lstm/train_lstm.py \
 
 Outputs include:
 
-- `lstm/models/lstm_next_week_<timestamp>.pt` – best model weights
-- `lstm/models/feature_scaler_<timestamp>.pkl` – fitted StandardScaler
-- `lstm/models/lstm_metadata_<timestamp>.json` – configuration + file paths needed for inference
-- `lstm/results/training/training_history_<timestamp>.csv` – per-epoch losses
+- `lstm/models/lstm_next_week_<timestamp>.pt` - best model weights
+- `lstm/models/feature_scaler_<timestamp>.pkl` - fitted StandardScaler
+- `lstm/models/lstm_metadata_<timestamp>.json` - configuration + file paths needed for inference
+- `lstm/results/training/training_history_<timestamp>.csv` - per-epoch loss plus val hit-rate, R2, and correlation
 
-Regularization knobs:
+Regularization and training knobs:
 
 - `--dropout` (default 0.3) controls the dropout applied inside the LSTM head.
 - `--weight-decay` adds L2 regularization to Adam; default `1e-4`.
 - `--early-stop-patience` together with `--min-delta` stops training once validation loss stalls, preventing overfitting on later epochs.
+- `--loss` selects the regression loss (`smooth_l1`/`mse`/`l1`); set `--smooth-l1-beta` to tune SmoothL1 sensitivity.
+- `--use-amp/--no-amp` toggles mixed precision on CUDA; `--num-workers` and `--pin-memory` speed up batch loading.
+- `--clip-target-quantiles` (default 1 99) clips extreme returns; use `--disable-target-clipping` to skip.
+- `--balance-ticker-samples/--no-balance-ticker-samples` controls sampler rebalancing across tickers.
 
 ### Forecasting Example
 

@@ -41,6 +41,11 @@ def load_artifacts(metadata: Dict, device: str) -> Dict:
     model.eval()
 
     scaler = joblib.load(metadata["scaler_path"])
+    if not hasattr(scaler, "transform"):
+        raise TypeError(
+            f"Loaded scaler object does not support transform(): got {type(scaler).__name__}. "
+            "Ensure the scaler_path points to the StandardScaler artifact produced during training."
+        )
     return {"model": model, "scaler": scaler}
 
 
@@ -114,19 +119,20 @@ def main():
         preds = model(sequences, lengths).cpu().numpy()
 
     run_timestamp = datetime.now(timezone.utc)
-    next_week_date = (run_timestamp + timedelta(days=7)).date()
 
     records = []
     for idx, ticker in enumerate(inference_batch["tickers"]):
+        latest_date = inference_batch["latest_dates"][idx]
+        target_week = (latest_date + timedelta(weeks=1)).date()
         records.append({
             "ticker": ticker,
             "forecast_horizon_weeks": 1,
             "predicted_return": preds[idx],
-            "latest_data_date": inference_batch["latest_dates"][idx],
+            "latest_data_date": latest_date,
             "sequence_length_used": int(inference_batch["lengths"][idx]),
             "generated_at_utc": run_timestamp,
-            "forecast_start_date": run_timestamp.date(),
-            "forecast_target_week": next_week_date,
+            "forecast_start_date": latest_date.date(),
+            "forecast_target_week": target_week,
         })
 
     forecasts_df = pd.DataFrame(records).sort_values("ticker")
