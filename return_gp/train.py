@@ -1,0 +1,670 @@
+import argparse
+import json
+import re
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import gpytorch
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
+
+from common import DEFAULT_SECTOR_ETF_MAP, get_history, get_info, parse_window, walk_forward_splits
+
+
+ARTIFACT_DIR_DEFAULT = Path(__file__).resolve().parent / "artifacts"
+TICKER_GOLD = "GLD"
+TICKER_SPY = "SPY"
+TICKER_VIX = "^VIX"
+WINDOW_RET = 5
+NOISE_WINDOW = 20
+DATA_YEARS = 3
+DEFAULT_TRAIN_ITERS = 200
+DEFAULT_TRAIN_WINDOW = "2y"
+DEFAULT_TEST_WINDOW = "1m"
+DEFAULT_STEP_WINDOW = "1m"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train GP return model.")
+    parser.add_argument(
+        "--drop-time-index",
+        action="store_true",
+        help="Exclude time_index from training features (default).",
+    )
+    parser.add_argument(
+        "--include-time-index",
+        action="store_true",
+        help="Include time_index in training features.",
+    )
+    parser.set_defaults(drop_time_index=True)
+    return parser.parse_args()
+
+
+def prompt_tickers():
+    raw = input("Enter tickers (comma-separated): ").strip()
+    if not raw:
+        return []
+    tokens = [token.strip().upper() for token in re.split(r"[,\s]+", raw) if token.strip()]
+    seen = set()
+    tickers = []
+    for token in tokens:
+        if token not in seen:
+            seen.add(token)
+            tickers.append(token)
+    return tickers
+
+
+def resolve_sector_etf(ticker):
+    sector = None
+    etf = None
+    error = None
+    try:
+        info = get_info(ticker)
+        sector = info.get("sector") or info.get("sectorKey")
+        if sector:
+            sector_key = sector.strip()
+            if sector_key not in DEFAULT_SECTOR_ETF_MAP:
+                title_key = sector_key.title()
+                if title_key in DEFAULT_SECTOR_ETF_MAP:
+                    sector_key = title_key
+            if sector_key in DEFAULT_SECTOR_ETF_MAP:
+                etf = DEFAULT_SECTOR_ETF_MAP[sector_key]
+                sector = sector_key
+            else:
+                error = f"Sector '{sector_key}' not in DEFAULT_SECTOR_ETF_MAP."
+        else:
+            error = "Sector missing from ticker info."
+    except Exception as exc:
+        error = str(exc)
+
+    if etf is None:
+        return TICKER_SPY, sector, error
+    return etf, sector, None
+
+
+def fetch_history_cached(symbol, start_date, end_date, cache):
+    key = symbol.upper()
+    if key not in cache:
+        history = get_history(
+            symbol,
+            period=None,
+            start=str(pd.Timestamp(start_date).date()),
+            end=str(pd.Timestamp(end_date).date()),
+            interval="1d",
+            auto_adjust=True,
+        )
+        if isinstance(history.index, pd.DatetimeIndex):
+            idx = history.index
+            if idx.tz is not None:
+                idx = idx.tz_localize(None)
+            history = history.copy()
+            history.index = idx.normalize()
+            history = history.sort_index()
+        cache[key] = history
+    return cache[key]
+
+
+def extract_field(history, field, symbol):
+    if field not in history.columns:
+        raise KeyError(f"Missing field {field} in data for {symbol}.")
+    series = history[field].copy()
+    if series.empty:
+        raise ValueError(f"No {field} data returned for {symbol}.")
+    return series
+
+
+def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix):
+    index = price_stock.index
+
+    volume_stock = volume_stock.reindex(index).ffill().bfill()
+    price_sector = price_sector.reindex(index).ffill().bfill()
+    price_gld = price_gld.reindex(index).ffill().bfill()
+    price_spy = price_spy.reindex(index).ffill().bfill()
+    price_vix = price_vix.reindex(index).ffill().bfill()
+
+    ret_stock = price_stock.pct_change()
+    ret_sector = price_sector.pct_change()
+    ret_gld = price_gld.pct_change()
+    ret_spy = price_spy.pct_change()
+
+    features = pd.DataFrame(index=price_stock.index)
+    features["time_index"] = (features.index - features.index[0]).days.astype(int)
+
+    features["ret_1d"] = ret_stock
+    features["ret_5d"] = price_stock.pct_change(WINDOW_RET)
+    features["vol_5d"] = ret_stock.rolling(WINDOW_RET).std()
+    features["mean_ret_5d"] = ret_stock.rolling(WINDOW_RET).mean()
+    features["mean_abs_ret_5d"] = ret_stock.abs().rolling(WINDOW_RET).mean()
+    features["vol_chg_1d"] = volume_stock.pct_change()
+
+    features["sector_ret_1d"] = ret_sector
+    features["sector_ret_5d"] = price_sector.pct_change(WINDOW_RET)
+    features["sector_vol_5d"] = ret_sector.rolling(WINDOW_RET).std()
+
+    features["gld_ret_1d"] = ret_gld
+    features["gld_ret_5d"] = price_gld.pct_change(WINDOW_RET)
+    features["gld_vol_5d"] = ret_gld.rolling(WINDOW_RET).std()
+
+    features["spy_ret_5d"] = price_spy.pct_change(WINDOW_RET)
+    features["spy_vol_20d"] = ret_spy.rolling(20).std()
+    features["spy_ma20_gap"] = (price_spy / price_spy.rolling(20).mean()) - 1.0
+    features["vix_level"] = price_vix
+    features["vix_chg_1d"] = price_vix.pct_change()
+
+    return features
+
+
+def set_time_index(features, start_date):
+    features = features.copy()
+    features["time_index"] = (features.index - start_date).days.astype(int)
+    return features
+
+
+def build_target(price_stock):
+    forward_price = price_stock.shift(-WINDOW_RET)
+    ratio = forward_price / price_stock
+    target = np.log(ratio.replace(0.0, np.nan))
+    target = target.replace([np.inf, -np.inf], np.nan)
+
+    noise = target.rolling(NOISE_WINDOW).std()
+    noise = noise.pow(2)
+    return target.rename("target"), noise.rename("noise")
+
+
+def find_all_nan_columns(frame):
+    return [col for col in frame.columns if frame[col].isna().all()]
+
+
+def summarize_series(series):
+    non_na = series.dropna()
+    if non_na.empty:
+        return {"count": 0, "start": None, "end": None}
+    return {"count": int(non_na.shape[0]), "start": str(non_na.index.min().date()), "end": str(non_na.index.max().date())}
+
+
+def validate_alignment_and_nan(
+    ticker,
+    features,
+    target,
+    noise,
+    price_stock,
+    price_sector,
+    price_gld,
+    price_spy,
+    price_vix,
+):
+    if not features.index.equals(target.index):
+        raise ValueError(
+            f"{ticker}: Feature/target index mismatch. "
+            f"features={features.index.min().date()}..{features.index.max().date()} "
+            f"target={target.index.min().date()}..{target.index.max().date()}"
+        )
+
+    all_nan_features = find_all_nan_columns(features)
+    if all_nan_features:
+        coverage = {
+            "stock": summarize_series(price_stock),
+            "sector": summarize_series(price_sector),
+            "gld": summarize_series(price_gld),
+            "spy": summarize_series(price_spy),
+            "vix": summarize_series(price_vix),
+        }
+        raise ValueError(
+            f"{ticker}: All-NaN feature columns detected: {', '.join(all_nan_features)}. "
+            f"Series coverage: {coverage}"
+        )
+
+    if target.isna().all():
+        coverage = summarize_series(price_stock)
+        raise ValueError(
+            f"{ticker}: Target is all NaN. "
+            f"Check price coverage and window settings. Stock coverage: {coverage}"
+        )
+
+    if noise.isna().all():
+        raise ValueError(f"{ticker}: Noise is all NaN. Consider increasing history or noise_window.")
+
+
+def normalize_features(train_df, test_df, feature_cols):
+    mean = train_df[feature_cols].mean()
+    std = train_df[feature_cols].std().replace(0.0, 1.0)
+
+    train_x = (train_df[feature_cols] - mean) / std
+    test_x = (test_df[feature_cols] - mean) / std
+
+    scaler = {
+        "mean": mean.to_dict(),
+        "std": std.to_dict(),
+    }
+    return train_x, test_x, scaler
+
+
+class ReturnGPModel(gpytorch.models.ExactGP):
+    def __init__(self, train_x, train_y, likelihood):
+        super().__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+
+        ard_num_dims = train_x.shape[-1]
+        linear = gpytorch.kernels.LinearKernel(ard_num_dims=ard_num_dims)
+        matern = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_num_dims)
+        self.covar_module = gpytorch.kernels.ScaleKernel(linear + matern)
+
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+def train_gp(train_x, train_y, train_noise, train_iters=DEFAULT_TRAIN_ITERS):
+    likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
+        noise=train_noise,
+        learn_additional_noise=True,
+    )
+    model = ReturnGPModel(train_x, train_y, likelihood)
+
+    model.train()
+    likelihood.train()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
+
+    for i in range(1, train_iters + 1):
+        optimizer.zero_grad()
+        output = model(train_x)
+        loss = -mll(output, train_y)
+        loss.backward()
+        optimizer.step()
+        if i == 1 or i % 50 == 0 or i == train_iters:
+            print(f"Iter {i}/{train_iters} - Loss: {loss.item():.4f}")
+
+    return model, likelihood
+
+
+def iter_base_kernels(kernel):
+    if hasattr(kernel, "base_kernel"):
+        yield from iter_base_kernels(kernel.base_kernel)
+        return
+    if hasattr(kernel, "kernels"):
+        for sub_kernel in kernel.kernels:
+            yield from iter_base_kernels(sub_kernel)
+        return
+    yield kernel
+
+
+def kernel_display_name(kernel):
+    if isinstance(kernel, gpytorch.kernels.MaternKernel):
+        return f"Matern(nu={kernel.nu})"
+    if isinstance(kernel, gpytorch.kernels.LinearKernel):
+        return "Linear"
+    return kernel.__class__.__name__
+
+
+def print_ard_importance(model, feature_cols):
+    num_features = len(feature_cols)
+    kernels = list(iter_base_kernels(model.covar_module))
+    results = []
+
+    for kernel in kernels:
+        if not hasattr(kernel, "lengthscale"):
+            continue
+        lengthscale = kernel.lengthscale
+        if lengthscale is None:
+            continue
+        lengthscale = lengthscale.detach().cpu().numpy().reshape(-1)
+        if lengthscale.size != num_features:
+            continue
+        lengthscale = np.clip(lengthscale, 1e-8, None)
+        importance = 1.0 / lengthscale
+        results.append((kernel_display_name(kernel), lengthscale, importance))
+
+    if not results:
+        print("\nARD feature importance: no ARD lengthscales found in kernel.")
+        return
+
+    for name, lengthscale, importance in results:
+        order = np.argsort(-importance)
+        print(f"\nARD feature importance ({name}) - higher = more important (1/lengthscale):")
+        for rank, idx in enumerate(order, start=1):
+            print(
+                f"  {rank}. {feature_cols[idx]}: {importance[idx]:.6f} "
+                f"(lengthscale={lengthscale[idx]:.6f})"
+            )
+
+
+def evaluate(model, likelihood, test_x, test_y, test_noise):
+    model.eval()
+    likelihood.eval()
+    with torch.no_grad():
+        preds = likelihood(model(test_x), noise=test_noise)
+        mean = preds.mean
+        std = preds.variance.sqrt()
+        mae = torch.mean(torch.abs(mean - test_y)).item()
+        mse = torch.mean((mean - test_y) ** 2).item()
+        mean_simple = torch.exp(mean) - 1.0
+        actual_simple = torch.exp(test_y) - 1.0
+        mae_simple = torch.mean(torch.abs(mean_simple - actual_simple)).item()
+        directional = torch.mean((torch.sign(mean) == torch.sign(test_y)).float()).item()
+        lower = mean - (1.96 * std)
+        upper = mean + (1.96 * std)
+        coverage_95 = torch.mean(((test_y >= lower) & (test_y <= upper)).float()).item()
+        avg_interval_width = torch.mean((upper - lower)).item()
+    return {
+        "mae": mae,
+        "mse": mse,
+        "mae_simple": mae_simple,
+        "directional": directional,
+        "coverage_95": coverage_95,
+        "avg_interval_width": avg_interval_width,
+    }
+
+
+def summarize_fold_metrics(fold_metrics):
+    mae_values = [fold["mae"] for fold in fold_metrics]
+    mse_values = [fold["mse"] for fold in fold_metrics]
+    mae_simple_values = [fold["mae_simple"] for fold in fold_metrics]
+    dir_values = [fold["directional"] for fold in fold_metrics]
+    coverage_values = [fold["coverage_95"] for fold in fold_metrics]
+    width_values = [fold["avg_interval_width"] for fold in fold_metrics]
+    summary = {
+        "folds": len(fold_metrics),
+        "mae_mean": float(np.mean(mae_values)) if mae_values else None,
+        "mae_median": float(np.median(mae_values)) if mae_values else None,
+        "mse_mean": float(np.mean(mse_values)) if mse_values else None,
+        "mse_median": float(np.median(mse_values)) if mse_values else None,
+        "mae_simple_mean": float(np.mean(mae_simple_values)) if mae_simple_values else None,
+        "mae_simple_median": float(np.median(mae_simple_values)) if mae_simple_values else None,
+        "directional_mean": float(np.mean(dir_values)) if dir_values else None,
+        "directional_median": float(np.median(dir_values)) if dir_values else None,
+        "coverage_95_mean": float(np.mean(coverage_values)) if coverage_values else None,
+        "coverage_95_median": float(np.median(coverage_values)) if coverage_values else None,
+        "avg_interval_width_mean": float(np.mean(width_values)) if width_values else None,
+        "avg_interval_width_median": float(np.median(width_values)) if width_values else None,
+    }
+    return summary
+
+
+def save_artifacts(
+    artifact_dir,
+    model,
+    likelihood,
+    scaler,
+    fold_metrics,
+    summary_metrics,
+    config,
+    feature_cols,
+):
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = artifact_dir / "model_state.pt"
+    scaler_path = artifact_dir / "scaler.json"
+    metrics_path = artifact_dir / "metrics.json"
+    config_path = artifact_dir / "config.json"
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "likelihood_state_dict": likelihood.state_dict(),
+            "feature_columns": feature_cols,
+        },
+        model_path,
+    )
+
+    scaler_out = {"mean": scaler["mean"], "std": scaler["std"]}
+    scaler_path.write_text(json.dumps(scaler_out, indent=2))
+
+    metrics_out = {
+        "summary": summary_metrics,
+        "folds": fold_metrics,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+    metrics_path.write_text(json.dumps(metrics_out, indent=2))
+
+    config_path.write_text(json.dumps(config, indent=2))
+
+    print(f"\nArtifacts saved to: {artifact_dir}")
+
+
+def compute_start_date(end_date, data_years, train_window, test_window):
+    start_date = end_date - pd.DateOffset(years=data_years)
+    train_offset = parse_window(train_window)
+    test_offset = parse_window(test_window)
+    buffer_days = NOISE_WINDOW + (2 * WINDOW_RET) + 5
+    min_start = end_date - train_offset
+    min_start = min_start - test_offset
+    min_start = min_start - pd.DateOffset(days=buffer_days)
+    if min_start < start_date:
+        start_date = min_start
+    return start_date
+
+
+def train_for_ticker(ticker, config, history_cache):
+    end_date = pd.Timestamp.today().normalize()
+    start_date = compute_start_date(
+        end_date,
+        config["data_years"],
+        config["train_window"],
+        config["test_window"],
+    )
+
+    sector_etf, sector_name, sector_error = resolve_sector_etf(ticker)
+    if sector_error:
+        print(f"{ticker}: sector fallback to {sector_etf} ({sector_error})")
+
+    stock_history = fetch_history_cached(ticker, start_date, end_date, history_cache)
+    sector_history = fetch_history_cached(sector_etf, start_date, end_date, history_cache)
+    gld_history = fetch_history_cached(TICKER_GOLD, start_date, end_date, history_cache)
+    spy_history = fetch_history_cached(TICKER_SPY, start_date, end_date, history_cache)
+    vix_history = fetch_history_cached(TICKER_VIX, start_date, end_date, history_cache)
+
+    price_stock = extract_field(stock_history, "Close", ticker)
+    volume_stock = extract_field(stock_history, "Volume", ticker)
+    price_sector = extract_field(sector_history, "Close", sector_etf)
+    price_gld = extract_field(gld_history, "Close", TICKER_GOLD)
+    price_spy = extract_field(spy_history, "Close", TICKER_SPY)
+    price_vix = extract_field(vix_history, "Close", TICKER_VIX)
+
+    features = build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix)
+    target, noise = build_target(price_stock)
+
+    validate_alignment_and_nan(
+        ticker,
+        features,
+        target,
+        noise,
+        price_stock,
+        price_sector,
+        price_gld,
+        price_spy,
+        price_vix,
+    )
+
+    dataset = features.join([target, noise])
+    before_rows = int(dataset.shape[0])
+    nan_counts = dataset.isna().sum().sort_values(ascending=False)
+    dataset = dataset.dropna()
+    if dataset.empty:
+        nan_summary = nan_counts.head(5).to_dict()
+        raise ValueError(
+            f"{ticker}: No rows left after feature/target alignment. "
+            f"Rows before dropna={before_rows}. Top NaN columns: {nan_summary}"
+        )
+
+    train_offset = parse_window(config["train_window"])
+    test_offset = parse_window(config["test_window"])
+    min_required_end = dataset.index.min() + train_offset + test_offset
+    last_usable = dataset.index.max()
+    if last_usable <= min_required_end:
+        raise ValueError(
+            f"{ticker}: Not enough data after alignment for walk-forward windows. "
+            f"Last usable date={last_usable.date()} but need >= {min_required_end.date()} "
+            f"for train_window={config['train_window']} and test_window={config['test_window']}. "
+            f"Note the forward target uses {WINDOW_RET}d, which trims the last {WINDOW_RET} days. "
+            "Try a shorter test window or wait for more recent data."
+        )
+
+    feature_cols = [col for col in dataset.columns if col not in ("target", "noise")]
+    if config.get("drop_time_index"):
+        feature_cols = [col for col in feature_cols if col != "time_index"]
+
+    splits = walk_forward_splits(
+        dataset,
+        train_window=config["train_window"],
+        test_window=config["test_window"],
+        embargo=config["window_ret"],
+        step=config["step_window"],
+        min_train_rows=60,
+    )
+
+    fold_metrics = []
+    last_model = None
+    last_likelihood = None
+    last_scaler = None
+
+    print(f"\nTraining {ticker} (sector ETF: {sector_etf})")
+    for split in splits:
+        train_df = set_time_index(split.train.copy(), split.train_start)
+        test_df = set_time_index(split.test.copy(), split.train_start)
+
+        train_x_df, test_x_df, scaler = normalize_features(train_df, test_df, feature_cols)
+
+        train_x = torch.tensor(train_x_df.values, dtype=torch.float32)
+        train_y = torch.tensor(train_df["target"].values, dtype=torch.float32)
+        train_noise = torch.tensor(train_df["noise"].values, dtype=torch.float32).clamp_min(1e-8)
+        test_x = torch.tensor(test_x_df.values, dtype=torch.float32)
+        test_y = torch.tensor(test_df["target"].values, dtype=torch.float32)
+        test_noise = torch.tensor(test_df["noise"].values, dtype=torch.float32).clamp_min(1e-8)
+
+        print(
+            f"\nFold {split.fold} | Train: {split.train_start.date()} -> {split.train_end.date()} | "
+            f"Test: {split.test_start.date()} -> {split.test_end.date()}"
+        )
+
+        model, likelihood = train_gp(
+            train_x,
+            train_y,
+            train_noise,
+            config["train_iters"],
+        )
+
+        metrics = evaluate(model, likelihood, test_x, test_y, test_noise)
+        print(
+            f"MAE(log): {metrics['mae']:.6f} | MAE(simple): {metrics['mae_simple']:.4%} | "
+            f"MSE: {metrics['mse']:.6f} | "
+            f"Dir: {metrics['directional']:.2%} | Coverage95: {metrics['coverage_95']:.2%}"
+        )
+        print_ard_importance(model, feature_cols)
+
+        fold_metrics.append(
+            {
+                "fold": split.fold,
+                "train_start": str(split.train_start.date()),
+                "train_end": str(split.train_end.date()),
+                "test_start": str(split.test_start.date()),
+                "test_end": str(split.test_end.date()),
+                "train_rows": int(len(train_df)),
+                "test_rows": int(len(test_df)),
+                "mae": metrics["mae"],
+                "mse": metrics["mse"],
+                "mae_simple": metrics["mae_simple"],
+                "directional": metrics["directional"],
+                "coverage_95": metrics["coverage_95"],
+                "avg_interval_width": metrics["avg_interval_width"],
+            }
+        )
+
+        last_model = model
+        last_likelihood = likelihood
+        last_scaler = scaler
+
+    if not fold_metrics:
+        raise ValueError(f"{ticker}: No walk-forward splits produced.")
+
+    summary_metrics = summarize_fold_metrics(fold_metrics)
+    print(
+        f"\nSummary | {ticker} | Folds: {summary_metrics['folds']} | "
+        f"MAE(log) mean: {summary_metrics['mae_mean']:.6f} | "
+        f"MAE(simple) mean: {summary_metrics['mae_simple_mean']:.4%} | "
+        f"MSE mean: {summary_metrics['mse_mean']:.6f} | "
+        f"Dir mean: {summary_metrics['directional_mean']:.2%}"
+    )
+
+    artifact_dir = Path(config["artifact_dir"]) / ticker
+    config_out = dict(config)
+    config_out.update(
+        {
+            "ticker": ticker,
+            "sector": sector_name,
+            "sector_etf": sector_etf,
+            "kernel": {
+                "linear_ard": True,
+                "matern_nu": 2.5,
+                "matern_ard": True,
+            },
+        }
+    )
+
+    save_artifacts(
+        artifact_dir,
+        last_model,
+        last_likelihood,
+        last_scaler,
+        fold_metrics,
+        summary_metrics,
+        config_out,
+        feature_cols,
+    )
+
+    return summary_metrics
+
+
+def main():
+    args = parse_args()
+    if args.include_time_index:
+        args.drop_time_index = False
+    tickers = prompt_tickers()
+    if not tickers:
+        print("No tickers provided. Exiting.")
+        return
+
+    config = {
+        "data_years": DATA_YEARS,
+        "window_ret": WINDOW_RET,
+        "noise_window": NOISE_WINDOW,
+        "train_window": DEFAULT_TRAIN_WINDOW,
+        "test_window": DEFAULT_TEST_WINDOW,
+        "step_window": DEFAULT_STEP_WINDOW,
+        "train_iters": DEFAULT_TRAIN_ITERS,
+        "artifact_dir": str(ARTIFACT_DIR_DEFAULT),
+        "drop_time_index": args.drop_time_index,
+    }
+
+    history_cache = {}
+    summaries = {}
+    for ticker in tickers:
+        try:
+            summary = train_for_ticker(ticker, config, history_cache)
+            summaries[ticker] = summary
+        except Exception as exc:
+            print(f"{ticker}: training failed - {exc}")
+
+    if summaries:
+        print("\nFinished training:")
+        for ticker, summary in summaries.items():
+            print(
+                f"  {ticker} | MAE(log) mean: {summary['mae_mean']:.6f} | "
+                f"MAE(simple) mean: {summary['mae_simple_mean']:.4%} | "
+                f"MSE mean: {summary['mse_mean']:.6f} | "
+                f"Dir mean: {summary['directional_mean']:.2%}"
+            )
+
+
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    np.random.seed(42)
+    main()

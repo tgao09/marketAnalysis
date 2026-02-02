@@ -1,21 +1,3 @@
-.claude
-.venv
-CLAUDE.md
-*.pyc
-__pycache__/
-.ipynb_checkpoints/
-.env
-.devcontainer
-
-# Pytest cache
-.pytest_cache/
-
-# Frontend Streamlit secrets
-frontend/.streamlit/secrets.toml
-
-# Frontend test artifacts
-frontend/tests/.pytest_cache/
-frontend/tests/playwright-report/
-frontend/tests/test-results/
-frontend/tests/.playwright/
-frontend/tests/screenshots/
+__pycache__
+artifacts
+*.md
