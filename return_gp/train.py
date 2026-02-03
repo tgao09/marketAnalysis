@@ -24,7 +24,7 @@ TICKER_VIX = "^VIX"
 WINDOW_RET = 5
 NOISE_WINDOW = 20
 DATA_YEARS = 3
-DEFAULT_TRAIN_ITERS = 200
+DEFAULT_TRAIN_ITERS = 400
 DEFAULT_TRAIN_WINDOW = "2y"
 DEFAULT_TEST_WINDOW = "1m"
 DEFAULT_STEP_WINDOW = "1m"
@@ -119,6 +119,24 @@ def extract_field(history, field, symbol):
     return series
 
 
+def compute_log_return(series, window=1):
+    ratio = series / series.shift(window)
+    ratio = ratio.replace(0.0, np.nan)
+    log_ret = np.log(ratio)
+    log_ret = log_ret.replace([np.inf, -np.inf], np.nan)
+    return log_ret
+
+
+def trading_day_in_quarter(index):
+    positions = pd.Series(np.arange(len(index)), index=index)
+    quarters = index.to_period("Q")
+    first_pos = positions.groupby(quarters).transform("min")
+    last_pos = positions.groupby(quarters).transform("max")
+    day_in_quarter = (positions - first_pos).astype(int)
+    quarter_len = (last_pos - first_pos + 1).astype(int)
+    return day_in_quarter, quarter_len
+
+
 def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix):
     index = price_stock.index
 
@@ -128,34 +146,63 @@ def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy
     price_spy = price_spy.reindex(index).ffill().bfill()
     price_vix = price_vix.reindex(index).ffill().bfill()
 
-    ret_stock = price_stock.pct_change()
-    ret_sector = price_sector.pct_change()
-    ret_gld = price_gld.pct_change()
-    ret_spy = price_spy.pct_change()
+    log_ret_stock = compute_log_return(price_stock, 1)
+    log_ret_sector = compute_log_return(price_sector, 1)
+    log_ret_gld = compute_log_return(price_gld, 1)
+    log_ret_spy = compute_log_return(price_spy, 1)
 
     features = pd.DataFrame(index=price_stock.index)
     features["time_index"] = (features.index - features.index[0]).days.astype(int)
 
-    features["ret_1d"] = ret_stock
-    features["ret_5d"] = price_stock.pct_change(WINDOW_RET)
-    features["vol_5d"] = ret_stock.rolling(WINDOW_RET).std()
-    features["mean_ret_5d"] = ret_stock.rolling(WINDOW_RET).mean()
-    features["mean_abs_ret_5d"] = ret_stock.abs().rolling(WINDOW_RET).mean()
-    features["vol_chg_1d"] = volume_stock.pct_change()
+    # Stock returns (log) and summary stats
+    # features["ret_1d"] = log_ret_stock
+    features["ret_5d"] = compute_log_return(price_stock, WINDOW_RET)
+    features["ret_10d"] = compute_log_return(price_stock, 10)
+    features["ret_20d"] = compute_log_return(price_stock, 20)
+    features["ret_60d"] = compute_log_return(price_stock, 60)
 
-    features["sector_ret_1d"] = ret_sector
-    features["sector_ret_5d"] = price_sector.pct_change(WINDOW_RET)
-    features["sector_vol_5d"] = ret_sector.rolling(WINDOW_RET).std()
+    # Stock volatility and standardized returns
+    features["vol_5d"] = log_ret_stock.rolling(WINDOW_RET).std()
+    features["vol_10d"] = log_ret_stock.rolling(10).std()
+    features["vol_20d"] = log_ret_stock.rolling(20).std()
+    features["vol_60d"] = log_ret_stock.rolling(60).std()
+    features["ret_10d_std"] = (features["ret_10d"] / features["vol_10d"]).replace(
+        [np.inf, -np.inf], np.nan
+    )
+    features["ret_20d_std"] = (features["ret_20d"] / features["vol_20d"]).replace(
+        [np.inf, -np.inf], np.nan
+    )
+    features["ret_60d_std"] = (features["ret_60d"] / features["vol_60d"]).replace(
+        [np.inf, -np.inf], np.nan
+    )
 
-    features["gld_ret_1d"] = ret_gld
-    features["gld_ret_5d"] = price_gld.pct_change(WINDOW_RET)
-    features["gld_vol_5d"] = ret_gld.rolling(WINDOW_RET).std()
+    # Volume and distribution shape
+    # features["vol_chg_1d"] = volume_stock.pct_change()
+    features["skew_20d"] = log_ret_stock.rolling(20).skew()
 
-    features["spy_ret_5d"] = price_spy.pct_change(WINDOW_RET)
-    features["spy_vol_20d"] = ret_spy.rolling(20).std()
+    # Sector ETF features
+    # features["sector_ret_1d"] = log_ret_sector
+    features["sector_ret_5d"] = compute_log_return(price_sector, WINDOW_RET)
+    features["sector_vol_5d"] = log_ret_sector.rolling(WINDOW_RET).std()
+
+    # GLD features
+    # features["gld_ret_1d"] = log_ret_gld
+    features["gld_ret_5d"] = compute_log_return(price_gld, WINDOW_RET)
+    features["gld_vol_5d"] = log_ret_gld.rolling(WINDOW_RET).std()
+
+    # Market regime (SPY + VIX)
+    features["spy_ret_5d"] = compute_log_return(price_spy, WINDOW_RET)
+    features["spy_vol_20d"] = log_ret_spy.rolling(20).std()
     features["spy_ma20_gap"] = (price_spy / price_spy.rolling(20).mean()) - 1.0
     features["vix_level"] = price_vix
-    features["vix_chg_1d"] = price_vix.pct_change()
+    # features["vix_chg_1d"] = compute_log_return(price_vix, 1)
+
+    # Calendar features (cyclical encoding within quarter)
+    day_in_quarter, quarter_len = trading_day_in_quarter(features.index)
+    quarter_len = quarter_len.replace(0, 1)
+    phase = (2.0 * np.pi * day_in_quarter) / quarter_len
+    features["q_phase_sin"] = np.sin(phase)
+    features["q_phase_cos"] = np.cos(phase)
 
     return features
 
@@ -251,9 +298,10 @@ class ReturnGPModel(gpytorch.models.ExactGP):
         self.mean_module = gpytorch.means.ConstantMean()
 
         ard_num_dims = train_x.shape[-1]
+        matern = gpytorch.kernels.MaternKernel(nu=0.5, ard_num_dims=ard_num_dims)
+        rq = gpytorch.kernels.RQKernel(ard_num_dims=ard_num_dims)
         linear = gpytorch.kernels.LinearKernel(ard_num_dims=ard_num_dims)
-        matern = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_num_dims)
-        self.covar_module = gpytorch.kernels.ScaleKernel(linear + matern)
+        self.covar_module = gpytorch.kernels.ScaleKernel(matern + rq + linear)
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -261,17 +309,14 @@ class ReturnGPModel(gpytorch.models.ExactGP):
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
 
-def train_gp(train_x, train_y, train_noise, train_iters=DEFAULT_TRAIN_ITERS):
-    likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
-        noise=train_noise,
-        learn_additional_noise=True,
-    )
+def train_gp(train_x, train_y, train_iters=DEFAULT_TRAIN_ITERS):
+    likelihood = gpytorch.likelihoods.GaussianLikelihood()
     model = ReturnGPModel(train_x, train_y, likelihood)
 
     model.train()
     likelihood.train()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
 
     for i in range(1, train_iters + 1):
@@ -337,11 +382,11 @@ def print_ard_importance(model, feature_cols):
             )
 
 
-def evaluate(model, likelihood, test_x, test_y, test_noise):
+def evaluate(model, likelihood, test_x, test_y):
     model.eval()
     likelihood.eval()
     with torch.no_grad():
-        preds = likelihood(model(test_x), noise=test_noise)
+        preds = likelihood(model(test_x))
         mean = preds.mean
         std = preds.variance.sqrt()
         mae = torch.mean(torch.abs(mean - test_y)).item()
@@ -535,24 +580,17 @@ def train_for_ticker(ticker, config, history_cache):
 
         train_x = torch.tensor(train_x_df.values, dtype=torch.float32)
         train_y = torch.tensor(train_df["target"].values, dtype=torch.float32)
-        train_noise = torch.tensor(train_df["noise"].values, dtype=torch.float32).clamp_min(1e-8)
         test_x = torch.tensor(test_x_df.values, dtype=torch.float32)
         test_y = torch.tensor(test_df["target"].values, dtype=torch.float32)
-        test_noise = torch.tensor(test_df["noise"].values, dtype=torch.float32).clamp_min(1e-8)
 
         print(
             f"\nFold {split.fold} | Train: {split.train_start.date()} -> {split.train_end.date()} | "
             f"Test: {split.test_start.date()} -> {split.test_end.date()}"
         )
 
-        model, likelihood = train_gp(
-            train_x,
-            train_y,
-            train_noise,
-            config["train_iters"],
-        )
+        model, likelihood = train_gp(train_x, train_y, config["train_iters"])
 
-        metrics = evaluate(model, likelihood, test_x, test_y, test_noise)
+        metrics = evaluate(model, likelihood, test_x, test_y)
         print(
             f"MAE(log): {metrics['mae']:.6f} | MAE(simple): {metrics['mae_simple']:.4%} | "
             f"MSE: {metrics['mse']:.6f} | "
@@ -602,10 +640,11 @@ def train_for_ticker(ticker, config, history_cache):
             "sector": sector_name,
             "sector_etf": sector_etf,
             "kernel": {
-                "linear_ard": True,
-                "matern_nu": 2.5,
+                "matern_nu": 1.5,
                 "matern_ard": True,
+                "rational_quadratic_ard": True,
             },
+            "noise_model": "gaussian",
         }
     )
 

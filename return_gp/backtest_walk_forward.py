@@ -206,7 +206,6 @@ def main():
         model, likelihood = train_gp(
             train_x,
             train_y,
-            train_noise,
             args.train_iters,
         )
 
@@ -268,7 +267,7 @@ def main():
         }
     )
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir) / ticker
     output_dir.mkdir(parents=True, exist_ok=True)
     trades_path = output_dir / "return_gp_trades.csv"
     summary_path = output_dir / "return_gp_summary.json"

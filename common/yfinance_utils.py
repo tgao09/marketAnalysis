@@ -54,8 +54,11 @@ def get_history(
     auto_adjust: bool = True,
 ) -> pd.DataFrame:
     ticker = get_ticker(symbol)
+    use_period = period
+    if start is not None or end is not None:
+        use_period = None
     history = ticker.history(
-        period=period,
+        period=use_period,
         interval=interval,
         start=start,
         end=end,
