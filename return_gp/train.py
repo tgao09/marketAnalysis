@@ -22,12 +22,24 @@ TICKER_GOLD = "GLD"
 TICKER_SPY = "SPY"
 TICKER_VIX = "^VIX"
 WINDOW_RET = 5
-NOISE_WINDOW = 20
 DATA_YEARS = 3
 DEFAULT_TRAIN_ITERS = 400
 DEFAULT_TRAIN_WINDOW = "2y"
 DEFAULT_TEST_WINDOW = "1m"
 DEFAULT_STEP_WINDOW = "1m"
+FEATURE_LOOKBACK_MAX = 60
+REGIME_SCORE_WINDOW = 252
+REGIME_SCORE_CLIP = 4.0
+REGIME_SCORE_WEIGHTS = {"vix": 0.5, "spy_vol": 0.5}
+
+
+def resolve_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def parse_args():
@@ -91,11 +103,16 @@ def resolve_sector_etf(ticker):
 def fetch_history_cached(symbol, start_date, end_date, cache):
     key = symbol.upper()
     if key not in cache:
+        end_exclusive = None
+        if end_date is not None:
+            # yfinance treats `end` as exclusive; bump by one day so the
+            # caller's inclusive end_date is respected.
+            end_exclusive = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
         history = get_history(
             symbol,
             period=None,
             start=str(pd.Timestamp(start_date).date()),
-            end=str(pd.Timestamp(end_date).date()),
+            end=str(end_exclusive.date()) if end_exclusive is not None else None,
             interval="1d",
             auto_adjust=True,
         )
@@ -125,6 +142,40 @@ def compute_log_return(series, window=1):
     log_ret = np.log(ratio)
     log_ret = log_ret.replace([np.inf, -np.inf], np.nan)
     return log_ret
+
+
+def zscore_trailing(series, window, min_periods=20):
+    roll_mean = series.rolling(window, min_periods=min_periods).mean()
+    roll_std = series.rolling(window, min_periods=min_periods).std()
+    z = (series - roll_mean) / roll_std
+    return z.replace([np.inf, -np.inf], np.nan)
+
+
+def normalize_regime_weights(weights):
+    if not weights:
+        return {"vix": 0.5, "spy_vol": 0.5}
+    w_vix = float(weights.get("vix", 0.5))
+    w_spy = float(weights.get("spy_vol", 0.5))
+    total = w_vix + w_spy
+    if total <= 0:
+        return {"vix": 0.5, "spy_vol": 0.5}
+    return {"vix": w_vix / total, "spy_vol": w_spy / total}
+
+
+def compute_regime_score(price_vix, price_spy, window, clip, weights):
+    log_ret_spy = compute_log_return(price_spy, 1)
+    spy_vol_20d = log_ret_spy.rolling(20).std()
+
+    z_vix = zscore_trailing(price_vix, window)
+    z_spy = zscore_trailing(spy_vol_20d, window)
+
+    z_vix = z_vix.clip(lower=0, upper=clip)
+    z_spy = z_spy.clip(lower=0, upper=clip)
+
+    weights = normalize_regime_weights(weights)
+    score = (weights["vix"] * (z_vix / clip)) + (weights["spy_vol"] * (z_spy / clip))
+    score = score.clip(lower=0, upper=1)
+    return score.rename("regime_score")
 
 
 def trading_day_in_quarter(index):
@@ -166,24 +217,27 @@ def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy
     features["vol_10d"] = log_ret_stock.rolling(10).std()
     features["vol_20d"] = log_ret_stock.rolling(20).std()
     features["vol_60d"] = log_ret_stock.rolling(60).std()
-    features["ret_10d_std"] = (features["ret_10d"] / features["vol_10d"]).replace(
-        [np.inf, -np.inf], np.nan
-    )
-    features["ret_20d_std"] = (features["ret_20d"] / features["vol_20d"]).replace(
-        [np.inf, -np.inf], np.nan
-    )
-    features["ret_60d_std"] = (features["ret_60d"] / features["vol_60d"]).replace(
-        [np.inf, -np.inf], np.nan
-    )
 
     # Volume and distribution shape
     # features["vol_chg_1d"] = volume_stock.pct_change()
     features["skew_20d"] = log_ret_stock.rolling(20).skew()
 
+    # Trend, range, and volatility structure
+    features["stock_ma20_gap"] = (price_stock / price_stock.rolling(20).mean()) - 1.0
+    features["stock_ma60_gap"] = (price_stock / price_stock.rolling(60).mean()) - 1.0
+    roll_min_60 = price_stock.rolling(60).min()
+    roll_max_60 = price_stock.rolling(60).max()
+    features["drawdown_60d"] = (price_stock / roll_max_60) - 1.0
+    features["momentum_5_20"] = features["ret_5d"] - features["ret_20d"]
+    features["vol_ratio_5_20"] = (features["vol_5d"] / features["vol_20d"]).replace(
+        [np.inf, -np.inf], np.nan
+    )
+
     # Sector ETF features
     # features["sector_ret_1d"] = log_ret_sector
     features["sector_ret_5d"] = compute_log_return(price_sector, WINDOW_RET)
     features["sector_vol_5d"] = log_ret_sector.rolling(WINDOW_RET).std()
+    features["rel_strength_sector_20d"] = features["ret_20d"] - compute_log_return(price_sector, 20)
 
     # GLD features
     # features["gld_ret_1d"] = log_ret_gld
@@ -196,6 +250,7 @@ def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy
     features["spy_ma20_gap"] = (price_spy / price_spy.rolling(20).mean()) - 1.0
     features["vix_level"] = price_vix
     # features["vix_chg_1d"] = compute_log_return(price_vix, 1)
+    features["corr_spy_60d"] = log_ret_stock.rolling(60).corr(log_ret_spy)
 
     # Calendar features (cyclical encoding within quarter)
     day_in_quarter, quarter_len = trading_day_in_quarter(features.index)
@@ -218,10 +273,7 @@ def build_target(price_stock):
     ratio = forward_price / price_stock
     target = np.log(ratio.replace(0.0, np.nan))
     target = target.replace([np.inf, -np.inf], np.nan)
-
-    noise = target.rolling(NOISE_WINDOW).std()
-    noise = noise.pow(2)
-    return target.rename("target"), noise.rename("noise")
+    return target.rename("target")
 
 
 def find_all_nan_columns(frame):
@@ -239,7 +291,6 @@ def validate_alignment_and_nan(
     ticker,
     features,
     target,
-    noise,
     price_stock,
     price_sector,
     price_gld,
@@ -274,9 +325,6 @@ def validate_alignment_and_nan(
             f"Check price coverage and window settings. Stock coverage: {coverage}"
         )
 
-    if noise.isna().all():
-        raise ValueError(f"{ticker}: Noise is all NaN. Consider increasing history or noise_window.")
-
 
 def normalize_features(train_df, test_df, feature_cols):
     mean = train_df[feature_cols].mean()
@@ -301,7 +349,11 @@ class ReturnGPModel(gpytorch.models.ExactGP):
         matern = gpytorch.kernels.MaternKernel(nu=0.5, ard_num_dims=ard_num_dims)
         rq = gpytorch.kernels.RQKernel(ard_num_dims=ard_num_dims)
         linear = gpytorch.kernels.LinearKernel(ard_num_dims=ard_num_dims)
-        self.covar_module = gpytorch.kernels.ScaleKernel(matern + rq + linear)
+        self.covar_module = (
+            gpytorch.kernels.ScaleKernel(matern)
+            + gpytorch.kernels.ScaleKernel(rq)
+            + gpytorch.kernels.ScaleKernel(linear)
+        )
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -309,9 +361,14 @@ class ReturnGPModel(gpytorch.models.ExactGP):
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
 
-def train_gp(train_x, train_y, train_iters=DEFAULT_TRAIN_ITERS):
-    likelihood = gpytorch.likelihoods.GaussianLikelihood()
-    model = ReturnGPModel(train_x, train_y, likelihood)
+def train_gp(train_x, train_y, train_iters=DEFAULT_TRAIN_ITERS, device=None):
+    if device is None:
+        device = train_x.device
+    train_x = train_x.to(device)
+    train_y = train_y.to(device)
+
+    likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+    model = ReturnGPModel(train_x, train_y, likelihood).to(device)
 
     model.train()
     likelihood.train()
@@ -350,7 +407,7 @@ def kernel_display_name(kernel):
     return kernel.__class__.__name__
 
 
-def print_ard_importance(model, feature_cols):
+def collect_ard_importance(model, feature_cols):
     num_features = len(feature_cols)
     kernels = list(iter_base_kernels(model.covar_module))
     results = []
@@ -366,13 +423,26 @@ def print_ard_importance(model, feature_cols):
             continue
         lengthscale = np.clip(lengthscale, 1e-8, None)
         importance = 1.0 / lengthscale
-        results.append((kernel_display_name(kernel), lengthscale, importance))
+        results.append(
+            {
+                "name": kernel_display_name(kernel),
+                "lengthscale": lengthscale,
+                "importance": importance,
+            }
+        )
 
+    return results
+
+
+def print_ard_importance(results, feature_cols):
     if not results:
         print("\nARD feature importance: no ARD lengthscales found in kernel.")
         return
 
-    for name, lengthscale, importance in results:
+    for result in results:
+        name = result["name"]
+        lengthscale = result["lengthscale"]
+        importance = result["importance"]
         order = np.argsort(-importance)
         print(f"\nARD feature importance ({name}) - higher = more important (1/lengthscale):")
         for rank, idx in enumerate(order, start=1):
@@ -380,6 +450,20 @@ def print_ard_importance(model, feature_cols):
                 f"  {rank}. {feature_cols[idx]}: {importance[idx]:.6f} "
                 f"(lengthscale={lengthscale[idx]:.6f})"
             )
+
+
+def bottom_feature_sets(results, feature_cols, bottom_n=10):
+    feature_sets = []
+    if not results:
+        return feature_sets
+    num_features = len(feature_cols)
+    take_n = min(bottom_n, num_features)
+    for result in results:
+        importance = result["importance"]
+        order = np.argsort(importance)
+        bottom_idx = order[:take_n]
+        feature_sets.append({feature_cols[idx] for idx in bottom_idx})
+    return feature_sets
 
 
 def evaluate(model, likelihood, test_x, test_y):
@@ -475,11 +559,11 @@ def save_artifacts(
     print(f"\nArtifacts saved to: {artifact_dir}")
 
 
-def compute_start_date(end_date, data_years, train_window, test_window):
+def compute_start_date(end_date, data_years, train_window, test_window, regime_score_window):
     start_date = end_date - pd.DateOffset(years=data_years)
     train_offset = parse_window(train_window)
     test_offset = parse_window(test_window)
-    buffer_days = NOISE_WINDOW + (2 * WINDOW_RET) + 5
+    buffer_days = max(FEATURE_LOOKBACK_MAX, regime_score_window) + (2 * WINDOW_RET) + 5
     min_start = end_date - train_offset
     min_start = min_start - test_offset
     min_start = min_start - pd.DateOffset(days=buffer_days)
@@ -488,13 +572,14 @@ def compute_start_date(end_date, data_years, train_window, test_window):
     return start_date
 
 
-def train_for_ticker(ticker, config, history_cache):
+def train_for_ticker(ticker, config, history_cache, device):
     end_date = pd.Timestamp.today().normalize()
     start_date = compute_start_date(
         end_date,
         config["data_years"],
         config["train_window"],
         config["test_window"],
+        config["regime_score"]["score_window"],
     )
 
     sector_etf, sector_name, sector_error = resolve_sector_etf(ticker)
@@ -515,13 +600,27 @@ def train_for_ticker(ticker, config, history_cache):
     price_vix = extract_field(vix_history, "Close", TICKER_VIX)
 
     features = build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix)
-    target, noise = build_target(price_stock)
+    target = build_target(price_stock)
+
+    regime_config = config["regime_score"]
+    price_spy_regime = price_spy.reindex(price_stock.index).ffill().bfill()
+    price_vix_regime = price_vix.reindex(price_stock.index).ffill().bfill()
+
+    if regime_config.get("enabled", True):
+        regime_score = compute_regime_score(
+            price_vix_regime,
+            price_spy_regime,
+            regime_config["score_window"],
+            regime_config["score_clip"],
+            regime_config["weights"],
+        )
+    else:
+        regime_score = pd.Series(0.0, index=price_stock.index, name="regime_score")
 
     validate_alignment_and_nan(
         ticker,
         features,
         target,
-        noise,
         price_stock,
         price_sector,
         price_gld,
@@ -529,7 +628,8 @@ def train_for_ticker(ticker, config, history_cache):
         price_vix,
     )
 
-    dataset = features.join([target, noise])
+    dataset = features.join([target])
+    dataset["regime_score"] = regime_score
     before_rows = int(dataset.shape[0])
     nan_counts = dataset.isna().sum().sort_values(ascending=False)
     dataset = dataset.dropna()
@@ -553,7 +653,7 @@ def train_for_ticker(ticker, config, history_cache):
             "Try a shorter test window or wait for more recent data."
         )
 
-    feature_cols = [col for col in dataset.columns if col not in ("target", "noise")]
+    feature_cols = [col for col in dataset.columns if col != "target"]
     if config.get("drop_time_index"):
         feature_cols = [col for col in feature_cols if col != "time_index"]
 
@@ -570,6 +670,7 @@ def train_for_ticker(ticker, config, history_cache):
     last_model = None
     last_likelihood = None
     last_scaler = None
+    ard_bottom_sets = []
 
     print(f"\nTraining {ticker} (sector ETF: {sector_etf})")
     for split in splits:
@@ -578,17 +679,22 @@ def train_for_ticker(ticker, config, history_cache):
 
         train_x_df, test_x_df, scaler = normalize_features(train_df, test_df, feature_cols)
 
-        train_x = torch.tensor(train_x_df.values, dtype=torch.float32)
-        train_y = torch.tensor(train_df["target"].values, dtype=torch.float32)
-        test_x = torch.tensor(test_x_df.values, dtype=torch.float32)
-        test_y = torch.tensor(test_df["target"].values, dtype=torch.float32)
+        train_x = torch.tensor(train_x_df.values, dtype=torch.float32, device=device)
+        train_y = torch.tensor(train_df["target"].values, dtype=torch.float32, device=device)
+        test_x = torch.tensor(test_x_df.values, dtype=torch.float32, device=device)
+        test_y = torch.tensor(test_df["target"].values, dtype=torch.float32, device=device)
 
         print(
             f"\nFold {split.fold} | Train: {split.train_start.date()} -> {split.train_end.date()} | "
             f"Test: {split.test_start.date()} -> {split.test_end.date()}"
         )
 
-        model, likelihood = train_gp(train_x, train_y, config["train_iters"])
+        model, likelihood = train_gp(
+            train_x,
+            train_y,
+            train_iters=config["train_iters"],
+            device=device,
+        )
 
         metrics = evaluate(model, likelihood, test_x, test_y)
         print(
@@ -596,7 +702,9 @@ def train_for_ticker(ticker, config, history_cache):
             f"MSE: {metrics['mse']:.6f} | "
             f"Dir: {metrics['directional']:.2%} | Coverage95: {metrics['coverage_95']:.2%}"
         )
-        print_ard_importance(model, feature_cols)
+        ard_results = collect_ard_importance(model, feature_cols)
+        print_ard_importance(ard_results, feature_cols)
+        ard_bottom_sets.extend(bottom_feature_sets(ard_results, feature_cols, bottom_n=10))
 
         fold_metrics.append(
             {
@@ -624,6 +732,13 @@ def train_for_ticker(ticker, config, history_cache):
         raise ValueError(f"{ticker}: No walk-forward splits produced.")
 
     summary_metrics = summarize_fold_metrics(fold_metrics)
+    if ard_bottom_sets:
+        shared_bottom = set.intersection(*ard_bottom_sets)
+        summary_metrics["low_importance_features"] = [
+            col for col in feature_cols if col in shared_bottom
+        ]
+    else:
+        summary_metrics["low_importance_features"] = []
     print(
         f"\nSummary | {ticker} | Folds: {summary_metrics['folds']} | "
         f"MAE(log) mean: {summary_metrics['mae_mean']:.6f} | "
@@ -640,7 +755,7 @@ def train_for_ticker(ticker, config, history_cache):
             "sector": sector_name,
             "sector_etf": sector_etf,
             "kernel": {
-                "matern_nu": 1.5,
+                "matern_nu": 0.5,
                 "matern_ard": True,
                 "rational_quadratic_ard": True,
             },
@@ -670,29 +785,43 @@ def main():
     if not tickers:
         print("No tickers provided. Exiting.")
         return
+    device = resolve_device()
+    print(f"Using device: {device.type}")
 
     config = {
         "data_years": DATA_YEARS,
         "window_ret": WINDOW_RET,
-        "noise_window": NOISE_WINDOW,
         "train_window": DEFAULT_TRAIN_WINDOW,
         "test_window": DEFAULT_TEST_WINDOW,
         "step_window": DEFAULT_STEP_WINDOW,
         "train_iters": DEFAULT_TRAIN_ITERS,
         "artifact_dir": str(ARTIFACT_DIR_DEFAULT),
         "drop_time_index": args.drop_time_index,
+        "regime_score": {
+            "enabled": True,
+            "score_window": REGIME_SCORE_WINDOW,
+            "score_clip": REGIME_SCORE_CLIP,
+            "weights": REGIME_SCORE_WEIGHTS,
+        },
     }
 
     history_cache = {}
     summaries = {}
     for ticker in tickers:
         try:
-            summary = train_for_ticker(ticker, config, history_cache)
+            summary = train_for_ticker(ticker, config, history_cache, device)
             summaries[ticker] = summary
         except Exception as exc:
             print(f"{ticker}: training failed - {exc}")
 
     if summaries:
+        print("\nBottom-10 features across all folds and ARD kernels:")
+        for ticker, summary in summaries.items():
+            low_features = summary.get("low_importance_features", [])
+            if low_features:
+                print(f"  {ticker}: {', '.join(low_features)}")
+            else:
+                print(f"  {ticker}: none")
         print("\nFinished training:")
         for ticker, summary in summaries.items():
             print(

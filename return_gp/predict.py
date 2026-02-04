@@ -20,29 +20,38 @@ from return_gp.train import (
     DEFAULT_TRAIN_WINDOW,
     DEFAULT_STEP_WINDOW,
     DATA_YEARS,
+    REGIME_SCORE_WINDOW,
+    REGIME_SCORE_CLIP,
+    REGIME_SCORE_WEIGHTS,
     TICKER_GOLD,
     TICKER_SPY,
     TICKER_VIX,
+    WINDOW_RET,
     ReturnGPModel,
     build_features,
     build_target,
+    compute_regime_score,
     compute_start_date,
     extract_field,
     fetch_history_cached,
     normalize_features,
     resolve_sector_etf,
+    resolve_device,
     set_time_index,
 )
 
 
-def prompt_ticker():
-    raw = input("Ticker to predict: ").strip()
+def prompt_tickers():
+    raw = input("Tickers to predict (comma separated): ").strip()
     if not raw:
         return None
-    return raw.upper()
+    tickers = [item.strip().upper() for item in raw.split(",") if item.strip()]
+    if not tickers:
+        return None
+    return tickers
 
 
-def load_artifacts(artifact_dir: Path):
+def load_artifacts(artifact_dir: Path, device: torch.device):
     model_path = artifact_dir / "model_state.pt"
     scaler_path = artifact_dir / "scaler.json"
     config_path = artifact_dir / "config.json"
@@ -54,7 +63,7 @@ def load_artifacts(artifact_dir: Path):
     if not config_path.exists():
         raise FileNotFoundError(f"Missing config artifact: {config_path}")
 
-    model_blob = torch.load(model_path, map_location="cpu")
+    model_blob = torch.load(model_path, map_location=device)
     scaler = json.loads(scaler_path.read_text())
     config = json.loads(config_path.read_text())
 
@@ -65,13 +74,25 @@ def load_artifacts(artifact_dir: Path):
     return model_blob, scaler, config, feature_cols
 
 
-def rebuild_training_data(config, feature_cols, history_cache):
+def resolve_regime_config(config):
+    regime = (config or {}).get("regime_score") or (config or {}).get("regime_noise") or {}
+    return {
+        "enabled": regime.get("enabled", True),
+        "score_window": regime.get("score_window", REGIME_SCORE_WINDOW),
+        "score_clip": regime.get("score_clip", REGIME_SCORE_CLIP),
+        "weights": regime.get("weights", REGIME_SCORE_WEIGHTS),
+    }
+
+
+def rebuild_training_data(config, feature_cols, history_cache, device: torch.device):
+    regime_config = resolve_regime_config(config)
     end_date = pd.Timestamp.today().normalize()
     start_date = compute_start_date(
         end_date,
         config.get("data_years", DATA_YEARS),
         config.get("train_window", DEFAULT_TRAIN_WINDOW),
         config.get("test_window", DEFAULT_TEST_WINDOW),
+        regime_config["score_window"],
     )
 
     ticker = config.get("ticker")
@@ -93,9 +114,26 @@ def rebuild_training_data(config, feature_cols, history_cache):
     price_vix = extract_field(vix_history, "Close", TICKER_VIX)
 
     features = build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix)
-    target, noise = build_target(price_stock)
+    target = build_target(price_stock)
 
-    dataset = features.join([target, noise]).dropna()
+    price_spy_regime = price_spy.reindex(price_stock.index).ffill().bfill()
+    price_vix_regime = price_vix.reindex(price_stock.index).ffill().bfill()
+
+    if regime_config.get("enabled", True):
+        regime_score = compute_regime_score(
+            price_vix_regime,
+            price_spy_regime,
+            regime_config["score_window"],
+            regime_config["score_clip"],
+            regime_config["weights"],
+        )
+    else:
+        regime_score = pd.Series(0.0, index=price_stock.index, name="regime_score")
+
+    features["regime_score"] = regime_score
+
+    dataset = features.join([target])
+    dataset = dataset.dropna()
     if dataset.empty:
         raise ValueError("No rows left after feature/target alignment.")
 
@@ -104,6 +142,7 @@ def rebuild_training_data(config, feature_cols, history_cache):
             dataset,
             train_window=config.get("train_window", DEFAULT_TRAIN_WINDOW),
             test_window=config.get("test_window", DEFAULT_TEST_WINDOW),
+            embargo=config.get("window_ret", WINDOW_RET),
             step=config.get("step_window", DEFAULT_STEP_WINDOW),
             min_train_rows=60,
         )
@@ -117,42 +156,38 @@ def rebuild_training_data(config, feature_cols, history_cache):
     features = set_time_index(features, fold_start)
 
     train_x_df, _, _ = normalize_features(train_df, train_df, feature_cols)
-    train_x = torch.tensor(train_x_df.values, dtype=torch.float32)
-    train_y = torch.tensor(train_df["target"].values, dtype=torch.float32)
-    train_noise = torch.tensor(train_df["noise"].values, dtype=torch.float32).clamp_min(1e-8)
+    train_x = torch.tensor(train_x_df.values, dtype=torch.float32, device=device)
+    train_y = torch.tensor(train_df["target"].values, dtype=torch.float32, device=device)
 
-    return train_x, train_y, train_noise, features, noise
+    return train_x, train_y, features
 
 
-def get_latest_feature_row(features, noise, feature_cols):
-    usable = features[feature_cols].join(noise).dropna()
+def get_latest_feature_row(features, feature_cols):
+    usable = features[feature_cols].dropna()
     if usable.empty:
         raise ValueError("No usable feature rows found for prediction.")
     latest = usable.iloc[-1]
-    return latest.name, latest[feature_cols], latest["noise"]
+    return latest.name, latest[feature_cols]
 
 
-def predict_next_window(artifact_dir: Path):
-    model_blob, scaler, config, feature_cols = load_artifacts(artifact_dir)
+def predict_next_window(artifact_dir: Path, device: torch.device):
+    model_blob, scaler, config, feature_cols = load_artifacts(artifact_dir, device)
 
     history_cache = {}
-    train_x, train_y, train_noise, features, noise = rebuild_training_data(
+    train_x, train_y, features = rebuild_training_data(
         config,
         feature_cols,
         history_cache,
+        device,
     )
 
-    likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
-        noise=train_noise,
-        learn_additional_noise=True,
-    )
-    model = ReturnGPModel(train_x, train_y, likelihood)
+    likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
+    model = ReturnGPModel(train_x, train_y, likelihood).to(device)
     model.load_state_dict(model_blob["model_state_dict"])
     likelihood.load_state_dict(model_blob["likelihood_state_dict"])
 
-    asof_date, latest_features, latest_noise = get_latest_feature_row(
+    asof_date, latest_features = get_latest_feature_row(
         features,
-        noise,
         feature_cols,
     )
 
@@ -160,13 +195,12 @@ def predict_next_window(artifact_dir: Path):
     std = pd.Series(scaler["std"]).replace(0.0, 1.0)
     latest_scaled = (latest_features - mean) / std
 
-    x = torch.tensor(latest_scaled.values, dtype=torch.float32).unsqueeze(0)
-    test_noise = torch.tensor([latest_noise], dtype=torch.float32).clamp_min(1e-8)
+    x = torch.tensor(latest_scaled.values, dtype=torch.float32, device=device).unsqueeze(0)
 
     model.eval()
     likelihood.eval()
     with torch.no_grad():
-        preds = likelihood(model(x), noise=test_noise)
+        preds = likelihood(model(x))
         mean_log = preds.mean.item()
         std_log = preds.variance.sqrt().item()
 
@@ -185,26 +219,37 @@ def predict_next_window(artifact_dir: Path):
 
 
 def main():
-    ticker = prompt_ticker()
-    if not ticker:
+    tickers = prompt_tickers()
+    if not tickers:
         print("No ticker provided. Exiting.")
         return
 
-    artifact_dir = ARTIFACT_DIR_DEFAULT / ticker
-    result = predict_next_window(artifact_dir)
-
-    asof = result["asof_date"]
+    device = resolve_device()
+    print(f"Using device: {device.type}")
     now_utc = datetime.now(UTC).isoformat()
 
-    print(f"{ticker} 5-day forward log-return forecast")
-    print(f"As of: {asof.date()} (last trading day with full features)")
-    print(f"Generated: {now_utc}")
-    print(f"Mean log return: {result['mean_log']:.6f}")
-    print(f"Log-return std: {result['std_log']:.6f}")
-    print(
-        "95% interval (simple return): "
-        f"[{result['lower_simple']:.2%}, {result['upper_simple']:.2%}]"
-    )
+    for idx, ticker in enumerate(tickers):
+        if idx:
+            print("")
+        artifact_dir = ARTIFACT_DIR_DEFAULT / ticker
+        try:
+            result = predict_next_window(artifact_dir, device)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"{ticker}: {exc}")
+            continue
+
+        asof = result["asof_date"]
+
+        print(f"{ticker} 5-day forward log-return forecast")
+        print(f"As of: {asof.date()} (last trading day with full features)")
+        print(f"Generated: {now_utc}")
+        print(f"Mean log return: {result['mean_log']:.6f}")
+        print(f"Log-return std: {result['std_log']:.6f}")
+        print(f"Mean simple return: {result['mean_simple']:.2%}")
+        print(
+            "95% interval (simple return): "
+            f"[{result['lower_simple']:.2%}, {result['upper_simple']:.2%}]"
+        )
 
 
 if __name__ == "__main__":

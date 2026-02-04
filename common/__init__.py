@@ -12,6 +12,13 @@ from .yfinance_utils import (
 )
 from .walk_forward import WalkForwardSplit, parse_window, walk_forward_splits
 from .sanity_checks import SanityConfig, SanityReport, print_report, run_sanity_checks, write_report_json
+from .significance import (
+    SignificanceConfig,
+    SignificanceReport,
+    print_significance_report,
+    run_significance,
+    write_significance_json,
+)
 
 __all__ = [
     "DEFAULT_SECTOR_ETF_MAP",
@@ -30,4 +37,9 @@ __all__ = [
     "run_sanity_checks",
     "print_report",
     "write_report_json",
+    "SignificanceConfig",
+    "SignificanceReport",
+    "run_significance",
+    "print_significance_report",
+    "write_significance_json",
 ]

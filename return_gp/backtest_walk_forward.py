@@ -19,14 +19,19 @@ from return_gp.train import (
     DATA_YEARS,
     DEFAULT_TRAIN_ITERS,
     DEFAULT_TRAIN_WINDOW,
-    NOISE_WINDOW,
+    FEATURE_LOOKBACK_MAX,
+    REGIME_SCORE_CLIP,
+    REGIME_SCORE_WEIGHTS,
+    REGIME_SCORE_WINDOW,
     WINDOW_RET,
     build_features,
     build_target,
+    compute_regime_score,
     extract_field,
     fetch_history_cached,
     normalize_features,
     resolve_sector_etf,
+    resolve_device,
     set_time_index,
     train_gp,
 )
@@ -63,7 +68,7 @@ def prompt_ticker():
 def compute_dataset_start(end_date: pd.Timestamp, train_window: str):
     train_offset = parse_window(train_window)
     base_start = end_date - pd.DateOffset(years=DATA_YEARS)
-    buffer_days = NOISE_WINDOW + (2 * WINDOW_RET) + 5
+    buffer_days = max(FEATURE_LOOKBACK_MAX, REGIME_SCORE_WINDOW) + (2 * WINDOW_RET) + 5
     min_start = end_date - train_offset - pd.DateOffset(days=buffer_days)
     return min(base_start, min_start)
 
@@ -97,9 +102,21 @@ def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp)
         price_spy,
         price_vix,
     )
-    target, noise = build_target(price_stock)
+    target = build_target(price_stock)
 
-    dataset = features.join([target, noise]).dropna()
+    price_spy_regime = price_spy.reindex(price_stock.index).ffill().bfill()
+    price_vix_regime = price_vix.reindex(price_stock.index).ffill().bfill()
+    regime_score = compute_regime_score(
+        price_vix_regime,
+        price_spy_regime,
+        REGIME_SCORE_WINDOW,
+        REGIME_SCORE_CLIP,
+        REGIME_SCORE_WEIGHTS,
+    )
+
+    dataset = features.join([target])
+    dataset["regime_score"] = regime_score
+    dataset = dataset.dropna()
     if dataset.empty:
         raise ValueError(f"{ticker}: No rows left after feature/target alignment.")
     if dataset.index.has_duplicates:
@@ -148,6 +165,8 @@ def main():
     time_fail_count = 0
     
     args = parse_args()
+    device = resolve_device()
+    print(f"Using device: {device.type}")
     ticker = args.ticker or prompt_ticker()
     if not ticker:
         print("No ticker provided. Exiting.")
@@ -163,7 +182,7 @@ def main():
     open_stock = data["open"]
     close_stock = data["close"]
 
-    feature_cols = [col for col in dataset.columns if col not in ("target", "noise")]
+    feature_cols = [col for col in dataset.columns if col != "target"]
     if not args.include_time_index:
         feature_cols = [col for col in feature_cols if col != "time_index"]
 
@@ -199,22 +218,21 @@ def main():
         test_df = set_time_index(test_df.copy(), fold_start)
         train_x_df, test_x_df, _ = normalize_features(train_df, test_df, feature_cols)
 
-        train_x = torch.tensor(train_x_df.values, dtype=torch.float32)
-        train_y = torch.tensor(train_df["target"].values, dtype=torch.float32)
-        train_noise = torch.tensor(train_df["noise"].values, dtype=torch.float32).clamp_min(1e-8)
+        train_x = torch.tensor(train_x_df.values, dtype=torch.float32, device=device)
+        train_y = torch.tensor(train_df["target"].values, dtype=torch.float32, device=device)
 
         model, likelihood = train_gp(
             train_x,
             train_y,
             args.train_iters,
+            device=device,
         )
 
         model.eval()
         likelihood.eval()
         with torch.no_grad():
-            test_x = torch.tensor(test_x_df.values, dtype=torch.float32)
-            test_noise = torch.tensor(test_df["noise"].values, dtype=torch.float32).clamp_min(1e-8)
-            preds = likelihood(model(test_x), noise=test_noise)
+            test_x = torch.tensor(test_x_df.values, dtype=torch.float32, device=device)
+            preds = likelihood(model(test_x))
             mean_log = float(preds.mean.item())
             std_log = float(preds.variance.sqrt().item())
 
