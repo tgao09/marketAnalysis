@@ -47,6 +47,12 @@ def parse_args():
     )
     parser.add_argument("--ticker", default=None, help="Ticker symbol.")
     parser.add_argument("--end", default=None, help="End date (YYYY-MM-DD).")
+    parser.add_argument(
+        "--notional",
+        type=float,
+        default=10000.0,
+        help="Dollar notional to size each trade (default: 10000).",
+    )
     parser.add_argument("--train-iters", type=int, default=DEFAULT_TRAIN_ITERS)
     parser.add_argument("--train-window", default=DEFAULT_TRAIN_WINDOW)
     parser.add_argument(
@@ -87,7 +93,6 @@ def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp)
     vix_history = fetch_history_cached("^VIX", start_date, end_date, history_cache)
 
     price_stock = extract_field(stock_history, "Close", ticker)
-    open_stock = extract_field(stock_history, "Open", ticker)
     volume_stock = extract_field(stock_history, "Volume", ticker)
     price_sector = extract_field(sector_history, "Close", sector_etf)
     price_gld = extract_field(gld_history, "Close", "GLD")
@@ -122,12 +127,10 @@ def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp)
     if dataset.index.has_duplicates:
         dataset = dataset.loc[~dataset.index.duplicated(keep="last")]
 
-    open_stock = open_stock.reindex(dataset.index)
     close_stock = price_stock.reindex(dataset.index)
 
     return {
         "dataset": dataset,
-        "open": open_stock,
         "close": close_stock,
         "sector_etf": sector_etf,
         "sector_name": sector_name,
@@ -167,6 +170,8 @@ def main():
     args = parse_args()
     device = resolve_device()
     print(f"Using device: {device.type}")
+    if args.notional <= 0:
+        raise ValueError("--notional must be positive.")
     ticker = args.ticker or prompt_ticker()
     if not ticker:
         print("No ticker provided. Exiting.")
@@ -179,7 +184,6 @@ def main():
     print(f"Building dataset for {ticker}...")
     data = build_dataset(ticker, dataset_start, end_date)
     dataset = data["dataset"]
-    open_stock = data["open"]
     close_stock = data["close"]
 
     feature_cols = [col for col in dataset.columns if col != "target"]
@@ -187,18 +191,18 @@ def main():
         feature_cols = [col for col in feature_cols if col != "time_index"]
 
     index_series = pd.Series(dataset.index, index=dataset.index)
-    exit_date = index_series.shift(-(WINDOW_RET + 1))
-    exit_close = close_stock.shift(-(WINDOW_RET + 1))
+    exit_date = index_series.shift(-WINDOW_RET)
+    exit_close = close_stock.shift(-WINDOW_RET)
 
     candidates = pd.DataFrame(
         {
-            "entry_open": open_stock,
+            "entry_close": close_stock,
             "exit_date": exit_date,
             "exit_close": exit_close,
         }
     )
     candidates = candidates.loc[test_start:end_date]
-    candidates = candidates.dropna(subset=["entry_open", "exit_date", "exit_close"])
+    candidates = candidates.dropna(subset=["entry_close", "exit_date", "exit_close"])
 
     test_dates = candidates.index
     if test_dates.empty:
@@ -238,16 +242,22 @@ def main():
 
         direction = "long" if mean_log > 0.0 else "short"
         try:
-            entry_open = float(candidates.at[test_date + pd.offsets.BDay(1), "entry_open"])
+            entry_close = float(candidates.at[test_date, "entry_close"])
             exit_dt = candidates.at[test_date, "exit_date"]
             exit_close = float(candidates.at[test_date, "exit_close"])
         except:
             time_fail_count+=1
             continue
 
-        pnl = (exit_close - entry_open) if direction == "long" else (entry_open - exit_close)
+        if entry_close <= 0:
+            print(f"Skipping {test_date.date()}: non-positive entry_close={entry_close}")
+            continue
+        shares = args.notional / entry_close
+        pnl_per_share = (exit_close - entry_close) if direction == "long" else (entry_close - exit_close)
+        pnl = shares * pnl_per_share
+        return_pct = pnl / args.notional
         mean_simple = math.exp(mean_log) - 1.0
-        actual_simple = (exit_close / entry_open) - 1.0
+        actual_simple = (exit_close / entry_close) - 1.0
 
         trades.append(
             {
@@ -255,13 +265,17 @@ def main():
                 "trade_date": test_date,
                 "exit_date": exit_dt,
                 "direction": direction,
-                "entry_open": entry_open,
+                "entry_close": entry_close,
                 "exit_close": exit_close,
+                "notional": args.notional,
+                "shares": shares,
+                "pnl_per_share": pnl_per_share,
                 "pred_mean_log": mean_log,
                 "pred_std_log": std_log,
                 "pred_mean_simple": mean_simple,
                 "actual_simple_return": actual_simple,
                 "pnl": pnl,
+                "return_pct": return_pct,
             }
         )
 
@@ -272,6 +286,9 @@ def main():
 
     trades_df = pd.DataFrame(trades).sort_values("trade_date")
     summary = summarize_trades(trades_df)
+    avg_return_pct = None
+    if not trades_df.empty and "return_pct" in trades_df.columns:
+        avg_return_pct = float(trades_df["return_pct"].mean())
     summary.update(
         {
             "generated_at": datetime.now(UTC).isoformat(),
@@ -281,7 +298,9 @@ def main():
             "train_window": args.train_window,
             "test_years": DEFAULT_TEST_YEARS,
             "window_ret": WINDOW_RET,
-            "time_fail_count": time_fail_count
+            "time_fail_count": time_fail_count,
+            "notional": args.notional,
+            "avg_return_pct": avg_return_pct,
         }
     )
 

@@ -13,12 +13,10 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from common import walk_forward_splits
 from return_gp.train import (
     ARTIFACT_DIR_DEFAULT,
     DEFAULT_TEST_WINDOW,
     DEFAULT_TRAIN_WINDOW,
-    DEFAULT_STEP_WINDOW,
     DATA_YEARS,
     REGIME_SCORE_WINDOW,
     REGIME_SCORE_CLIP,
@@ -34,7 +32,7 @@ from return_gp.train import (
     compute_start_date,
     extract_field,
     fetch_history_cached,
-    normalize_features,
+    latest_train_window,
     resolve_sector_etf,
     resolve_device,
     set_time_index,
@@ -84,7 +82,26 @@ def resolve_regime_config(config):
     }
 
 
-def rebuild_training_data(config, feature_cols, history_cache, device: torch.device):
+def scale_with_saved_scaler(frame, feature_cols, scaler):
+    mean = pd.Series(scaler["mean"], dtype=float)
+    std = pd.Series(scaler["std"], dtype=float).replace(0.0, 1.0)
+    mean = mean.reindex(feature_cols)
+    std = std.reindex(feature_cols)
+
+    missing = [col for col in feature_cols if pd.isna(mean[col]) or pd.isna(std[col])]
+    if missing:
+        raise ValueError(f"Scaler is missing feature stats for: {', '.join(missing)}")
+
+    scaled = (frame[feature_cols] - mean) / std
+    scaled = scaled.replace([np.inf, -np.inf], np.nan)
+    if scaled.isna().any().any():
+        bad_cols = [col for col in feature_cols if scaled[col].isna().any()]
+        raise ValueError(f"Scaled features contain NaNs for columns: {', '.join(bad_cols)}")
+
+    return scaled, mean, std
+
+
+def rebuild_training_data(config, feature_cols, scaler, history_cache, device: torch.device):
     regime_config = resolve_regime_config(config)
     end_date = pd.Timestamp.today().normalize()
     start_date = compute_start_date(
@@ -137,29 +154,20 @@ def rebuild_training_data(config, feature_cols, history_cache, device: torch.dev
     if dataset.empty:
         raise ValueError("No rows left after feature/target alignment.")
 
-    splits = list(
-        walk_forward_splits(
-            dataset,
-            train_window=config.get("train_window", DEFAULT_TRAIN_WINDOW),
-            test_window=config.get("test_window", DEFAULT_TEST_WINDOW),
-            embargo=config.get("window_ret", WINDOW_RET),
-            step=config.get("step_window", DEFAULT_STEP_WINDOW),
-            min_train_rows=60,
-        )
+    final_train_raw = latest_train_window(
+        dataset,
+        train_window=config.get("train_window", DEFAULT_TRAIN_WINDOW),
+        min_train_rows=60,
     )
-    if not splits:
-        raise ValueError("No walk-forward splits available to rebuild training data.")
-
-    last_split = splits[-1]
-    fold_start = last_split.train_start
-    train_df = set_time_index(last_split.train.copy(), fold_start)
+    fold_start = final_train_raw.index.min()
+    train_df = set_time_index(final_train_raw.copy(), fold_start)
     features = set_time_index(features, fold_start)
 
-    train_x_df, _, _ = normalize_features(train_df, train_df, feature_cols)
+    train_x_df, mean, std = scale_with_saved_scaler(train_df, feature_cols, scaler)
     train_x = torch.tensor(train_x_df.values, dtype=torch.float32, device=device)
     train_y = torch.tensor(train_df["target"].values, dtype=torch.float32, device=device)
 
-    return train_x, train_y, features
+    return train_x, train_y, features, mean, std
 
 
 def get_latest_feature_row(features, feature_cols):
@@ -174,9 +182,10 @@ def predict_next_window(artifact_dir: Path, device: torch.device):
     model_blob, scaler, config, feature_cols = load_artifacts(artifact_dir, device)
 
     history_cache = {}
-    train_x, train_y, features = rebuild_training_data(
+    train_x, train_y, features, mean, std = rebuild_training_data(
         config,
         feature_cols,
+        scaler,
         history_cache,
         device,
     )
@@ -191,9 +200,11 @@ def predict_next_window(artifact_dir: Path, device: torch.device):
         feature_cols,
     )
 
-    mean = pd.Series(scaler["mean"])
-    std = pd.Series(scaler["std"]).replace(0.0, 1.0)
-    latest_scaled = (latest_features - mean) / std
+    latest_scaled = (latest_features - mean.reindex(feature_cols)) / std.reindex(feature_cols)
+    latest_scaled = latest_scaled.replace([np.inf, -np.inf], np.nan)
+    if latest_scaled.isna().any():
+        bad_cols = [col for col in feature_cols if pd.isna(latest_scaled[col])]
+        raise ValueError(f"Latest feature row produced NaNs after scaling for: {', '.join(bad_cols)}")
 
     x = torch.tensor(latest_scaled.values, dtype=torch.float32, device=device).unsqueeze(0)
 

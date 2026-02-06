@@ -206,7 +206,7 @@ def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy
     features["time_index"] = (features.index - features.index[0]).days.astype(int)
 
     # Stock returns (log) and summary stats
-    # features["ret_1d"] = log_ret_stock
+    features["ret_1d"] = log_ret_stock
     features["ret_5d"] = compute_log_return(price_stock, WINDOW_RET)
     features["ret_10d"] = compute_log_return(price_stock, 10)
     features["ret_20d"] = compute_log_return(price_stock, 20)
@@ -249,8 +249,8 @@ def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy
     features["spy_vol_20d"] = log_ret_spy.rolling(20).std()
     features["spy_ma20_gap"] = (price_spy / price_spy.rolling(20).mean()) - 1.0
     features["vix_level"] = price_vix
-    # features["vix_chg_1d"] = compute_log_return(price_vix, 1)
-    features["corr_spy_60d"] = log_ret_stock.rolling(60).corr(log_ret_spy)
+    features["vix_chg_1d"] = compute_log_return(price_vix, 1)
+    # features["corr_spy_60d"] = log_ret_stock.rolling(60).corr(log_ret_spy)
 
     # Calendar features (cyclical encoding within quarter)
     day_in_quarter, quarter_len = trading_day_in_quarter(features.index)
@@ -338,6 +338,24 @@ def normalize_features(train_df, test_df, feature_cols):
         "std": std.to_dict(),
     }
     return train_x, test_x, scaler
+
+
+def latest_train_window(data, train_window, min_train_rows=60):
+    if data.empty:
+        raise ValueError("Cannot build final training window from empty dataset.")
+
+    train_offset = parse_window(train_window)
+    latest_end = data.index.max()
+    latest_start = latest_end - train_offset
+    train_df = data.loc[(data.index > latest_start) & (data.index <= latest_end)]
+
+    if len(train_df) < min_train_rows:
+        raise ValueError(
+            f"Not enough rows for final training window ({len(train_df)} < {min_train_rows}). "
+            f"window={train_window}, latest_end={latest_end.date()}"
+        )
+
+    return train_df
 
 
 class ReturnGPModel(gpytorch.models.ExactGP):
@@ -657,19 +675,20 @@ def train_for_ticker(ticker, config, history_cache, device):
     if config.get("drop_time_index"):
         feature_cols = [col for col in feature_cols if col != "time_index"]
 
-    splits = walk_forward_splits(
-        dataset,
-        train_window=config["train_window"],
-        test_window=config["test_window"],
-        embargo=config["window_ret"],
-        step=config["step_window"],
-        min_train_rows=60,
+    splits = list(
+        walk_forward_splits(
+            dataset,
+            train_window=config["train_window"],
+            test_window=config["test_window"],
+            embargo=config["window_ret"],
+            step=config["step_window"],
+            min_train_rows=60,
+        )
     )
+    if not splits:
+        raise ValueError(f"{ticker}: No walk-forward splits produced.")
 
     fold_metrics = []
-    last_model = None
-    last_likelihood = None
-    last_scaler = None
     ard_bottom_sets = []
 
     print(f"\nTraining {ticker} (sector ETF: {sector_etf})")
@@ -724,13 +743,6 @@ def train_for_ticker(ticker, config, history_cache, device):
             }
         )
 
-        last_model = model
-        last_likelihood = likelihood
-        last_scaler = scaler
-
-    if not fold_metrics:
-        raise ValueError(f"{ticker}: No walk-forward splits produced.")
-
     summary_metrics = summarize_fold_metrics(fold_metrics)
     if ard_bottom_sets:
         shared_bottom = set.intersection(*ard_bottom_sets)
@@ -747,6 +759,32 @@ def train_for_ticker(ticker, config, history_cache, device):
         f"Dir mean: {summary_metrics['directional_mean']:.2%}"
     )
 
+    final_train_raw = latest_train_window(
+        dataset,
+        train_window=config["train_window"],
+        min_train_rows=60,
+    )
+    final_fold_start = final_train_raw.index.min()
+    final_train_df = set_time_index(final_train_raw.copy(), final_fold_start)
+    final_train_x_df, _, final_scaler = normalize_features(
+        final_train_df,
+        final_train_df,
+        feature_cols,
+    )
+    final_train_x = torch.tensor(final_train_x_df.values, dtype=torch.float32, device=device)
+    final_train_y = torch.tensor(final_train_df["target"].values, dtype=torch.float32, device=device)
+
+    print(
+        f"\nFinal model fit | Train: {final_train_df.index.min().date()} -> "
+        f"{final_train_df.index.max().date()}"
+    )
+    final_model, final_likelihood = train_gp(
+        final_train_x,
+        final_train_y,
+        train_iters=config["train_iters"],
+        device=device,
+    )
+
     artifact_dir = Path(config["artifact_dir"]) / ticker
     config_out = dict(config)
     config_out.update(
@@ -760,14 +798,19 @@ def train_for_ticker(ticker, config, history_cache, device):
                 "rational_quadratic_ard": True,
             },
             "noise_model": "gaussian",
+            "final_train_window": {
+                "start": str(final_train_df.index.min().date()),
+                "end": str(final_train_df.index.max().date()),
+                "rows": int(len(final_train_df)),
+            },
         }
     )
 
     save_artifacts(
         artifact_dir,
-        last_model,
-        last_likelihood,
-        last_scaler,
+        final_model,
+        final_likelihood,
+        final_scaler,
         fold_metrics,
         summary_metrics,
         config_out,

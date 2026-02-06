@@ -28,12 +28,14 @@ REQUIRED_COLUMNS = {
     "actual_simple_return",
 }
 
+TRADING_DAYS_PER_YEAR = 252
+
 
 @dataclass(frozen=True)
 class SignificanceConfig:
     benchmark_ticker: str = "SPY"
     return_column: str = "actual_simple_return"
-    apply_direction: bool = False
+    apply_direction: bool = True
     lag: Optional[int] = None
     json_output_name: str = "significance_report.json"
 
@@ -108,7 +110,8 @@ def run_significance(
     active_returns = aligned["trade_return"] - aligned["benchmark_return"]
 
     lag_used, median_holding_days = auto_lag(trades, bench_index, config.lag)
-    info_ratio = information_ratio(active_returns)
+    info_ratio_raw = information_ratio(active_returns)
+    info_ratio = annualize_information_ratio(info_ratio_raw, median_holding_days)
     t_stat = newey_west_tstat(active_returns, lag_used)
 
     metadata = {
@@ -126,6 +129,7 @@ def run_significance(
 
     metrics = {
         "information_ratio": info_ratio,
+        "information_ratio_raw": info_ratio_raw,
         "t_stat": t_stat,
         "active_mean": float(active_returns.mean()) if len(active_returns) else float("nan"),
         "active_std": float(active_returns.std(ddof=1)) if len(active_returns) > 1 else float("nan"),
@@ -184,6 +188,22 @@ def information_ratio(series: pd.Series) -> float:
     return float(series.mean() / std)
 
 
+def annualize_information_ratio(
+    info_ratio: float,
+    median_holding_days: Optional[int],
+    trading_days_per_year: int = TRADING_DAYS_PER_YEAR,
+) -> float:
+    if (
+        info_ratio is None
+        or (isinstance(info_ratio, float) and np.isnan(info_ratio))
+        or median_holding_days is None
+        or median_holding_days <= 0
+    ):
+        return float("nan")
+    scale = np.sqrt(trading_days_per_year / float(median_holding_days))
+    return float(info_ratio * scale)
+
+
 def newey_west_tstat(series: pd.Series, lag: int) -> float:
     if series is None:
         return float("nan")
@@ -218,9 +238,6 @@ def auto_lag(
     benchmark_index: pd.DatetimeIndex,
     override: Optional[int],
 ) -> Tuple[int, Optional[int]]:
-    if override is not None:
-        return int(override), None
-
     trade_dates = trades["trade_date"].dt.normalize()
     exit_dates = trades["exit_date"].dt.normalize()
 
@@ -229,14 +246,16 @@ def auto_lag(
 
     valid = (entry_idx >= 0) & (exit_idx >= 0)
     if not valid.any():
-        return 0, None
+        return int(override) if override is not None else 0, None
 
     holding = exit_idx[valid] - entry_idx[valid]
     holding = holding[holding >= 0]
     if holding.size == 0:
-        return 0, None
+        return int(override) if override is not None else 0, None
 
     median_days = int(np.median(holding))
+    if override is not None:
+        return int(override), median_days
     lag = max(0, median_days - 1)
     return lag, median_days
 
@@ -295,7 +314,8 @@ def print_significance_report(report: SignificanceReport) -> None:
     print(f"Trades: {metadata.get('trade_count')}")
     print(f"Active Trades Used: {metadata.get('active_trades_used')}")
     print(f"Date Range: {metadata.get('start_date')} -> {metadata.get('end_date')}")
-    print(f"Information Ratio: {_fmt(metrics.get('information_ratio'))}")
+    print(f"Information Ratio (Annualized): {_fmt(metrics.get('information_ratio'))}")
+    print(f"Information Ratio (Per-Trade): {_fmt(metrics.get('information_ratio_raw'))}")
     print(f"HAC t-stat: {_fmt(metrics.get('t_stat'))}")
     print(f"Lag Used: {_fmt(metadata.get('lag_used'), 0)}")
 
