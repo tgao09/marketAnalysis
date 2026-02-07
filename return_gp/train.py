@@ -14,7 +14,15 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from common import DEFAULT_SECTOR_ETF_MAP, get_history, get_info, parse_window, walk_forward_splits
+from common import (
+    DEFAULT_SECTOR_ETF_MAP,
+    PCATransformer,
+    get_history,
+    get_info,
+    parse_window,
+    save_pca_json,
+    walk_forward_splits,
+)
 
 
 ARTIFACT_DIR_DEFAULT = Path(__file__).resolve().parent / "artifacts"
@@ -31,6 +39,22 @@ FEATURE_LOOKBACK_MAX = 60
 REGIME_SCORE_WINDOW = 252
 REGIME_SCORE_CLIP = 4.0
 REGIME_SCORE_WEIGHTS = {"vix": 0.5, "spy_vol": 0.5}
+PCA_VAR_THRESHOLD = 0.80
+PCA_MAX_PCS = 12
+PCA_IMPUTE_STRATEGY = "median"
+PCA_MODE = "replace"
+PCA_PC_PREFIX = "pc_"
+ARTIFACT_VARIANT_REGULAR = "regular"
+ARTIFACT_VARIANT_PCA = "pca"
+PCA_ANALYSIS_EXTRA_FEATURES = [
+    "ret_20d",
+    "vol_chg_1d",
+    "momentum_5_20",
+    "sector_ret_1d",
+    "gld_ret_1d",
+    "vix_level",
+    "corr_spy_60d",
+]
 
 
 def resolve_device():
@@ -54,8 +78,27 @@ def parse_args():
         action="store_true",
         help="Include time_index in training features.",
     )
+    parser.add_argument(
+        "--pca",
+        action="store_true",
+        help="Enable PCA preprocessing pipeline (saved under ticker/pca artifacts).",
+    )
     parser.set_defaults(drop_time_index=True)
     return parser.parse_args()
+
+
+def resolve_artifact_variant(pca_enabled: bool) -> str:
+    return ARTIFACT_VARIANT_PCA if pca_enabled else ARTIFACT_VARIANT_REGULAR
+
+
+def build_pca_transformer() -> PCATransformer:
+    return PCATransformer(
+        threshold=PCA_VAR_THRESHOLD,
+        max_pcs=PCA_MAX_PCS,
+        impute_strategy=PCA_IMPUTE_STRATEGY,
+        mode=PCA_MODE,
+        pc_prefix=PCA_PC_PREFIX,
+    )
 
 
 def prompt_tickers():
@@ -191,11 +234,12 @@ def trading_day_in_quarter(index):
 def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix):
     index = price_stock.index
 
-    volume_stock = volume_stock.reindex(index).ffill().bfill()
-    price_sector = price_sector.reindex(index).ffill().bfill()
-    price_gld = price_gld.reindex(index).ffill().bfill()
-    price_spy = price_spy.reindex(index).ffill().bfill()
-    price_vix = price_vix.reindex(index).ffill().bfill()
+    # Forward-fill only to avoid leaking future information via backfill.
+    volume_stock = volume_stock.reindex(index).ffill()
+    price_sector = price_sector.reindex(index).ffill()
+    price_gld = price_gld.reindex(index).ffill()
+    price_spy = price_spy.reindex(index).ffill()
+    price_vix = price_vix.reindex(index).ffill()
 
     log_ret_stock = compute_log_return(price_stock, 1)
     log_ret_sector = compute_log_return(price_sector, 1)
@@ -209,7 +253,8 @@ def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy
     features["ret_1d"] = log_ret_stock
     features["ret_5d"] = compute_log_return(price_stock, WINDOW_RET)
     features["ret_10d"] = compute_log_return(price_stock, 10)
-    features["ret_20d"] = compute_log_return(price_stock, 20)
+    ret_20d = compute_log_return(price_stock, 20)
+    features["ret_20d"] = ret_20d
     features["ret_60d"] = compute_log_return(price_stock, 60)
 
     # Stock volatility and standardized returns
@@ -219,7 +264,7 @@ def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy
     features["vol_60d"] = log_ret_stock.rolling(60).std()
 
     # Volume and distribution shape
-    # features["vol_chg_1d"] = volume_stock.pct_change()
+    features["vol_chg_1d"] = volume_stock.pct_change()
     features["skew_20d"] = log_ret_stock.rolling(20).skew()
 
     # Trend, range, and volatility structure
@@ -228,19 +273,19 @@ def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy
     roll_min_60 = price_stock.rolling(60).min()
     roll_max_60 = price_stock.rolling(60).max()
     features["drawdown_60d"] = (price_stock / roll_max_60) - 1.0
-    features["momentum_5_20"] = features["ret_5d"] - features["ret_20d"]
+    features["momentum_5_20"] = features["ret_5d"] - ret_20d
     features["vol_ratio_5_20"] = (features["vol_5d"] / features["vol_20d"]).replace(
         [np.inf, -np.inf], np.nan
     )
 
     # Sector ETF features
-    # features["sector_ret_1d"] = log_ret_sector
+    features["sector_ret_1d"] = log_ret_sector
     features["sector_ret_5d"] = compute_log_return(price_sector, WINDOW_RET)
     features["sector_vol_5d"] = log_ret_sector.rolling(WINDOW_RET).std()
-    features["rel_strength_sector_20d"] = features["ret_20d"] - compute_log_return(price_sector, 20)
+    features["rel_strength_sector_20d"] = ret_20d - compute_log_return(price_sector, 20)
 
     # GLD features
-    # features["gld_ret_1d"] = log_ret_gld
+    features["gld_ret_1d"] = log_ret_gld
     features["gld_ret_5d"] = compute_log_return(price_gld, WINDOW_RET)
     features["gld_vol_5d"] = log_ret_gld.rolling(WINDOW_RET).std()
 
@@ -250,7 +295,7 @@ def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy
     features["spy_ma20_gap"] = (price_spy / price_spy.rolling(20).mean()) - 1.0
     features["vix_level"] = price_vix
     features["vix_chg_1d"] = compute_log_return(price_vix, 1)
-    # features["corr_spy_60d"] = log_ret_stock.rolling(60).corr(log_ret_spy)
+    features["corr_spy_60d"] = log_ret_stock.rolling(60).corr(log_ret_spy)
 
     # Calendar features (cyclical encoding within quarter)
     day_in_quarter, quarter_len = trading_day_in_quarter(features.index)
@@ -338,6 +383,15 @@ def normalize_features(train_df, test_df, feature_cols):
         "std": std.to_dict(),
     }
     return train_x, test_x, scaler
+
+
+def select_feature_columns(dataset: pd.DataFrame, drop_time_index: bool, pca_enabled: bool) -> list[str]:
+    feature_cols = [col for col in dataset.columns if col != "target"]
+    if drop_time_index:
+        feature_cols = [col for col in feature_cols if col != "time_index"]
+    if not pca_enabled:
+        feature_cols = [col for col in feature_cols if col not in PCA_ANALYSIS_EXTRA_FEATURES]
+    return feature_cols
 
 
 def latest_train_window(data, train_window, min_train_rows=60):
@@ -540,11 +594,12 @@ def save_artifacts(
     artifact_dir,
     model,
     likelihood,
-    scaler,
     fold_metrics,
     summary_metrics,
     config,
     feature_cols,
+    raw_feature_cols,
+    scaler=None,
 ):
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -558,12 +613,16 @@ def save_artifacts(
             "model_state_dict": model.state_dict(),
             "likelihood_state_dict": likelihood.state_dict(),
             "feature_columns": feature_cols,
+            "raw_feature_columns": raw_feature_cols,
         },
         model_path,
     )
 
-    scaler_out = {"mean": scaler["mean"], "std": scaler["std"]}
-    scaler_path.write_text(json.dumps(scaler_out, indent=2))
+    if scaler is not None:
+        scaler_out = {"mean": scaler["mean"], "std": scaler["std"]}
+        scaler_path.write_text(json.dumps(scaler_out, indent=2))
+    elif scaler_path.exists():
+        scaler_path.unlink()
 
     metrics_out = {
         "summary": summary_metrics,
@@ -621,8 +680,9 @@ def train_for_ticker(ticker, config, history_cache, device):
     target = build_target(price_stock)
 
     regime_config = config["regime_score"]
-    price_spy_regime = price_spy.reindex(price_stock.index).ffill().bfill()
-    price_vix_regime = price_vix.reindex(price_stock.index).ffill().bfill()
+    # Keep regime inputs causal (no backward fill from future observations).
+    price_spy_regime = price_spy.reindex(price_stock.index).ffill()
+    price_vix_regime = price_vix.reindex(price_stock.index).ffill()
 
     if regime_config.get("enabled", True):
         regime_score = compute_regime_score(
@@ -671,9 +731,13 @@ def train_for_ticker(ticker, config, history_cache, device):
             "Try a shorter test window or wait for more recent data."
         )
 
-    feature_cols = [col for col in dataset.columns if col != "target"]
-    if config.get("drop_time_index"):
-        feature_cols = [col for col in feature_cols if col != "time_index"]
+    pca_enabled = bool(config.get("pca", {}).get("enabled", False))
+    feature_cols = select_feature_columns(
+        dataset=dataset,
+        drop_time_index=bool(config.get("drop_time_index", True)),
+        pca_enabled=pca_enabled,
+    )
+    artifact_variant = resolve_artifact_variant(pca_enabled)
 
     splits = list(
         walk_forward_splits(
@@ -690,13 +754,28 @@ def train_for_ticker(ticker, config, history_cache, device):
 
     fold_metrics = []
     ard_bottom_sets = []
+    importance_feature_cols_ref = None
+    importance_feature_cols_unstable = False
 
-    print(f"\nTraining {ticker} (sector ETF: {sector_etf})")
+    print(f"\nTraining {ticker} (sector ETF: {sector_etf}, variant: {artifact_variant})")
     for split in splits:
         train_df = set_time_index(split.train.copy(), split.train_start)
         test_df = set_time_index(split.test.copy(), split.train_start)
 
-        train_x_df, test_x_df, scaler = normalize_features(train_df, test_df, feature_cols)
+        if pca_enabled:
+            fold_pca = build_pca_transformer()
+            train_x_df, test_x_df = fold_pca.transform_train_test(train_df, test_df, feature_cols)
+            model_feature_cols = train_x_df.columns.tolist()
+            fold_pca_k = int(fold_pca.k_selected_ or 0)
+        else:
+            train_x_df, test_x_df, _ = normalize_features(train_df, test_df, feature_cols)
+            model_feature_cols = list(feature_cols)
+            fold_pca_k = None
+
+        if importance_feature_cols_ref is None:
+            importance_feature_cols_ref = list(model_feature_cols)
+        elif model_feature_cols != importance_feature_cols_ref:
+            importance_feature_cols_unstable = True
 
         train_x = torch.tensor(train_x_df.values, dtype=torch.float32, device=device)
         train_y = torch.tensor(train_df["target"].values, dtype=torch.float32, device=device)
@@ -721,9 +800,9 @@ def train_for_ticker(ticker, config, history_cache, device):
             f"MSE: {metrics['mse']:.6f} | "
             f"Dir: {metrics['directional']:.2%} | Coverage95: {metrics['coverage_95']:.2%}"
         )
-        ard_results = collect_ard_importance(model, feature_cols)
-        print_ard_importance(ard_results, feature_cols)
-        ard_bottom_sets.extend(bottom_feature_sets(ard_results, feature_cols, bottom_n=10))
+        ard_results = collect_ard_importance(model, model_feature_cols)
+        print_ard_importance(ard_results, model_feature_cols)
+        ard_bottom_sets.extend(bottom_feature_sets(ard_results, model_feature_cols, bottom_n=10))
 
         fold_metrics.append(
             {
@@ -740,15 +819,21 @@ def train_for_ticker(ticker, config, history_cache, device):
                 "directional": metrics["directional"],
                 "coverage_95": metrics["coverage_95"],
                 "avg_interval_width": metrics["avg_interval_width"],
+                "pca_k": fold_pca_k,
             }
         )
 
     summary_metrics = summarize_fold_metrics(fold_metrics)
-    if ard_bottom_sets:
+    if ard_bottom_sets and not importance_feature_cols_unstable:
         shared_bottom = set.intersection(*ard_bottom_sets)
         summary_metrics["low_importance_features"] = [
-            col for col in feature_cols if col in shared_bottom
+            col for col in (importance_feature_cols_ref or []) if col in shared_bottom
         ]
+    elif ard_bottom_sets and importance_feature_cols_unstable:
+        summary_metrics["low_importance_features"] = []
+        summary_metrics["low_importance_note"] = (
+            "Skipped shared-bottom ARD summary because PCA fold component counts varied."
+        )
     else:
         summary_metrics["low_importance_features"] = []
     print(
@@ -766,11 +851,19 @@ def train_for_ticker(ticker, config, history_cache, device):
     )
     final_fold_start = final_train_raw.index.min()
     final_train_df = set_time_index(final_train_raw.copy(), final_fold_start)
-    final_train_x_df, _, final_scaler = normalize_features(
-        final_train_df,
-        final_train_df,
-        feature_cols,
-    )
+    final_pca_transformer = None
+    if pca_enabled:
+        final_pca_transformer = build_pca_transformer().fit(final_train_df, feature_cols)
+        final_train_x_df = final_pca_transformer.transform(final_train_df)
+        final_scaler = None
+        final_model_feature_cols = final_train_x_df.columns.tolist()
+    else:
+        final_train_x_df, _, final_scaler = normalize_features(
+            final_train_df,
+            final_train_df,
+            feature_cols,
+        )
+        final_model_feature_cols = list(feature_cols)
     final_train_x = torch.tensor(final_train_x_df.values, dtype=torch.float32, device=device)
     final_train_y = torch.tensor(final_train_df["target"].values, dtype=torch.float32, device=device)
 
@@ -785,13 +878,14 @@ def train_for_ticker(ticker, config, history_cache, device):
         device=device,
     )
 
-    artifact_dir = Path(config["artifact_dir"]) / ticker
+    artifact_dir = Path(config["artifact_dir"]) / ticker / artifact_variant
     config_out = dict(config)
     config_out.update(
         {
             "ticker": ticker,
             "sector": sector_name,
             "sector_etf": sector_etf,
+            "artifact_variant": artifact_variant,
             "kernel": {
                 "matern_nu": 0.5,
                 "matern_ard": True,
@@ -810,12 +904,20 @@ def train_for_ticker(ticker, config, history_cache, device):
         artifact_dir,
         final_model,
         final_likelihood,
-        final_scaler,
         fold_metrics,
         summary_metrics,
         config_out,
+        final_model_feature_cols,
         feature_cols,
+        scaler=final_scaler,
     )
+    pca_path = artifact_dir / "pca.json"
+    if pca_enabled:
+        if final_pca_transformer is None:
+            raise RuntimeError("Expected final_pca_transformer for PCA-enabled training.")
+        save_pca_json(pca_path, final_pca_transformer)
+    elif pca_path.exists():
+        pca_path.unlink()
 
     return summary_metrics
 
@@ -840,6 +942,14 @@ def main():
         "train_iters": DEFAULT_TRAIN_ITERS,
         "artifact_dir": str(ARTIFACT_DIR_DEFAULT),
         "drop_time_index": args.drop_time_index,
+        "pca": {
+            "enabled": args.pca,
+            "threshold": PCA_VAR_THRESHOLD,
+            "max_pcs": PCA_MAX_PCS,
+            "impute_strategy": PCA_IMPUTE_STRATEGY,
+            "mode": PCA_MODE,
+            "pc_prefix": PCA_PC_PREFIX,
+        },
         "regime_score": {
             "enabled": True,
             "score_window": REGIME_SCORE_WINDOW,

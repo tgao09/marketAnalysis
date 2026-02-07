@@ -66,6 +66,9 @@ def walk_forward_splits(
     train_offset = _parse_window(train_window)
     test_offset = _parse_window(test_window)
     step_offset = _parse_window(step or test_window)
+    embargo_rows = int(embargo)
+    if embargo_rows < 0:
+        raise ValueError("embargo must be non-negative.")
 
     index = data.index.sort_values()
     first_date = index.min()
@@ -73,21 +76,31 @@ def walk_forward_splits(
 
     train_end = first_date + train_offset
     fold = 0
-    
-    embargo = pd.offsets.BDay(embargo)
 
     while True:
         train_start = train_end - train_offset
-        test_start = train_end + embargo
-        test_end = test_start + test_offset
 
+        train_mask = (index > train_start) & (index <= train_end)
+        train_df = data.loc[train_mask]
+        if train_df.empty:
+            train_end = train_end + step_offset
+            if train_end >= last_date:
+                break
+            continue
+
+        # Use row-based embargo so target horizons (which are row-based shifts)
+        # cannot overlap the first test row, including holiday-affected calendars.
+        train_end_pos = int(index.searchsorted(train_df.index.max(), side="right") - 1)
+        first_test_pos = train_end_pos + embargo_rows + 1
+        if first_test_pos >= len(index):
+            break
+
+        test_start = index[first_test_pos]
+        test_end = test_start + test_offset
         if test_end > last_date:
             break
 
-        train_mask = (index > train_start) & (index <= train_end)
-        test_mask = (index > test_start) & (index <= test_end)
-
-        train_df = data.loc[train_mask]
+        test_mask = (index >= test_start) & (index <= test_end)
         test_df = data.loc[test_mask]
 
         if test_df.empty:

@@ -12,6 +12,7 @@ from .yfinance_utils import (
 )
 from .walk_forward import WalkForwardSplit, parse_window, walk_forward_splits
 from .sanity_checks import SanityConfig, SanityReport, print_report, run_sanity_checks, write_report_json
+from .pca_utils import PCATransformer, load_pca_json, save_pca_json, select_k_by_variance
 from .significance import (
     SignificanceConfig,
     SignificanceReport,
@@ -37,6 +38,10 @@ __all__ = [
     "run_sanity_checks",
     "print_report",
     "write_report_json",
+    "PCATransformer",
+    "select_k_by_variance",
+    "save_pca_json",
+    "load_pca_json",
     "SignificanceConfig",
     "SignificanceReport",
     "run_significance",

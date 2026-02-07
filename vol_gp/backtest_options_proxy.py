@@ -104,11 +104,16 @@ def generate_forecast_series(
     step_window: str,
 ):
     forecasts = []
+    # Target uses forward WINDOW_VOL days, so embargo must match to prevent leakage.
+    horizon_embargo = WINDOW_VOL
+    if horizon_embargo < 0:
+        raise ValueError("WINDOW_VOL must be non-negative for walk-forward embargo.")
 
     splits = walk_forward_splits(
         dataset,
         train_window=train_window,
         test_window=test_window,
+        embargo=horizon_embargo,
         step=step_window,
         min_train_rows=60,
     )

@@ -597,11 +597,16 @@ def main():
     last_model = None
     last_likelihood = None
     last_scaler = None
+    # Target uses forward WINDOW_VOL days, so embargo must match to prevent leakage.
+    horizon_embargo = WINDOW_VOL
+    if horizon_embargo < 0:
+        raise ValueError("WINDOW_VOL must be non-negative for walk-forward embargo.")
 
     splits = walk_forward_splits(
         dataset,
         train_window=config["train_window"],
         test_window=config["test_window"],
+        embargo=horizon_embargo,
         step=config["step_window"],
         min_train_rows=60,
     )

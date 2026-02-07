@@ -13,7 +13,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from common import parse_window
+from common import PCATransformer, parse_window
 from return_gp.train import (
     ARTIFACT_DIR_DEFAULT,
     DATA_YEARS,
@@ -30,8 +30,10 @@ from return_gp.train import (
     extract_field,
     fetch_history_cached,
     normalize_features,
+    resolve_artifact_variant,
     resolve_sector_etf,
     resolve_device,
+    select_feature_columns,
     set_time_index,
     train_gp,
 )
@@ -59,6 +61,11 @@ def parse_args():
         "--include-time-index",
         action="store_true",
         help="Include time_index in features (default is to exclude).",
+    )
+    parser.add_argument(
+        "--pca",
+        action="store_true",
+        help="Enable fold-local PCA features for backtest and write outputs under ticker/pca.",
     )
     parser.add_argument("--output-dir", default=str(ARTIFACT_DIR_DEFAULT))
     return parser.parse_args()
@@ -109,8 +116,9 @@ def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp)
     )
     target = build_target(price_stock)
 
-    price_spy_regime = price_spy.reindex(price_stock.index).ffill().bfill()
-    price_vix_regime = price_vix.reindex(price_stock.index).ffill().bfill()
+    # Keep regime inputs causal to avoid leaking future values.
+    price_spy_regime = price_spy.reindex(price_stock.index).ffill()
+    price_vix_regime = price_vix.reindex(price_stock.index).ffill()
     regime_score = compute_regime_score(
         price_vix_regime,
         price_spy_regime,
@@ -164,6 +172,16 @@ def summarize_trades(trades: pd.DataFrame):
     }
 
 
+def build_backtest_pca_transformer() -> PCATransformer:
+    return PCATransformer(
+        threshold=0.80,
+        max_pcs=12,
+        impute_strategy="median",
+        mode="replace",
+        pc_prefix="pc_",
+    )
+
+
 def main():
     time_fail_count = 0
     
@@ -186,9 +204,11 @@ def main():
     dataset = data["dataset"]
     close_stock = data["close"]
 
-    feature_cols = [col for col in dataset.columns if col != "target"]
-    if not args.include_time_index:
-        feature_cols = [col for col in feature_cols if col != "time_index"]
+    feature_cols = select_feature_columns(
+        dataset=dataset,
+        drop_time_index=not args.include_time_index,
+        pca_enabled=args.pca,
+    )
 
     index_series = pd.Series(dataset.index, index=dataset.index)
     exit_date = index_series.shift(-WINDOW_RET)
@@ -208,10 +228,18 @@ def main():
     if test_dates.empty:
         raise ValueError("No eligible test dates found in the last year.")
 
+    dataset_index = dataset.index
     trades = []
     for test_date in test_dates:
+        test_pos = int(dataset_index.searchsorted(test_date, side="left"))
+        if test_pos >= len(dataset_index) or dataset_index[test_pos] != test_date:
+            continue
+        train_end_pos = test_pos - WINDOW_RET - 1
+        if train_end_pos < 0:
+            continue
+        train_end = dataset_index[train_end_pos]
         train_start = test_date - pd.DateOffset(years=2) - pd.offsets.BDay(WINDOW_RET)
-        train_df = dataset.loc[(dataset.index > train_start) & (dataset.index < test_date - pd.offsets.BDay(WINDOW_RET))]
+        train_df = dataset.loc[(dataset.index > train_start) & (dataset.index <= train_end)]
         if len(train_df) < MIN_TRAIN_ROWS:
             continue
         
@@ -220,7 +248,13 @@ def main():
         fold_start = train_df.index.min()
         train_df = set_time_index(train_df.copy(), fold_start)
         test_df = set_time_index(test_df.copy(), fold_start)
-        train_x_df, test_x_df, _ = normalize_features(train_df, test_df, feature_cols)
+        fold_pca_k = None
+        if args.pca:
+            fold_pca = build_backtest_pca_transformer()
+            train_x_df, test_x_df = fold_pca.transform_train_test(train_df, test_df, feature_cols)
+            fold_pca_k = int(fold_pca.k_selected_ or 0)
+        else:
+            train_x_df, test_x_df, _ = normalize_features(train_df, test_df, feature_cols)
 
         train_x = torch.tensor(train_x_df.values, dtype=torch.float32, device=device)
         train_y = torch.tensor(train_df["target"].values, dtype=torch.float32, device=device)
@@ -276,6 +310,8 @@ def main():
                 "actual_simple_return": actual_simple,
                 "pnl": pnl,
                 "return_pct": return_pct,
+                "pca_enabled": bool(args.pca),
+                "pca_k": fold_pca_k,
             }
         )
 
@@ -301,10 +337,12 @@ def main():
             "time_fail_count": time_fail_count,
             "notional": args.notional,
             "avg_return_pct": avg_return_pct,
+            "pca_enabled": bool(args.pca),
+            "artifact_variant": resolve_artifact_variant(args.pca),
         }
     )
 
-    output_dir = Path(args.output_dir) / ticker
+    output_dir = Path(args.output_dir) / ticker / resolve_artifact_variant(args.pca)
     output_dir.mkdir(parents=True, exist_ok=True)
     trades_path = output_dir / "return_gp_trades.csv"
     summary_path = output_dir / "return_gp_summary.json"
