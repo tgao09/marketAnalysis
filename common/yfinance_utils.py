@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Dict, Optional
 
 import pandas as pd
@@ -22,6 +23,50 @@ DEFAULT_SECTOR_ETF_MAP: Dict[str, str] = {
     "Utilities": "XLU",
 }
 
+_SECTOR_ALIASES: Dict[str, str] = {
+    "communication services": "Communication Services",
+    "consumer discretionary": "Consumer Discretionary",
+    "consumer cyclical": "Consumer Discretionary",
+    "consumer staples": "Consumer Staples",
+    "consumer defensive": "Consumer Staples",
+    "energy": "Energy",
+    "financials": "Financials",
+    "financial services": "Financials",
+    "health care": "Health Care",
+    "healthcare": "Health Care",
+    "industrials": "Industrials",
+    "materials": "Materials",
+    "basic materials": "Materials",
+    "real estate": "Real Estate",
+    "technology": "Technology",
+    "information technology": "Technology",
+    "utilities": "Utilities",
+}
+
+_DEFAULT_NORMALIZED_SECTORS: Dict[str, str] = {
+    re.sub(r"[^a-z0-9]+", " ", sector.lower()).strip(): sector
+    for sector in DEFAULT_SECTOR_ETF_MAP
+}
+_SECTOR_ALIASES_NORMALIZED: Dict[str, str] = {
+    re.sub(r"[^a-z0-9]+", " ", alias.lower()).strip(): sector
+    for alias, sector in _SECTOR_ALIASES.items()
+}
+
+
+def _normalize_sector_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def canonicalize_sector_name(sector: Optional[str]) -> Optional[str]:
+    if not isinstance(sector, str):
+        return None
+    normalized = _normalize_sector_key(sector)
+    if not normalized:
+        return None
+    if normalized in _DEFAULT_NORMALIZED_SECTORS:
+        return _DEFAULT_NORMALIZED_SECTORS[normalized]
+    return _SECTOR_ALIASES_NORMALIZED.get(normalized)
+
 
 def _validate_symbol(symbol: str) -> str:
     if not isinstance(symbol, str) or not symbol.strip():
@@ -32,12 +77,29 @@ def _validate_symbol(symbol: str) -> str:
 def _resolve_sector_etf(sector: str, sector_map: Optional[Dict[str, str]]) -> str:
     if not isinstance(sector, str) or not sector.strip():
         raise ValueError("Sector must be a non-empty string.")
-    sector_key = sector.strip()
     mapping = sector_map if sector_map is not None else DEFAULT_SECTOR_ETF_MAP
-    if sector_key not in mapping:
+    raw_key = sector.strip()
+    sector_key = canonicalize_sector_name(raw_key)
+    if sector_key in mapping:
+        return mapping[sector_key]
+    if raw_key in mapping:
+        return mapping[raw_key]
+    normalized_lookup = {
+        _normalize_sector_key(candidate): candidate
+        for candidate in mapping
+    }
+    normalized_raw = _normalize_sector_key(raw_key)
+    if normalized_raw in normalized_lookup:
+        return mapping[normalized_lookup[normalized_raw]]
+    if sector_key is not None:
+        normalized_sector_key = _normalize_sector_key(sector_key)
+        if normalized_sector_key in normalized_lookup:
+            return mapping[normalized_lookup[normalized_sector_key]]
+    if sector_key is None:
         available = ", ".join(sorted(mapping.keys()))
-        raise KeyError(f"Unknown sector: {sector_key}. Available: {available}")
-    return mapping[sector_key]
+        raise KeyError(f"Unknown sector: {raw_key}. Available: {available}")
+    available = ", ".join(sorted(mapping.keys()))
+    raise KeyError(f"Unknown sector: {raw_key}. Canonicalized: {sector_key}. Available: {available}")
 
 
 def get_ticker(symbol: str) -> yf.Ticker:

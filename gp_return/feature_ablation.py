@@ -14,7 +14,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from common import parse_window, walk_forward_splits
-from return_gp.train import (
+from gp_return.train import (
     ARTIFACT_DIR_DEFAULT,
     DATA_YEARS,
     DEFAULT_STEP_WINDOW,
@@ -116,7 +116,6 @@ def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp)
     )
     target = build_target(price_stock)
 
-    # Keep regime inputs causal to avoid leaking future values.
     price_spy_regime = price_spy.reindex(price_stock.index).ffill()
     price_vix_regime = price_vix.reindex(price_stock.index).ffill()
     regime_score = compute_regime_score(

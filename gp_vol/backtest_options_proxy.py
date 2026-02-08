@@ -14,7 +14,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from common import get_history, parse_window, walk_forward_splits
-from vol_gp.train import (
+from gp_vol.train import (
     ANNUALIZATION,
     DEFAULT_KERNEL_EQUATION,
     NOISE_WINDOW,

@@ -15,7 +15,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from common import load_pca_json
-from return_gp.train import (
+from gp_return.train import (
     ARTIFACT_DIR_DEFAULT,
     DEFAULT_TEST_WINDOW,
     DEFAULT_TRAIN_WINDOW,

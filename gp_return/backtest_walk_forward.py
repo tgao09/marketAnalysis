@@ -14,7 +14,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from common import PCATransformer, parse_window
-from return_gp.train import (
+from gp_return.train import (
     ARTIFACT_DIR_DEFAULT,
     DATA_YEARS,
     DEFAULT_TRAIN_ITERS,
@@ -116,7 +116,6 @@ def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp)
     )
     target = build_target(price_stock)
 
-    # Keep regime inputs causal to avoid leaking future values.
     price_spy_regime = price_spy.reindex(price_stock.index).ffill()
     price_vix_regime = price_vix.reindex(price_stock.index).ffill()
     regime_score = compute_regime_score(
@@ -197,6 +196,7 @@ def main():
 
     end_date = pd.Timestamp(args.end).normalize() if args.end else pd.Timestamp.today().normalize()
     test_start = end_date - pd.DateOffset(years=DEFAULT_TEST_YEARS)
+    train_offset = parse_window(args.train_window)
     dataset_start = compute_dataset_start(end_date, args.train_window)
 
     print(f"Building dataset for {ticker}...")
@@ -238,7 +238,7 @@ def main():
         if train_end_pos < 0:
             continue
         train_end = dataset_index[train_end_pos]
-        train_start = test_date - pd.DateOffset(years=2) - pd.offsets.BDay(WINDOW_RET)
+        train_start = test_date - train_offset - pd.offsets.BDay(WINDOW_RET)
         train_df = dataset.loc[(dataset.index > train_start) & (dataset.index <= train_end)]
         if len(train_df) < MIN_TRAIN_ROWS:
             continue
@@ -344,8 +344,8 @@ def main():
 
     output_dir = Path(args.output_dir) / ticker / resolve_artifact_variant(args.pca)
     output_dir.mkdir(parents=True, exist_ok=True)
-    trades_path = output_dir / "return_gp_trades.csv"
-    summary_path = output_dir / "return_gp_summary.json"
+    trades_path = output_dir / "gp_return_trades.csv"
+    summary_path = output_dir / "gp_return_summary.json"
 
     trades_df.to_csv(trades_path, index=False)
     summary_path.write_text(json.dumps(summary, indent=2))

@@ -597,7 +597,7 @@ def main():
     last_model = None
     last_likelihood = None
     last_scaler = None
-    # Target uses forward WINDOW_VOL days, so embargo must match to prevent leakage.
+
     horizon_embargo = WINDOW_VOL
     if horizon_embargo < 0:
         raise ValueError("WINDOW_VOL must be non-negative for walk-forward embargo.")
@@ -616,7 +616,6 @@ def main():
         train_df = split.train.copy()
         test_df = split.test.copy()
 
-        # Reset time index per fold to avoid absolute calendar leakage.
         fold_start = split.train_start
         train_df["time_index"] = (train_df.index - fold_start).days.astype(int)
         test_df["time_index"] = (test_df.index - fold_start).days.astype(int)

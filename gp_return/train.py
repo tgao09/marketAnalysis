@@ -17,6 +17,7 @@ if str(ROOT_DIR) not in sys.path:
 from common import (
     DEFAULT_SECTOR_ETF_MAP,
     PCATransformer,
+    canonicalize_sector_name,
     get_history,
     get_info,
     parse_window,
@@ -68,6 +69,11 @@ def resolve_device():
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train GP return model.")
+    parser.add_argument(
+        "--train-window",
+        default=DEFAULT_TRAIN_WINDOW,
+        help="Rolling train window like '2y', '18m', or '260d'.",
+    )
     parser.add_argument(
         "--drop-time-index",
         action="store_true",
@@ -121,18 +127,23 @@ def resolve_sector_etf(ticker):
     error = None
     try:
         info = get_info(ticker)
-        sector = info.get("sector") or info.get("sectorKey")
-        if sector:
-            sector_key = sector.strip()
-            if sector_key not in DEFAULT_SECTOR_ETF_MAP:
-                title_key = sector_key.title()
-                if title_key in DEFAULT_SECTOR_ETF_MAP:
-                    sector_key = title_key
+        sector_raw = info.get("sector") or info.get("sectorKey")
+        if sector_raw:
+            sector_key = canonicalize_sector_name(sector_raw)
+            if sector_key is None and isinstance(sector_raw, str):
+                stripped_key = sector_raw.strip()
+                if stripped_key in DEFAULT_SECTOR_ETF_MAP:
+                    sector_key = stripped_key
             if sector_key in DEFAULT_SECTOR_ETF_MAP:
                 etf = DEFAULT_SECTOR_ETF_MAP[sector_key]
                 sector = sector_key
             else:
-                error = f"Sector '{sector_key}' not in DEFAULT_SECTOR_ETF_MAP."
+                error = (
+                    f"Sector '{sector_raw}'"
+                    if sector_key is None
+                    else f"Sector '{sector_raw}' canonicalized to '{sector_key}'"
+                )
+                error += " not in DEFAULT_SECTOR_ETF_MAP."
         else:
             error = "Sector missing from ticker info."
     except Exception as exc:
@@ -148,8 +159,6 @@ def fetch_history_cached(symbol, start_date, end_date, cache):
     if key not in cache:
         end_exclusive = None
         if end_date is not None:
-            # yfinance treats `end` as exclusive; bump by one day so the
-            # caller's inclusive end_date is respected.
             end_exclusive = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
         history = get_history(
             symbol,
@@ -234,7 +243,6 @@ def trading_day_in_quarter(index):
 def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix):
     index = price_stock.index
 
-    # Forward-fill only to avoid leaking future information via backfill.
     volume_stock = volume_stock.reindex(index).ffill()
     price_sector = price_sector.reindex(index).ffill()
     price_gld = price_gld.reindex(index).ffill()
@@ -297,7 +305,7 @@ def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy
     features["vix_chg_1d"] = compute_log_return(price_vix, 1)
     features["corr_spy_60d"] = log_ret_stock.rolling(60).corr(log_ret_spy)
 
-    # Calendar features (cyclical encoding within quarter)
+    # Calendar features
     day_in_quarter, quarter_len = trading_day_in_quarter(features.index)
     quarter_len = quarter_len.replace(0, 1)
     phase = (2.0 * np.pi * day_in_quarter) / quarter_len
@@ -680,7 +688,7 @@ def train_for_ticker(ticker, config, history_cache, device):
     target = build_target(price_stock)
 
     regime_config = config["regime_score"]
-    # Keep regime inputs causal (no backward fill from future observations).
+    
     price_spy_regime = price_spy.reindex(price_stock.index).ffill()
     price_vix_regime = price_vix.reindex(price_stock.index).ffill()
 
@@ -926,6 +934,8 @@ def main():
     args = parse_args()
     if args.include_time_index:
         args.drop_time_index = False
+    # Validate early so invalid window strings fail before any data fetch/training.
+    parse_window(args.train_window)
     tickers = prompt_tickers()
     if not tickers:
         print("No tickers provided. Exiting.")
@@ -936,7 +946,7 @@ def main():
     config = {
         "data_years": DATA_YEARS,
         "window_ret": WINDOW_RET,
-        "train_window": DEFAULT_TRAIN_WINDOW,
+        "train_window": args.train_window,
         "test_window": DEFAULT_TEST_WINDOW,
         "step_window": DEFAULT_STEP_WINDOW,
         "train_iters": DEFAULT_TRAIN_ITERS,
