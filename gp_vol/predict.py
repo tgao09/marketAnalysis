@@ -13,10 +13,8 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from common import get_history, parse_window, walk_forward_splits
+from common import parse_window, walk_forward_splits
 from gp_vol.train import (
-    ANNUALIZATION,
-    KERNEL_BUILDERS,
     NOISE_WINDOW,
     WINDOW_VOL,
     VolGPModel,

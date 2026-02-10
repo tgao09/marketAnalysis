@@ -26,7 +26,6 @@ from gp_return.train import (
     TICKER_GOLD,
     TICKER_SPY,
     TICKER_VIX,
-    WINDOW_RET,
     ReturnGPModel,
     build_features,
     build_target,

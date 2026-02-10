@@ -19,7 +19,6 @@ from gp_vol.train import (
     DEFAULT_KERNEL_EQUATION,
     NOISE_WINDOW,
     WINDOW_VOL,
-    VolGPModel,
     build_features,
     build_target,
     extract_field,
