@@ -54,10 +54,8 @@ def parse_args():
 def prompt_tickers():
     raw = input("Tickers to predict (comma separated): ").strip()
     if not raw:
-        return None
+        return []
     tickers = [item.strip().upper() for item in raw.split(",") if item.strip()]
-    if not tickers:
-        return None
     return tickers
 
 
@@ -67,42 +65,17 @@ def load_artifacts(artifact_dir: Path, device: torch.device, pca_enabled: bool):
     pca_path = artifact_dir / "pca.json"
     config_path = artifact_dir / "config.json"
 
-    if not model_path.exists():
-        raise FileNotFoundError(f"Missing model artifact: {model_path}")
-    if not config_path.exists():
-        raise FileNotFoundError(f"Missing config artifact: {config_path}")
-
     model_blob = torch.load(model_path, map_location=device)
     config = json.loads(config_path.read_text())
 
-    feature_cols = model_blob.get("feature_columns")
-    if not feature_cols:
-        raise ValueError("Artifact is missing feature columns.")
+    feature_cols = model_blob["feature_columns"]
     raw_feature_cols = model_blob.get("raw_feature_columns") or feature_cols
-
-    model_pca_enabled = bool((config.get("pca") or {}).get("enabled", False))
-    expected_variant = resolve_artifact_variant(pca_enabled)
-    artifact_variant = config.get("artifact_variant")
-    if artifact_variant != expected_variant:
-        raise ValueError(
-            f"Artifact variant mismatch in {artifact_dir}. "
-            f"Expected '{expected_variant}' but found '{artifact_variant}'."
-        )
-    if model_pca_enabled != pca_enabled:
-        raise ValueError(
-            f"PCA mode mismatch for {artifact_dir}. "
-            f"CLI --pca={pca_enabled} but artifact config pca.enabled={model_pca_enabled}."
-        )
 
     scaler = None
     pca_transformer = None
     if pca_enabled:
-        if not pca_path.exists():
-            raise FileNotFoundError(f"Missing PCA artifact: {pca_path}")
         pca_transformer = load_pca_json(pca_path)
     else:
-        if not scaler_path.exists():
-            raise FileNotFoundError(f"Missing scaler artifact: {scaler_path}")
         scaler = json.loads(scaler_path.read_text())
 
     return model_blob, scaler, pca_transformer, config, feature_cols, raw_feature_cols
@@ -124,16 +97,8 @@ def scale_with_saved_scaler(frame, feature_cols, scaler):
     mean = mean.reindex(feature_cols)
     std = std.reindex(feature_cols)
 
-    missing = [col for col in feature_cols if pd.isna(mean[col]) or pd.isna(std[col])]
-    if missing:
-        raise ValueError(f"Scaler is missing feature stats for: {', '.join(missing)}")
-
     scaled = (frame[feature_cols] - mean) / std
     scaled = scaled.replace([np.inf, -np.inf], np.nan)
-    if scaled.isna().any().any():
-        bad_cols = [col for col in feature_cols if scaled[col].isna().any()]
-        raise ValueError(f"Scaled features contain NaNs for columns: {', '.join(bad_cols)}")
-
     return scaled, mean, std
 
 
@@ -151,16 +116,14 @@ def rebuild_training_data(
     end_date = pd.Timestamp.today().normalize()
     start_date = compute_start_date(
         end_date,
-        config.get("data_years", DATA_YEARS),
-        config.get("train_window", DEFAULT_TRAIN_WINDOW),
-        config.get("test_window", DEFAULT_TEST_WINDOW),
+        config["data_years"],
+        config["train_window"],
+        config["test_window"],
         regime_config["score_window"],
     )
 
-    ticker = config.get("ticker")
-    sector_etf = config.get("sector_etf")
-    if not sector_etf:
-        sector_etf, _, _ = resolve_sector_etf(ticker)
+    ticker = config["ticker"]
+    sector_etf = config.get("sector_etf") or resolve_sector_etf(ticker)[0]
 
     stock_history = fetch_history_cached(ticker, start_date, end_date, history_cache)
     sector_history = fetch_history_cached(sector_etf, start_date, end_date, history_cache)
@@ -197,12 +160,9 @@ def rebuild_training_data(
 
     dataset = features.join([target])
     dataset = dataset.dropna()
-    if dataset.empty:
-        raise ValueError("No rows left after feature/target alignment.")
-
     final_train_raw = latest_train_window(
         dataset,
-        train_window=config.get("train_window", DEFAULT_TRAIN_WINDOW),
+        train_window=config["train_window"],
         min_train_rows=60,
     )
     fold_start = final_train_raw.index.min()
@@ -211,11 +171,6 @@ def rebuild_training_data(
 
     if pca_enabled:
         train_x_df = pca_transformer.transform(train_df)
-        if train_x_df.columns.tolist() != list(model_feature_cols):
-            raise ValueError(
-                "PCA transformed training columns do not match model feature columns. "
-                f"model={model_feature_cols}, transformed={train_x_df.columns.tolist()}"
-            )
         mean = None
         std = None
     else:
@@ -228,8 +183,6 @@ def rebuild_training_data(
 
 def get_latest_feature_row(features, feature_cols):
     usable = features[feature_cols].dropna()
-    if usable.empty:
-        raise ValueError("No usable feature rows found for prediction.")
     latest = usable.iloc[-1]
     return latest.name, latest[feature_cols]
 
@@ -261,18 +214,10 @@ def predict_next_window(artifact_dir: Path, device: torch.device, pca_enabled: b
     if pca_enabled:
         latest_frame = pd.DataFrame([latest_features], index=[asof_date])
         latest_transformed = pca_transformer.transform(latest_frame)
-        if latest_transformed.columns.tolist() != list(model_feature_cols):
-            raise ValueError(
-                "PCA transformed inference columns do not match model feature columns. "
-                f"model={model_feature_cols}, transformed={latest_transformed.columns.tolist()}"
-            )
         x = torch.tensor(latest_transformed.values, dtype=torch.float32, device=device)
     else:
         latest_scaled = (latest_features - mean.reindex(model_feature_cols)) / std.reindex(model_feature_cols)
         latest_scaled = latest_scaled.replace([np.inf, -np.inf], np.nan)
-        if latest_scaled.isna().any():
-            bad_cols = [col for col in model_feature_cols if pd.isna(latest_scaled[col])]
-            raise ValueError(f"Latest feature row produced NaNs after scaling for: {', '.join(bad_cols)}")
         x = torch.tensor(latest_scaled.values, dtype=torch.float32, device=device).unsqueeze(0)
 
     model.eval()
@@ -312,11 +257,7 @@ def main():
         if idx:
             print("")
         artifact_dir = ARTIFACT_DIR_DEFAULT / ticker / artifact_variant
-        try:
-            result = predict_next_window(artifact_dir, device, args.pca)
-        except (FileNotFoundError, ValueError) as exc:
-            print(f"{ticker}: {exc}")
-            continue
+        result = predict_next_window(artifact_dir, device, args.pca)
 
         asof = result["asof_date"]
 

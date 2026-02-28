@@ -82,12 +82,9 @@ def build_gp_dataset(start_date: pd.Timestamp, end_date: pd.Timestamp):
     target, noise = build_target(price_xlk)
 
     dataset = features.join([target, noise]).dropna()
-    if dataset.empty:
-        raise ValueError("No rows left after feature/target alignment.")
-    if isinstance(dataset.index, pd.DatetimeIndex):
-        if dataset.index.tz is not None:
-            dataset.index = dataset.index.tz_localize(None)
-        dataset.index = dataset.index.normalize()
+    if dataset.index.tz is not None:
+        dataset.index = dataset.index.tz_localize(None)
+    dataset.index = dataset.index.normalize()
 
     feature_cols = [col for col in dataset.columns if col not in ("target", "noise")]
     return dataset, feature_cols
@@ -105,8 +102,6 @@ def generate_forecast_series(
     forecasts = []
     # Target uses forward WINDOW_VOL days, so embargo must match to prevent leakage.
     horizon_embargo = WINDOW_VOL
-    if horizon_embargo < 0:
-        raise ValueError("WINDOW_VOL must be non-negative for walk-forward embargo.")
 
     splits = walk_forward_splits(
         dataset,
@@ -163,14 +158,10 @@ def generate_forecast_series(
             f"Test: {split.test_start.date()} -> {split.test_end.date()}"
         )
 
-    if not forecasts:
-        raise ValueError("No walk-forward splits produced; check date range and windows.")
-
     combined = pd.concat(forecasts).sort_index()
-    if isinstance(combined.index, pd.DatetimeIndex):
-        if combined.index.tz is not None:
-            combined.index = combined.index.tz_localize(None)
-        combined.index = combined.index.normalize()
+    if combined.index.tz is not None:
+        combined.index = combined.index.tz_localize(None)
+    combined.index = combined.index.normalize()
     return combined
 
 
@@ -184,12 +175,9 @@ def get_price_history(symbol: str, start_date: pd.Timestamp, end_date: pd.Timest
         auto_adjust=True,
     )
     close = history["Close"].dropna()
-    if close.empty:
-        raise ValueError(f"No close prices returned for {symbol}.")
-    if isinstance(close.index, pd.DatetimeIndex):
-        if close.index.tz is not None:
-            close.index = close.index.tz_localize(None)
-        close.index = close.index.normalize()
+    if close.index.tz is not None:
+        close.index = close.index.tz_localize(None)
+    close.index = close.index.normalize()
     return close
 
 
@@ -205,9 +193,9 @@ def build_trades_for_symbol(
     fees: float,
     slippage: float,
 ):
-    if isinstance(start_date, pd.Timestamp) and start_date.tz is not None:
+    if start_date.tz is not None:
         start_date = start_date.tz_localize(None)
-    if isinstance(end_date, pd.Timestamp) and end_date.tz is not None:
+    if end_date.tz is not None:
         end_date = end_date.tz_localize(None)
     returns = price.pct_change()
     iv_proxy = returns.rolling(iv_window).std() * math.sqrt(ANNUALIZATION)
@@ -331,8 +319,6 @@ def main():
     args = parse_args()
 
     symbols = [symbol.strip().upper() for symbol in args.symbols.split(",") if symbol.strip()]
-    if not symbols:
-        raise ValueError("No symbols provided.")
 
     end_date = pd.Timestamp(args.end).normalize() if args.end else pd.Timestamp.today().normalize()
     start_date = pd.Timestamp(args.start).normalize() if args.start else end_date - pd.DateOffset(years=2)

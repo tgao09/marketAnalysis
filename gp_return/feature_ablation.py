@@ -129,8 +129,6 @@ def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp)
     dataset = features.join([target])
     dataset["regime_score"] = regime_score
     dataset = dataset.dropna()
-    if dataset.empty:
-        raise ValueError(f"{ticker}: No rows left after feature/target alignment.")
     if dataset.index.has_duplicates:
         dataset = dataset.loc[~dataset.index.duplicated(keep="last")]
 
@@ -150,26 +148,6 @@ def select_last_6m_folds(all_splits, end_date, test_window, step_window):
         for split in all_splits
         if split.test_start >= eval_start and split.test_end <= eval_end
     ]
-
-    if test_window == "1m" and step_window == "1m":
-        expected = 6
-        if len(selected) != expected:
-            dates = [
-                f"fold{split.fold}:{split.test_start.date()}->{split.test_end.date()}"
-                for split in all_splits
-            ]
-            raise ValueError(
-                "Last-6-month fold enforcement failed. "
-                f"Expected {expected} monthly folds but found {len(selected)} within "
-                f"{eval_start.date()}..{eval_end.date()}. "
-                f"All available test windows: {dates}"
-            )
-    elif not selected:
-        raise ValueError(
-            f"No walk-forward folds found within last 6 months "
-            f"({eval_start.date()}..{eval_end.date()})."
-        )
-
     return eval_start, eval_end, selected
 
 
@@ -348,9 +326,6 @@ def write_ablation_json(
 
 def main():
     args = parse_args()
-    if args.train_iters <= 0:
-        raise ValueError("--train-iters must be positive.")
-
     tickers = prompt_tickers()
     if not tickers:
         print("No tickers provided. Exiting.")
@@ -364,114 +339,88 @@ def main():
     end_date = pd.Timestamp(args.end).normalize() if args.end else pd.Timestamp.today().normalize()
 
     for ticker in tickers:
-        try:
-            dataset_start = compute_dataset_start(end_date, args.train_window)
-            print(f"\nBuilding dataset for {ticker}...")
+        dataset_start = compute_dataset_start(end_date, args.train_window)
+        print(f"\nBuilding dataset for {ticker}...")
 
-            data = build_dataset(ticker, dataset_start, end_date)
-            dataset = data["dataset"]
+        data = build_dataset(ticker, dataset_start, end_date)
+        dataset = data["dataset"]
 
-            baseline_feature_cols = [col for col in dataset.columns if col != "target"]
-            if not args.include_time_index:
-                baseline_feature_cols = [col for col in baseline_feature_cols if col != "time_index"]
-            if not baseline_feature_cols:
-                raise ValueError("No features available for ablation.")
+        baseline_feature_cols = [col for col in dataset.columns if col != "target"]
+        if not args.include_time_index:
+            baseline_feature_cols = [col for col in baseline_feature_cols if col != "time_index"]
 
-            all_splits = list(
-                walk_forward_splits(
-                    dataset,
-                    train_window=args.train_window,
-                    test_window=args.test_window,
-                    embargo=WINDOW_RET,
-                    step=args.step_window,
-                    min_train_rows=MIN_TRAIN_ROWS,
-                )
+        all_splits = list(
+            walk_forward_splits(
+                dataset,
+                train_window=args.train_window,
+                test_window=args.test_window,
+                embargo=WINDOW_RET,
+                step=args.step_window,
+                min_train_rows=MIN_TRAIN_ROWS,
             )
-            if not all_splits:
-                raise ValueError("No walk-forward splits produced.")
+        )
 
-            eval_start, eval_end, selected_splits = select_last_6m_folds(
-                all_splits,
-                end_date,
-                args.test_window,
-                args.step_window,
-            )
-            print(
-                f"Selected {len(selected_splits)} folds within last 6 months "
-                f"({eval_start.date()}..{eval_end.date()})."
-            )
+        eval_start, eval_end, selected_splits = select_last_6m_folds(
+            all_splits,
+            end_date,
+            args.test_window,
+            args.step_window,
+        )
+        print(
+            f"Selected {len(selected_splits)} folds within last 6 months "
+            f"({eval_start.date()}..{eval_end.date()})."
+        )
 
-            baseline_summary = run_candidate(
-                baseline_feature_cols,
+        baseline_summary = run_candidate(
+            baseline_feature_cols,
+            selected_splits,
+            args.train_iters,
+            device,
+        )
+        baseline_metrics = metric_triplet(baseline_summary)
+        print(
+            "Baseline metrics | "
+            f"Dir mean: {baseline_metrics['directional_mean']:.2%} | "
+            f"MAE(simple) mean: {baseline_metrics['mae_simple_mean']:.4%} | "
+            f"Coverage95 mean: {baseline_metrics['coverage_95_mean']:.2%}"
+        )
+
+        results = []
+        for idx, feature in enumerate(baseline_feature_cols, start=1):
+            candidate_feature_cols = [col for col in baseline_feature_cols if col != feature]
+            print(f"[{idx}/{len(baseline_feature_cols)}] Testing drop: {feature}")
+            candidate_summary = run_candidate(
+                candidate_feature_cols,
                 selected_splits,
                 args.train_iters,
                 device,
             )
-            baseline_metrics = metric_triplet(baseline_summary)
-            print(
-                "Baseline metrics | "
-                f"Dir mean: {baseline_metrics['directional_mean']:.2%} | "
-                f"MAE(simple) mean: {baseline_metrics['mae_simple_mean']:.4%} | "
-                f"Coverage95 mean: {baseline_metrics['coverage_95_mean']:.2%}"
+            results.append(
+                {
+                    "dropped_feature": feature,
+                    "status": "ok",
+                    "candidate_metrics": metric_triplet(candidate_summary),
+                }
             )
 
-            results = []
-            for idx, feature in enumerate(baseline_feature_cols, start=1):
-                candidate_feature_cols = [col for col in baseline_feature_cols if col != feature]
-                print(f"[{idx}/{len(baseline_feature_cols)}] Testing drop: {feature}")
-                if not candidate_feature_cols:
-                    results.append(
-                        {
-                            "dropped_feature": feature,
-                            "status": "failed",
-                            "error": "Cannot drop the only feature.",
-                        }
-                    )
-                    continue
+        leaderboard, feature_deltas = build_ranked_outputs(results, baseline_metrics)
+        ticker_output_dir = Path(args.output_dir) / ticker
+        out_path = write_ablation_json(
+            ticker_output_dir,
+            ticker,
+            eval_start,
+            eval_end,
+            args,
+            baseline_feature_cols,
+            baseline_metrics,
+            selected_splits,
+            leaderboard,
+            feature_deltas,
+        )
 
-                try:
-                    candidate_summary = run_candidate(
-                        candidate_feature_cols,
-                        selected_splits,
-                        args.train_iters,
-                        device,
-                    )
-                    results.append(
-                        {
-                            "dropped_feature": feature,
-                            "status": "ok",
-                            "candidate_metrics": metric_triplet(candidate_summary),
-                        }
-                    )
-                except Exception as exc:
-                    results.append(
-                        {
-                            "dropped_feature": feature,
-                            "status": "failed",
-                            "error": str(exc),
-                        }
-                    )
-
-            leaderboard, feature_deltas = build_ranked_outputs(results, baseline_metrics)
-            ticker_output_dir = Path(args.output_dir) / ticker
-            out_path = write_ablation_json(
-                ticker_output_dir,
-                ticker,
-                eval_start,
-                eval_end,
-                args,
-                baseline_feature_cols,
-                baseline_metrics,
-                selected_splits,
-                leaderboard,
-                feature_deltas,
-            )
-
-            print(f"\nAblation saved to: {out_path}")
-            print(f"Leaderboard rows: {len(leaderboard)}")
-            print(f"Feature delta rows: {len(feature_deltas)}")
-        except Exception as exc:
-            print(f"{ticker}: ablation failed - {exc}")
+        print(f"\nAblation saved to: {out_path}")
+        print(f"Leaderboard rows: {len(leaderboard)}")
+        print(f"Feature delta rows: {len(feature_deltas)}")
 
 
 if __name__ == "__main__":

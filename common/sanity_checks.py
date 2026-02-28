@@ -673,8 +673,6 @@ def _parse_config(path: Optional[str]) -> Optional[SanityConfig]:
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
     values = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(values, dict):
-        raise ValueError("Config file must contain a JSON object.")
     return SanityConfig.from_dict(values)
 
 

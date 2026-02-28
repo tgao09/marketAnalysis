@@ -109,8 +109,6 @@ def build_pca_transformer() -> PCATransformer:
 
 def prompt_tickers():
     raw = input("Enter tickers (comma-separated): ").strip()
-    if not raw:
-        return []
     tokens = [token.strip().upper() for token in re.split(r"[,\s]+", raw) if token.strip()]
     seen = set()
     tickers = []
@@ -129,21 +127,12 @@ def resolve_sector_etf(ticker):
         info = get_info(ticker)
         sector_raw = info.get("sector") or info.get("sectorKey")
         if sector_raw:
-            sector_key = canonicalize_sector_name(sector_raw)
-            if sector_key is None and isinstance(sector_raw, str):
-                stripped_key = sector_raw.strip()
-                if stripped_key in DEFAULT_SECTOR_ETF_MAP:
-                    sector_key = stripped_key
+            sector_key = canonicalize_sector_name(sector_raw) or sector_raw.strip()
             if sector_key in DEFAULT_SECTOR_ETF_MAP:
                 etf = DEFAULT_SECTOR_ETF_MAP[sector_key]
                 sector = sector_key
             else:
-                error = (
-                    f"Sector '{sector_raw}'"
-                    if sector_key is None
-                    else f"Sector '{sector_raw}' canonicalized to '{sector_key}'"
-                )
-                error += " not in DEFAULT_SECTOR_ETF_MAP."
+                error = f"Sector '{sector_raw}' resolved to '{sector_key}' not in DEFAULT_SECTOR_ETF_MAP."
         else:
             error = "Sector missing from ticker info."
     except Exception as exc:
@@ -157,9 +146,11 @@ def resolve_sector_etf(ticker):
 def fetch_history_cached(symbol, start_date, end_date, cache):
     key = symbol.upper()
     if key not in cache:
-        end_exclusive = None
-        if end_date is not None:
-            end_exclusive = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
+        end_exclusive = (
+            pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
+            if end_date is not None
+            else None
+        )
         history = get_history(
             symbol,
             period=None,
@@ -168,13 +159,12 @@ def fetch_history_cached(symbol, start_date, end_date, cache):
             interval="1d",
             auto_adjust=True,
         )
-        if isinstance(history.index, pd.DatetimeIndex):
-            idx = history.index
-            if idx.tz is not None:
-                idx = idx.tz_localize(None)
-            history = history.copy()
-            history.index = idx.normalize()
-            history = history.sort_index()
+        idx = history.index
+        if idx.tz is not None:
+            idx = idx.tz_localize(None)
+        history = history.copy()
+        history.index = idx.normalize()
+        history = history.sort_index()
         cache[key] = history
     return cache[key]
 
@@ -442,8 +432,7 @@ class ReturnGPModel(gpytorch.models.ExactGP):
 
 
 def train_gp(train_x, train_y, train_iters=DEFAULT_TRAIN_ITERS, device=None):
-    if device is None:
-        device = train_x.device
+    device = train_x.device if device is None else device
     train_x = train_x.to(device)
     train_y = train_y.to(device)
 
@@ -757,9 +746,6 @@ def train_for_ticker(ticker, config, history_cache, device):
             min_train_rows=60,
         )
     )
-    if not splits:
-        raise ValueError(f"{ticker}: No walk-forward splits produced.")
-
     fold_metrics = []
     ard_bottom_sets = []
     importance_feature_cols_ref = None
@@ -780,7 +766,7 @@ def train_for_ticker(ticker, config, history_cache, device):
             model_feature_cols = list(feature_cols)
             fold_pca_k = None
 
-        if importance_feature_cols_ref is None:
+        if split.fold == 1:
             importance_feature_cols_ref = list(model_feature_cols)
         elif model_feature_cols != importance_feature_cols_ref:
             importance_feature_cols_unstable = True
@@ -921,8 +907,6 @@ def train_for_ticker(ticker, config, history_cache, device):
     )
     pca_path = artifact_dir / "pca.json"
     if pca_enabled:
-        if final_pca_transformer is None:
-            raise RuntimeError("Expected final_pca_transformer for PCA-enabled training.")
         save_pca_json(pca_path, final_pca_transformer)
     elif pca_path.exists():
         pca_path.unlink()
@@ -937,9 +921,6 @@ def main():
     # Validate early so invalid window strings fail before any data fetch/training.
     parse_window(args.train_window)
     tickers = prompt_tickers()
-    if not tickers:
-        print("No tickers provided. Exiting.")
-        return
     device = resolve_device()
     print(f"Using device: {device.type}")
 
@@ -971,11 +952,8 @@ def main():
     history_cache = {}
     summaries = {}
     for ticker in tickers:
-        try:
-            summary = train_for_ticker(ticker, config, history_cache, device)
-            summaries[ticker] = summary
-        except Exception as exc:
-            print(f"{ticker}: training failed - {exc}")
+        summary = train_for_ticker(ticker, config, history_cache, device)
+        summaries[ticker] = summary
 
     if summaries:
         print("\nBottom-10 features across all folds and ARD kernels:")

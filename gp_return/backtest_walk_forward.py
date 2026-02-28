@@ -129,8 +129,6 @@ def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp)
     dataset = features.join([target])
     dataset["regime_score"] = regime_score
     dataset = dataset.dropna()
-    if dataset.empty:
-        raise ValueError(f"{ticker}: No rows left after feature/target alignment.")
     if dataset.index.has_duplicates:
         dataset = dataset.loc[~dataset.index.duplicated(keep="last")]
 
@@ -182,13 +180,9 @@ def build_backtest_pca_transformer() -> PCATransformer:
 
 
 def main():
-    time_fail_count = 0
-    
     args = parse_args()
     device = resolve_device()
     print(f"Using device: {device.type}")
-    if args.notional <= 0:
-        raise ValueError("--notional must be positive.")
     ticker = args.ticker or prompt_ticker()
     if not ticker:
         print("No ticker provided. Exiting.")
@@ -225,15 +219,10 @@ def main():
     candidates = candidates.dropna(subset=["entry_close", "exit_date", "exit_close"])
 
     test_dates = candidates.index
-    if test_dates.empty:
-        raise ValueError("No eligible test dates found in the last year.")
-
     dataset_index = dataset.index
     trades = []
     for test_date in test_dates:
         test_pos = int(dataset_index.searchsorted(test_date, side="left"))
-        if test_pos >= len(dataset_index) or dataset_index[test_pos] != test_date:
-            continue
         train_end_pos = test_pos - WINDOW_RET - 1
         if train_end_pos < 0:
             continue
@@ -252,7 +241,7 @@ def main():
         if args.pca:
             fold_pca = build_backtest_pca_transformer()
             train_x_df, test_x_df = fold_pca.transform_train_test(train_df, test_df, feature_cols)
-            fold_pca_k = int(fold_pca.k_selected_ or 0)
+            fold_pca_k = int(fold_pca.k_selected_)
         else:
             train_x_df, test_x_df, _ = normalize_features(train_df, test_df, feature_cols)
 
@@ -275,17 +264,9 @@ def main():
             std_log = float(preds.variance.sqrt().item())
 
         direction = "long" if mean_log > 0.0 else "short"
-        try:
-            entry_close = float(candidates.at[test_date, "entry_close"])
-            exit_dt = candidates.at[test_date, "exit_date"]
-            exit_close = float(candidates.at[test_date, "exit_close"])
-        except:
-            time_fail_count+=1
-            continue
-
-        if entry_close <= 0:
-            print(f"Skipping {test_date.date()}: non-positive entry_close={entry_close}")
-            continue
+        entry_close = float(candidates.at[test_date, "entry_close"])
+        exit_dt = candidates.at[test_date, "exit_date"]
+        exit_close = float(candidates.at[test_date, "exit_close"])
         shares = args.notional / entry_close
         pnl_per_share = (exit_close - entry_close) if direction == "long" else (entry_close - exit_close)
         pnl = shares * pnl_per_share
@@ -322,9 +303,6 @@ def main():
 
     trades_df = pd.DataFrame(trades).sort_values("trade_date")
     summary = summarize_trades(trades_df)
-    avg_return_pct = None
-    if not trades_df.empty and "return_pct" in trades_df.columns:
-        avg_return_pct = float(trades_df["return_pct"].mean())
     summary.update(
         {
             "generated_at": datetime.now(UTC).isoformat(),
@@ -334,9 +312,8 @@ def main():
             "train_window": args.train_window,
             "test_years": DEFAULT_TEST_YEARS,
             "window_ret": WINDOW_RET,
-            "time_fail_count": time_fail_count,
             "notional": args.notional,
-            "avg_return_pct": avg_return_pct,
+            "avg_return_pct": float(trades_df["return_pct"].mean()),
             "pca_enabled": bool(args.pca),
             "artifact_variant": resolve_artifact_variant(args.pca),
         }
@@ -352,7 +329,6 @@ def main():
 
     print(f"\nTrades saved to: {trades_path}")
     print(f"Summary saved to: {summary_path}")
-    print(f"Time failed count: {time_fail_count}")
 
 
 if __name__ == "__main__":

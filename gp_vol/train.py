@@ -55,30 +55,17 @@ def parse_args():
 
 
 def choose_option(prompt, options, default_index=0):
-    while True:
-        print("\n" + prompt)
-        for i, opt in enumerate(options, start=1):
-            suffix = " (default)" if i - 1 == default_index else ""
-            print(f"  {i}) {opt}{suffix}")
-        raw = input("Select option number: ").strip()
-        if raw == "":
-            return default_index
-        if raw.isdigit():
-            idx = int(raw) - 1
-            if 0 <= idx < len(options):
-                return idx
-        print("Invalid choice. Try again.")
+    print("\n" + prompt)
+    for i, opt in enumerate(options, start=1):
+        suffix = " (default)" if i - 1 == default_index else ""
+        print(f"  {i}) {opt}{suffix}")
+    raw = input("Select option number: ").strip()
+    return default_index if raw == "" else int(raw) - 1
 
 
 def prompt_float(prompt, default_value):
-    while True:
-        raw = input(f"{prompt} [default {default_value}]: ").strip()
-        if raw == "":
-            return float(default_value)
-        try:
-            return float(raw)
-        except ValueError:
-            print("Invalid number. Try again.")
+    raw = input(f"{prompt} [default {default_value}]: ").strip()
+    return float(default_value) if raw == "" else float(raw)
 
 
 def tokenize_kernel_equation(expr):
@@ -186,15 +173,8 @@ def prompt_kernel_equation(kernel_labels, default_equation):
         print(f"  {i}) {label}")
     print("Combine using +, *, and parentheses. Example: (1+2)*3+4")
 
-    while True:
-        raw = input(f"Kernel equation [default {default_equation}]: ").strip()
-        if raw == "":
-            return default_equation
-        try:
-            parse_kernel_equation(raw, len(kernel_labels))
-            return raw
-        except ValueError as exc:
-            print(f"Invalid kernel equation: {exc}")
+    raw = input(f"Kernel equation [default {default_equation}]: ").strip()
+    return default_equation if raw == "" else raw
 
 
 def get_config_interactive():
@@ -265,13 +245,7 @@ def fetch_data(tickers, start_date, end_date):
 
 
 def extract_field(data, field, ticker):
-    if isinstance(data.columns, pd.MultiIndex):
-        if field not in data.columns.get_level_values(0):
-            raise KeyError(f"Missing field {field} in data.")
-        return data[field][ticker].copy()
-    if field not in data.columns:
-        raise KeyError(f"Missing field {field} in data.")
-    return data[field].copy()
+    return data[field][ticker].copy()
 
 
 def build_features(price_xlk, volume_xlk, price_gld, price_spy, price_vix):
@@ -590,7 +564,7 @@ def main():
         )
 
     feature_cols = [col for col in dataset.columns if col not in ("target", "noise")]
-    if config.get("drop_time_index"):
+    if config["drop_time_index"]:
         feature_cols = [col for col in feature_cols if col != "time_index"]
 
     fold_metrics = []
@@ -666,9 +640,6 @@ def main():
         last_model = model
         last_likelihood = likelihood
         last_scaler = scaler
-
-    if not fold_metrics:
-        raise ValueError("No walk-forward splits produced; check date range and windows.")
 
     summary_metrics = summarize_fold_metrics(fold_metrics)
     print(

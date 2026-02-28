@@ -2,8 +2,6 @@
 
 from .yfinance_utils import (
     DEFAULT_SECTOR_ETF_MAP,
-    SectorClient,
-    TickerClient,
     canonicalize_sector_name,
     get_history,
     get_info,
@@ -24,8 +22,6 @@ from .significance import (
 
 __all__ = [
     "DEFAULT_SECTOR_ETF_MAP",
-    "SectorClient",
-    "TickerClient",
     "canonicalize_sector_name",
     "get_history",
     "get_info",

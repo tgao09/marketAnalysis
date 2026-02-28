@@ -34,29 +34,18 @@ def load_artifacts(artifact_dir: Path):
     scaler_path = artifact_dir / "scaler.json"
     config_path = artifact_dir / "config.json"
 
-    if not model_path.exists():
-        raise FileNotFoundError(f"Missing model artifact: {model_path}")
-    if not scaler_path.exists():
-        raise FileNotFoundError(f"Missing scaler artifact: {scaler_path}")
-    if not config_path.exists():
-        raise FileNotFoundError(f"Missing config artifact: {config_path}")
-
     model_blob = torch.load(model_path, map_location="cpu")
     scaler = json.loads(scaler_path.read_text())
     config = json.loads(config_path.read_text())
 
-    feature_cols = model_blob.get("feature_columns")
-    if not feature_cols:
-        raise ValueError("Artifact is missing feature columns.")
-
-    return model_blob, scaler, config, feature_cols
+    return model_blob, scaler, config, model_blob["feature_columns"]
 
 
 def rebuild_training_data(config, feature_cols):
     end_date = pd.Timestamp.today().normalize()
-    start_date = end_date - pd.DateOffset(years=config.get("data_years", 2))
-    train_offset = parse_window(config.get("train_window", "2y"))
-    test_offset = parse_window(config.get("test_window", "1m"))
+    start_date = end_date - pd.DateOffset(years=config["data_years"])
+    train_offset = parse_window(config["train_window"])
+    test_offset = parse_window(config["test_window"])
     buffer_days = NOISE_WINDOW + (2 * WINDOW_VOL) + 5
 
     min_start = end_date - train_offset
@@ -87,16 +76,14 @@ def rebuild_training_data(config, feature_cols):
 
     splits = list(
         walk_forward_splits(
-        dataset,
-        train_window=config.get("train_window", "2y"),
-        test_window=config.get("test_window", "1m"),
-        step=config.get("step_window", "1m"),
-        min_train_rows=60,
+            dataset,
+            train_window=config["train_window"],
+            test_window=config["test_window"],
+            embargo=int(config["window_vol"]),
+            step=config["step_window"],
+            min_train_rows=60,
         )
     )
-    if not splits:
-        raise ValueError("No walk-forward splits available to rebuild training data.")
-
     last_split = splits[-1]
     train_df = last_split.train
     train_x_df, _, _ = normalize_features(train_df, train_df, feature_cols)
@@ -111,8 +98,6 @@ def rebuild_training_data(config, feature_cols):
 
 def get_latest_feature_row(features, feature_cols):
     usable = features[feature_cols].dropna()
-    if usable.empty:
-        raise ValueError("No usable feature rows found for prediction.")
     latest_row = usable.iloc[-1]
     return latest_row.name, latest_row
 
@@ -124,7 +109,7 @@ def predict_next_week(artifact_dir: Path):
         config, feature_cols
     )
 
-    kernel_config = config.get("kernel", {})
+    kernel_config = config["kernel"]
     likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
         noise=train_noise,
         learn_additional_noise=False,

@@ -180,7 +180,7 @@ def active_returns(trade_returns: pd.Series, benchmark_returns: pd.Series) -> pd
 
 
 def information_ratio(series: pd.Series) -> float:
-    if series is None or len(series) < 2:
+    if len(series) < 2:
         return float("nan")
     std = series.std(ddof=1)
     if std == 0 or np.isnan(std):
@@ -194,8 +194,7 @@ def annualize_information_ratio(
     trading_days_per_year: int = TRADING_DAYS_PER_YEAR,
 ) -> float:
     if (
-        info_ratio is None
-        or (isinstance(info_ratio, float) and np.isnan(info_ratio))
+        np.isnan(info_ratio)
         or median_holding_days is None
         or median_holding_days <= 0
     ):
@@ -205,8 +204,6 @@ def annualize_information_ratio(
 
 
 def newey_west_tstat(series: pd.Series, lag: int) -> float:
-    if series is None:
-        return float("nan")
     values = series.dropna().to_numpy(dtype=float)
     n = len(values)
     if n < 2:
@@ -327,8 +324,6 @@ def _parse_config(path: Optional[str]) -> Optional[SignificanceConfig]:
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
     values = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(values, dict):
-        raise ValueError("Config file must contain a JSON object.")
     return SignificanceConfig.from_dict(values)
 
 

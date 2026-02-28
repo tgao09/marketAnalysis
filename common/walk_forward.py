@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import Generator, Optional
+from typing import Generator
 
 import pandas as pd
 
@@ -19,20 +20,15 @@ class WalkForwardSplit:
     test: pd.DataFrame
 
 
-def _parse_window(window: str) -> pd.DateOffset:
-    if not isinstance(window, str) or not window.strip():
-        raise ValueError("Window must be a non-empty string like '2y' or '1m'.")
+def parse_window(window: str) -> pd.DateOffset:
     text = window.strip().lower()
-    number = ""
-    unit = ""
-    for char in text:
-        if char.isdigit():
-            number += char
-        else:
-            unit += char
-    if not number or not unit:
+    match = re.fullmatch(r"(\d+)\s*([dwmy])", text)
+    if not match:
         raise ValueError("Window must include a number and a unit (d, w, m, y).")
-    count = int(number)
+    count = int(match.group(1))
+    unit = match.group(2)
+    if count <= 0:
+        raise ValueError("Window count must be positive.")
     if unit == "d":
         return pd.DateOffset(days=count)
     if unit == "w":
@@ -43,29 +39,20 @@ def _parse_window(window: str) -> pd.DateOffset:
         return pd.DateOffset(years=count)
     raise ValueError("Unsupported window unit. Use d, w, m, or y.")
 
-
-def parse_window(window: str) -> pd.DateOffset:
-    """Public wrapper for parsing window strings like '2y' or '1m'."""
-    return _parse_window(window)
-
-
 def walk_forward_splits(
     data: pd.DataFrame,
     train_window: str,
     test_window: str,
     embargo: int,
-    step: Optional[str] = None,
+    step: str | None = None,
     min_train_rows: int = 30,
 ) -> Generator[WalkForwardSplit, None, None]:
-    if not isinstance(data.index, pd.DatetimeIndex):
-        raise ValueError("Data must be indexed by DatetimeIndex.")
-
     if data.empty:
         return
 
-    train_offset = _parse_window(train_window)
-    test_offset = _parse_window(test_window)
-    step_offset = _parse_window(step or test_window)
+    train_offset = parse_window(train_window)
+    test_offset = parse_window(test_window)
+    step_offset = parse_window(step or test_window)
     embargo_rows = int(embargo)
     if embargo_rows < 0:
         raise ValueError("embargo must be non-negative.")
@@ -121,3 +108,4 @@ def walk_forward_splits(
         train_end = train_end + step_offset
         if train_end >= last_date:
             break
+
