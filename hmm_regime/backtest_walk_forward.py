@@ -23,10 +23,14 @@ from hmm_regime.train import (
     DEFAULT_TRAIN_WINDOW,
     FEATURE_COLUMNS,
     STATE_LABELS,
+    apply_scaler,
     build_market_dataset,
     build_state_output,
+    compute_filtered_canonical_probs,
     compute_dataset_start,
+    compute_shift_probability,
     fit_hmm_bundle,
+    remap_transition_matrix,
     select_training_features,
 )
 
@@ -126,14 +130,15 @@ def evaluate_predictions(
 ) -> Dict[str, object]:
     eval_cols = ["forward_ret_5d", "forward_vol_5d", "drawdown", "vol_jump_5d"]
     eval_frame = predictions.set_index("date").join(dataset[eval_cols], how="left").sort_index()
-    eval_frame["next_state_label"] = eval_frame["state_label"].shift(-1)
-    eval_frame["regime_change_next_sample"] = (eval_frame["state_label"] != eval_frame["next_state_label"]).astype(float)
-    eval_frame.loc[eval_frame["next_state_label"].isna(), "regime_change_next_sample"] = np.nan
+    eval_frame["regime_change_next_bday"] = (
+        eval_frame["state_label"] != eval_frame["next_business_state_label"]
+    ).astype(float)
+    eval_frame.loc[eval_frame["next_business_state_label"].isna(), "regime_change_next_bday"] = np.nan
 
     regime_change_auc = binary_auc_metric(
         frame=eval_frame,
         score_col="shift_prob",
-        target_col="regime_change_next_sample",
+        target_col="regime_change_next_bday",
         threshold=auc_threshold,
     )
     vol_jump_auc = binary_auc_metric(
@@ -184,7 +189,7 @@ def evaluate_predictions(
         "eval_frame": eval_frame.reset_index(),
         "acceptance_pass": acceptance_pass,
         "gates": {
-            "shift_prob_auc_regime_change_next_sample": regime_change_auc,
+            "shift_prob_auc_regime_change_next_bday": regime_change_auc,
             "stress_like_vol_ratio": {
                 "label": STRESS_LIKE_LABEL,
                 "value": stress_vol_ratio,
@@ -204,6 +209,30 @@ def evaluate_predictions(
         },
         "drawdown_alignment": drawdown_alignment,
     }
+
+
+def infer_state_for_date(
+    bundle: Dict[str, object],
+    train_features: pd.DataFrame,
+    dataset: pd.DataFrame,
+    target_date: pd.Timestamp,
+) -> pd.Series:
+    eval_features = dataset.loc[
+        (dataset.index >= train_features.index.min()) & (dataset.index <= target_date),
+        FEATURE_COLUMNS,
+    ].dropna()
+    scaled = apply_scaler(eval_features, bundle["scaler"])
+    canonical_to_raw = [int(item) for item in bundle["canonical_to_raw"]]
+    canonical_probs = compute_filtered_canonical_probs(bundle["model"], scaled.values, canonical_to_raw)
+    canonical_transition = remap_transition_matrix(bundle["model"].transmat_, canonical_to_raw)
+    shift_probability = compute_shift_probability(canonical_probs, canonical_transition)
+    states = build_state_output(
+        index=eval_features.index,
+        canonical_probs=canonical_probs,
+        shift_probability=shift_probability,
+        asof_date=target_date,
+    )
+    return states.iloc[-1]
 
 
 def main() -> None:
@@ -249,6 +278,15 @@ def main() -> None:
         latest["train_start"] = pd.Timestamp(train_features.index.min())
         latest["train_end"] = pd.Timestamp(train_features.index.max())
         latest["fold"] = int(fold)
+        next_pos = usable_idx.searchsorted(asof_date, side="right")
+        if next_pos < len(usable_idx):
+            next_business_date = pd.Timestamp(usable_idx[next_pos])
+            next_state = infer_state_for_date(bundle, train_features, dataset, next_business_date)
+            latest["next_business_date"] = next_business_date
+            latest["next_business_state_label"] = str(next_state["state_label"])
+        else:
+            latest["next_business_date"] = pd.NaT
+            latest["next_business_state_label"] = None
         prediction_rows.append(latest)
 
         trans = np.asarray(bundle["canonical_transmat"], dtype=float)
@@ -318,6 +356,8 @@ def main() -> None:
         "p_state_2",
         "p_state_3",
         "shift_prob",
+        "next_business_date",
+        "next_business_state_label",
         "asof",
         "fold",
         "train_start",
