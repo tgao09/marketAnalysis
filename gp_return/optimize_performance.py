@@ -24,7 +24,14 @@ from gp_return.backtest_walk_forward import (
     compute_dataset_start,
     summarize_trades,
 )
-from gp_return.train import ARTIFACT_DIR_DEFAULT, WINDOW_RET, normalize_features, set_time_index, train_gp
+from gp_return.train import (
+    ARTIFACT_DIR_DEFAULT,
+    WINDOW_RET,
+    normalize_features,
+    select_feature_columns,
+    set_time_index,
+    train_gp,
+)
 
 
 DEFAULT_TICKERS = ["AAPL", "NVDA", "AMZN", "KO"]
@@ -172,6 +179,7 @@ def prepare_backtest_data(
     train_window: str,
     test_window: str,
     step_window: str,
+    pca_enabled: bool,
 ):
     dataset_start = compute_dataset_start(end_date, train_window)
     eval_start = end_date - pd.DateOffset(years=DEFAULT_TEST_YEARS)
@@ -207,7 +215,11 @@ def prepare_backtest_data(
         "eval_start": eval_start,
         "dataset": dataset,
         "splits": selected_splits,
-        "base_feature_columns": [col for col in dataset.columns if col != "target"],
+        "base_feature_columns": select_feature_columns(
+            dataset=dataset,
+            drop_time_index=True,
+            pca_enabled=pca_enabled,
+        ),
     }
 
 
@@ -326,6 +338,7 @@ def evaluate_candidate_on_end_date(
                 train_window=train_window,
                 test_window=test_window,
                 step_window=step_window,
+                pca_enabled=pca_enabled,
             )
         prepared = prepared_cache[cache_key]
         feature_columns = [col for col in selected_features if col in prepared["base_feature_columns"]]
@@ -411,9 +424,10 @@ def main():
         train_window=args.train_window,
         test_window=args.test_window,
         step_window=args.step_window,
+        pca_enabled=args.pca,
     )
     base_feature_columns = list(base_prepared["base_feature_columns"])
-    baseline_features = [col for col in base_feature_columns if col != "time_index"] or list(base_feature_columns)
+    baseline_features = list(base_feature_columns)
     baseline_params = {
         "train_iters": 160,
         "learning_rate": 0.05,
