@@ -411,19 +411,37 @@ def latest_train_window(data, train_window, min_train_rows=60):
 
 
 class ReturnGPModel(gpytorch.models.ExactGP):
-    def __init__(self, train_x, train_y, likelihood):
+    def __init__(
+        self,
+        train_x,
+        train_y,
+        likelihood,
+        matern_nu: float = 0.5,
+        use_rq: bool = True,
+        use_linear: bool = True,
+    ):
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ConstantMean()
 
         ard_num_dims = train_x.shape[-1]
-        matern = gpytorch.kernels.MaternKernel(nu=0.5, ard_num_dims=ard_num_dims)
-        rq = gpytorch.kernels.RQKernel(ard_num_dims=ard_num_dims)
-        linear = gpytorch.kernels.LinearKernel(ard_num_dims=ard_num_dims)
-        self.covar_module = (
-            gpytorch.kernels.ScaleKernel(matern)
-            + gpytorch.kernels.ScaleKernel(rq)
-            + gpytorch.kernels.ScaleKernel(linear)
-        )
+        kernels = [
+            gpytorch.kernels.ScaleKernel(
+                gpytorch.kernels.MaternKernel(nu=matern_nu, ard_num_dims=ard_num_dims)
+            )
+        ]
+        if use_rq:
+            kernels.append(
+                gpytorch.kernels.ScaleKernel(gpytorch.kernels.RQKernel(ard_num_dims=ard_num_dims))
+            )
+        if use_linear:
+            kernels.append(
+                gpytorch.kernels.ScaleKernel(gpytorch.kernels.LinearKernel(ard_num_dims=ard_num_dims))
+            )
+
+        covar_module = kernels[0]
+        for kernel in kernels[1:]:
+            covar_module = covar_module + kernel
+        self.covar_module = covar_module
 
     def forward(self, x):
         mean_x = self.mean_module(x)
@@ -431,18 +449,35 @@ class ReturnGPModel(gpytorch.models.ExactGP):
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
 
-def train_gp(train_x, train_y, train_iters=DEFAULT_TRAIN_ITERS, device=None):
+def train_gp(
+    train_x,
+    train_y,
+    train_iters=DEFAULT_TRAIN_ITERS,
+    device=None,
+    learning_rate: float = 0.05,
+    weight_decay: float = 0.0,
+    matern_nu: float = 0.5,
+    use_rq: bool = True,
+    use_linear: bool = True,
+):
     device = train_x.device if device is None else device
     train_x = train_x.to(device)
     train_y = train_y.to(device)
 
     likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-    model = ReturnGPModel(train_x, train_y, likelihood).to(device)
+    model = ReturnGPModel(
+        train_x,
+        train_y,
+        likelihood,
+        matern_nu=matern_nu,
+        use_rq=use_rq,
+        use_linear=use_linear,
+    ).to(device)
 
     model.train()
     likelihood.train()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
 
     for i in range(1, train_iters + 1):

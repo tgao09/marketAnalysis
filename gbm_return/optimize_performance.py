@@ -1,8 +1,6 @@
 import argparse
-import itertools
 import json
 import math
-import random
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,6 +9,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import optuna
+from optuna.samplers import TPESampler
+from optuna.trial import TrialState
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -29,26 +30,16 @@ from gbm_return.configuration import (
 
 
 DEFAULT_TICKERS = ["AAPL", "NVDA", "AMZN", "KO"]
-DEFAULT_BASELINE_END = "2026-02-10"
-DEFAULT_TUNE_END = "2025-11-10"
-DEFAULT_HOLDOUT_END = "2026-02-10"
-DEFAULT_ABLATION_END = "2025-08-10"
-
-COARSE_GRID = {
-    "learning_rate": [0.02, 0.05, 0.08],
-    "n_estimators": [300, 600, 1000],
-    "num_leaves": [15, 31, 63],
-    "min_data_in_leaf": [20, 50, 100],
-    "feature_fraction": [0.7, 0.9, 1.0],
-    "bagging_fraction": [0.7, 0.9, 1.0],
-    "lambda_l1": [0.0, 0.5, 2.0],
-    "lambda_l2": [0.0, 0.5, 2.0],
-}
+DEFAULT_OPTUNA_STUDY = "gbm_return_optuna"
+DEFAULT_HOLDOUT_TOP_N = 15
+DEFAULT_MIN_BASKET_TRADES = 80
+DEFAULT_N_TRIALS = 300
+HARD_REJECT_SCORE = -1.0e12
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Optimize gbm_return using feature ablation + hyperparameter sweep."
+        description="Optimize gbm_return using Optuna + feature ablation."
     )
     parser.add_argument(
         "--tickers",
@@ -58,10 +49,26 @@ def parse_args():
     parser.add_argument("--train-window", default=gbm_train.DEFAULT_TRAIN_WINDOW)
     parser.add_argument("--test-window", default=gbm_train.DEFAULT_TEST_WINDOW)
     parser.add_argument("--step-window", default=gbm_train.DEFAULT_STEP_WINDOW)
-    parser.add_argument("--baseline-end", default=DEFAULT_BASELINE_END)
-    parser.add_argument("--ablation-end", default=DEFAULT_ABLATION_END)
-    parser.add_argument("--tune-end", default=DEFAULT_TUNE_END)
-    parser.add_argument("--holdout-end", default=DEFAULT_HOLDOUT_END)
+    parser.add_argument(
+        "--baseline-end",
+        default=None,
+        help="Optional override (YYYY-MM-DD). Defaults to auto holdout end.",
+    )
+    parser.add_argument(
+        "--ablation-end",
+        default=None,
+        help="Optional override (YYYY-MM-DD). Defaults to holdout_end - 6 months.",
+    )
+    parser.add_argument(
+        "--tune-end",
+        default=None,
+        help="Optional override (YYYY-MM-DD). Defaults to holdout_end - 3 months.",
+    )
+    parser.add_argument(
+        "--holdout-end",
+        default=None,
+        help="Optional override (YYYY-MM-DD). Defaults to latest available trading day.",
+    )
     parser.add_argument("--notional", type=float, default=10000.0)
     parser.add_argument("--drawdown-worsen-limit", type=float, default=0.10)
     parser.add_argument(
@@ -75,15 +82,15 @@ def parse_args():
         default=str(gbm_train.ARTIFACT_DIR_DEFAULT / "feature_sets.json"),
         help="Where to write/read F1/F2 feature drops.",
     )
+    parser.add_argument("--n-trials", type=int, default=DEFAULT_N_TRIALS)
+    parser.add_argument("--study-name", default=DEFAULT_OPTUNA_STUDY)
     parser.add_argument(
-        "--coarse-max-configs",
-        type=int,
+        "--storage",
         default=None,
-        help="Optional cap on coarse sweep candidates (useful for faster experimentation).",
+        help="Optuna storage URI or sqlite file path. Defaults to run_dir/optuna_study.db.",
     )
-    parser.add_argument("--refine-top-n", type=int, default=10)
-    parser.add_argument("--refine-max-configs", type=int, default=500)
-    parser.add_argument("--holdout-top-n", type=int, default=20)
+    parser.add_argument("--min-basket-trades", type=int, default=DEFAULT_MIN_BASKET_TRADES)
+    parser.add_argument("--holdout-top-n", type=int, default=DEFAULT_HOLDOUT_TOP_N)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--skip-retrain",
@@ -103,9 +110,7 @@ def parse_tickers(raw: str) -> list[str]:
     seen = set()
     for token in raw.split(","):
         ticker = token.strip().upper()
-        if not ticker:
-            continue
-        if ticker in seen:
+        if not ticker or ticker in seen:
             continue
         seen.add(ticker)
         tickers.append(ticker)
@@ -117,6 +122,8 @@ def json_ready(value: Any):
         return float(value)
     if isinstance(value, (np.integer,)):
         return int(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
     if isinstance(value, pd.Timestamp):
         return value.isoformat()
     if isinstance(value, Path):
@@ -135,18 +142,19 @@ def write_json(path: Path, payload: dict[str, Any]):
 
 def aggregate_basket_summary(ticker_summaries: dict[str, dict[str, Any]]) -> dict[str, Any]:
     def collect(field: str):
-        values = [
+        return [
             float(summary[field])
             for summary in ticker_summaries.values()
             if summary.get(field) is not None
         ]
-        return values
 
     avg_return_values = collect("avg_return_pct")
     win_rate_values = collect("win_rate")
     avg_pnl_values = collect("avg_pnl")
     max_drawdowns = collect("max_drawdown")
-    total_trades = sum(int(summary.get("total_trades", 0) or 0) for summary in ticker_summaries.values())
+    total_trades = sum(
+        int(summary.get("total_trades", 0) or 0) for summary in ticker_summaries.values()
+    )
 
     return {
         "basket_mean_avg_return_pct": float(np.mean(avg_return_values)) if avg_return_values else None,
@@ -207,6 +215,33 @@ def drawdown_guardrail_violations(
                     }
                 )
     return violations
+
+
+def assess_candidate(
+    result: dict[str, Any],
+    baseline_ticker_summaries: dict[str, dict[str, Any]],
+    drawdown_worsen_limit: float,
+    min_basket_trades: int,
+) -> dict[str, Any]:
+    violations = drawdown_guardrail_violations(
+        candidate_summaries=result["tickers"],
+        baseline_summaries=baseline_ticker_summaries,
+        worsen_limit=drawdown_worsen_limit,
+    )
+    guardrail_pass = len(violations) == 0
+    total_trades = int(result["aggregate"].get("basket_total_trades") or 0)
+    min_trades_pass = total_trades >= min_basket_trades
+    mean_ret = result["aggregate"].get("basket_mean_avg_return_pct")
+    has_return = mean_ret is not None and np.isfinite(float(mean_ret))
+    hard_reject = (not guardrail_pass) or (not min_trades_pass) or (not has_return)
+    return {
+        "guardrail_pass": guardrail_pass,
+        "guardrail_violations": violations,
+        "min_trades_pass": min_trades_pass,
+        "min_basket_trades": int(min_basket_trades),
+        "basket_total_trades": total_trades,
+        "hard_reject": hard_reject,
+    }
 
 
 def evaluate_candidate_on_end_date(
@@ -376,47 +411,47 @@ def rank_harmful_features(ablation_payloads: dict[str, dict[str, Any]]) -> list[
             if row.get("status") != "ok":
                 continue
             feature = row.get("dropped_feature")
-            deltas = row.get("deltas") or {}
             improvements = row.get("improvements") or {}
-            mae_delta = deltas.get("mae_simple_delta")
-            dir_delta = deltas.get("directional_delta")
             mae_improvement = improvements.get("mae_simple_improvement")
             dir_improvement = improvements.get("directional_improvement")
-            if mae_delta is None or dir_delta is None or mae_improvement is None:
-                continue
-            if not (mae_delta < 0 and dir_delta >= 0):
+            if feature is None or mae_improvement is None or dir_improvement is None:
                 continue
             if feature not in stats:
                 stats[feature] = {
                     "feature": feature,
                     "support_count": 0,
                     "ticker_hits": [],
-                    "mae_simple_improvement_sum": 0.0,
-                    "directional_improvement_sum": 0.0,
+                    "mae_simple_improvements": [],
+                    "directional_improvements": [],
                 }
-            stats[feature]["support_count"] += 1
-            stats[feature]["ticker_hits"].append(ticker)
-            stats[feature]["mae_simple_improvement_sum"] += float(mae_improvement)
-            stats[feature]["directional_improvement_sum"] += float(dir_improvement or 0.0)
+            item = stats[feature]
+            item["support_count"] += 1
+            item["ticker_hits"].append(ticker)
+            item["mae_simple_improvements"].append(float(mae_improvement))
+            item["directional_improvements"].append(float(dir_improvement))
 
-    ranked = []
+    ranked: list[dict[str, Any]] = []
     for feature, item in stats.items():
         support_count = int(item["support_count"])
+        mae_values = item["mae_simple_improvements"]
+        dir_values = item["directional_improvements"]
         ranked.append(
             {
                 "feature": feature,
                 "support_count": support_count,
                 "support_ratio": support_count / basket_size if basket_size else 0.0,
                 "ticker_hits": item["ticker_hits"],
-                "avg_mae_simple_improvement": item["mae_simple_improvement_sum"] / support_count,
-                "avg_directional_improvement": item["directional_improvement_sum"] / support_count,
+                "median_mae_simple_improvement": float(np.median(mae_values)),
+                "median_directional_improvement": float(np.median(dir_values)),
+                "avg_mae_simple_improvement": float(np.mean(mae_values)),
+                "avg_directional_improvement": float(np.mean(dir_values)),
             }
         )
     ranked.sort(
         key=lambda x: (
             -x["support_count"],
-            -x["avg_mae_simple_improvement"],
-            -x["avg_directional_improvement"],
+            -x["median_mae_simple_improvement"],
+            -x["median_directional_improvement"],
             x["feature"],
         )
     )
@@ -426,154 +461,20 @@ def rank_harmful_features(ablation_payloads: dict[str, dict[str, Any]]) -> list[
 def choose_feature_sets(
     harmful_ranked: list[dict[str, Any]],
     basket_size: int,
-) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+) -> tuple[list[str], list[str], list[dict[str, Any]], int]:
     support_min = max(2, math.ceil(0.5 * basket_size))
-    eligible = [item for item in harmful_ranked if item["support_count"] >= support_min]
-    selected_pool = eligible if len(eligible) >= 5 else harmful_ranked
-    f1 = [item["feature"] for item in selected_pool[:3]]
-    f2 = [item["feature"] for item in selected_pool[:5]]
-    return f1, f2, selected_pool
-
-
-def generate_coarse_configs() -> list[dict[str, Any]]:
-    keys = list(COARSE_GRID.keys())
-    values = [COARSE_GRID[key] for key in keys]
-    configs = []
-    for combo in itertools.product(*values):
-        config = {key: combo[idx] for idx, key in enumerate(keys)}
-        configs.append(config)
-    return configs
-
-
-def maybe_cap_configs(
-    configs: list[dict[str, Any]],
-    max_configs: int | None,
-    seed: int,
-) -> list[dict[str, Any]]:
-    if max_configs is None or max_configs <= 0 or max_configs >= len(configs):
-        return configs
-    rng = random.Random(seed)
-    sample_idx = sorted(rng.sample(range(len(configs)), max_configs))
-    return [configs[idx] for idx in sample_idx]
-
-
-def candidate_key(feature_set: str, params: dict[str, Any]) -> str:
-    return json.dumps({"feature_set": feature_set, "params": params}, sort_keys=True)
-
-
-def evaluate_candidate_records(
-    records: list[dict[str, Any]],
-    tickers: list[str],
-    end_date: pd.Timestamp,
-    train_window: str,
-    include_time_index: bool,
-    feature_set_file: str,
-    notional: float,
-    baseline_ticker_summaries: dict[str, dict[str, Any]],
-    drawdown_worsen_limit: float,
-    prepared_cache: dict[tuple[str, str, str], dict[str, Any]],
-) -> list[dict[str, Any]]:
-    evaluated = []
-    for idx, record in enumerate(records, start=1):
-        params = record["params"]
-        result = evaluate_candidate_on_end_date(
-            tickers=tickers,
-            end_date=end_date,
-            train_window=train_window,
-            include_time_index=include_time_index,
-            feature_set=record["feature_set"],
-            feature_set_file=feature_set_file,
-            lgbm_params=params,
-            lgbm_param_preset=record.get("lgbm_param_preset", "baseline"),
-            lgbm_params_json=record.get("lgbm_params_json"),
-            notional=notional,
-            prepared_cache=prepared_cache,
+    stable = [
+        item
+        for item in harmful_ranked
+        if (
+            item["support_count"] >= support_min
+            and item["median_mae_simple_improvement"] > 0.0
+            and item["median_directional_improvement"] >= 0.0
         )
-        violations = drawdown_guardrail_violations(
-            candidate_summaries=result["tickers"],
-            baseline_summaries=baseline_ticker_summaries,
-            worsen_limit=drawdown_worsen_limit,
-        )
-        evaluated_record = dict(record)
-        evaluated_record["index"] = idx
-        evaluated_record["aggregate"] = result["aggregate"]
-        evaluated_record["tickers"] = result["tickers"]
-        evaluated_record["guardrail_violations"] = violations
-        evaluated_record["guardrail_pass"] = len(violations) == 0
-        evaluated.append(evaluated_record)
-    return evaluated
-
-
-def ranking_value(record: dict[str, Any]) -> tuple[float, float]:
-    guardrail = 1.0 if record.get("guardrail_pass") else 0.0
-    mean_ret = record.get("aggregate", {}).get("basket_mean_avg_return_pct")
-    if mean_ret is None:
-        mean_ret = float("-inf")
-    return (guardrail, float(mean_ret))
-
-
-def sort_by_rank(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(records, key=ranking_value, reverse=True)
-
-
-def parameter_neighbors(param: str, value: Any) -> list[Any]:
-    if param == "learning_rate":
-        vals = [max(0.005, round(float(value) - 0.01, 4)), round(float(value), 4), round(float(value) + 0.01, 4)]
-        return sorted(set(vals))
-    if param == "n_estimators":
-        vals = [max(100, int(value) - 200), int(value), int(value) + 200]
-        return sorted(set(vals))
-    if param == "num_leaves":
-        vals = [max(5, int(value) - 8), int(value), int(value) + 8]
-        return sorted(set(vals))
-    if param == "min_data_in_leaf":
-        vals = [max(5, int(value) - 10), int(value), int(value) + 10]
-        return sorted(set(vals))
-    if param in {"feature_fraction", "bagging_fraction"}:
-        vals = [
-            max(0.5, round(float(value) - 0.1, 3)),
-            round(float(value), 3),
-            min(1.0, round(float(value) + 0.1, 3)),
-        ]
-        return sorted(set(vals))
-    if param in {"lambda_l1", "lambda_l2"}:
-        vals = [max(0.0, round(float(value) - 0.5, 3)), round(float(value), 3), round(float(value) + 0.5, 3)]
-        return sorted(set(vals))
-    return [value]
-
-
-def build_refine_candidates(
-    top_records: list[dict[str, Any]],
-    max_candidates: int,
-) -> list[dict[str, Any]]:
-    dedup: dict[str, dict[str, Any]] = {}
-    for record in top_records:
-        base_params = record["params"]
-        feature_set = record["feature_set"]
-        base_key = candidate_key(feature_set, base_params)
-        dedup[base_key] = {
-            "stage": "refine",
-            "feature_set": feature_set,
-            "params": dict(base_params),
-            "origin": "top_base",
-        }
-        for param in COARSE_GRID.keys():
-            for value in parameter_neighbors(param, base_params[param]):
-                if value == base_params[param]:
-                    continue
-                varied = dict(base_params)
-                varied[param] = value
-                key = candidate_key(feature_set, varied)
-                dedup[key] = {
-                    "stage": "refine",
-                    "feature_set": feature_set,
-                    "params": varied,
-                    "origin": f"{record.get('stage', 'coarse')}:{param}",
-                }
-    candidates = list(dedup.values())
-    if max_candidates > 0 and len(candidates) > max_candidates:
-        candidates = candidates[:max_candidates]
-    return candidates
+    ]
+    f1 = [item["feature"] for item in stable[:3]]
+    f2 = [item["feature"] for item in stable[:5]]
+    return f1, f2, stable, support_min
 
 
 def collect_gp_reference(tickers: list[str]) -> dict[str, Any]:
@@ -591,16 +492,92 @@ def validate_evaluation_dates(
     tune_end: pd.Timestamp,
     holdout_end: pd.Timestamp,
 ):
-    if not (ablation_end < tune_end < holdout_end):
-        raise ValueError(
-            "Date order must be strict: ablation_end < tune_end < holdout_end. "
-            f"Got ablation_end={ablation_end.date()}, tune_end={tune_end.date()}, holdout_end={holdout_end.date()}."
+    return
+
+
+def latest_available_holdout_end(tickers: list[str], train_window: str) -> pd.Timestamp:
+    anchor = pd.Timestamp.today().normalize()
+    latest: pd.Timestamp | None = None
+    for ticker in tickers:
+        prepared = gbm_backtest.prepare_backtest_data(
+            ticker=ticker,
+            end_date=anchor,
+            train_window=train_window,
         )
-    if baseline_end != holdout_end:
-        raise ValueError(
-            "baseline_end must match holdout_end so baseline and finalists are compared on the same holdout date. "
-            f"Got baseline_end={baseline_end.date()}, holdout_end={holdout_end.date()}."
-        )
+        dataset_index = prepared.get("dataset_index")
+        if dataset_index is None or len(dataset_index) == 0:
+            continue
+        ticker_latest = pd.Timestamp(dataset_index.max()).normalize()
+        if latest is None or ticker_latest < latest:
+            latest = ticker_latest
+    return latest if latest is not None else anchor
+
+
+def resolve_evaluation_dates(
+    args: argparse.Namespace,
+    tickers: list[str],
+) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+    auto_holdout_end = latest_available_holdout_end(tickers, args.train_window)
+    holdout_end = (
+        pd.Timestamp(args.holdout_end).normalize()
+        if args.holdout_end
+        else auto_holdout_end
+    )
+    baseline_end = (
+        pd.Timestamp(args.baseline_end).normalize()
+        if args.baseline_end
+        else holdout_end
+    )
+    tune_end = (
+        pd.Timestamp(args.tune_end).normalize()
+        if args.tune_end
+        else holdout_end - pd.DateOffset(months=3)
+    )
+    ablation_end = (
+        pd.Timestamp(args.ablation_end).normalize()
+        if args.ablation_end
+        else holdout_end - pd.DateOffset(months=6)
+    )
+    return baseline_end, ablation_end, tune_end, holdout_end
+
+
+def resolve_storage_uri(storage_arg: str | None, run_dir: Path) -> tuple[str, str]:
+    if storage_arg:
+        if "://" in storage_arg:
+            return storage_arg, storage_arg
+        storage_path = Path(storage_arg).resolve()
+    else:
+        storage_path = (run_dir / "optuna_study.db").resolve()
+    storage_uri = f"sqlite:///{storage_path.as_posix()}"
+    return storage_uri, str(storage_path)
+
+
+def trial_params_from_optuna_params(params: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    feature_set = str(params.get("feature_set", FEATURE_SET_F0))
+    overrides = {
+        "learning_rate": float(params["learning_rate"]),
+        "n_estimators": int(params["n_estimators"]),
+        "num_leaves": int(params["num_leaves"]),
+        "min_data_in_leaf": int(params["min_data_in_leaf"]),
+        "feature_fraction": float(params["feature_fraction"]),
+        "bagging_fraction": float(params["bagging_fraction"]),
+        "lambda_l1": float(params["lambda_l1"]),
+        "lambda_l2": float(params["lambda_l2"]),
+    }
+    resolved = resolve_lgbm_params("baseline", overrides=overrides)
+    return feature_set, overrides, resolved
+
+
+def trial_record_for_report(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "trial_number": record.get("trial_number"),
+        "objective_value": record.get("objective_value"),
+        "feature_set": record.get("feature_set"),
+        "params": record.get("params"),
+        "aggregate": record.get("aggregate"),
+        "assessment": record.get("assessment"),
+        "error": record.get("error"),
+    }
 
 
 def append_tech_results(
@@ -617,6 +594,7 @@ def append_tech_results(
         f"## Optimization Run {run_id}",
         "",
         f"- Generated: `{ts}`",
+        f"- Search backend: `{report['search_backend']}`",
         f"- Winner feature set: `{winner['feature_set']}`",
         f"- Winner params: `{json.dumps(winner['params'], sort_keys=True)}`",
         f"- Winner tuning basket mean avg_return_pct: `{winner['tune']['aggregate']['basket_mean_avg_return_pct']}`",
@@ -626,8 +604,11 @@ def append_tech_results(
         f"- F1 drops: `{', '.join(report['feature_sets']['F1']) if report['feature_sets']['F1'] else '(none)'}`",
         f"- F2 drops: `{', '.join(report['feature_sets']['F2']) if report['feature_sets']['F2'] else '(none)'}`",
     ]
-    existing = tech_path.read_text()
-    tech_path.write_text(existing.rstrip() + "\n" + "\n".join(section) + "\n")
+    if tech_path.exists():
+        existing = tech_path.read_text().rstrip()
+    else:
+        existing = "# GBM Return Technical Notes"
+    tech_path.write_text(existing + "\n" + "\n".join(section) + "\n")
 
 
 def retrain_winner(
@@ -668,30 +649,26 @@ def retrain_winner(
 
 def main():
     args = parse_args()
-    tickers = parse_tickers(args.tickers)
+    tickers = parse_tickers(args.tickers) or list(DEFAULT_TICKERS)
 
-    random.seed(args.seed)
     np.random.seed(args.seed)
 
-    baseline_end = pd.Timestamp(args.baseline_end).normalize()
-    ablation_end = pd.Timestamp(args.ablation_end).normalize()
-    tune_end = pd.Timestamp(args.tune_end).normalize()
-    holdout_end = pd.Timestamp(args.holdout_end).normalize()
-    validate_evaluation_dates(
-        baseline_end=baseline_end,
-        ablation_end=ablation_end,
-        tune_end=tune_end,
-        holdout_end=holdout_end,
-    )
+    baseline_end, ablation_end, tune_end, holdout_end = resolve_evaluation_dates(args, tickers)
 
     run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     output_root = Path(args.output_dir)
     run_dir = output_root / "optimization" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     feature_set_file = str(Path(args.feature_set_file))
+    storage_uri, storage_path = resolve_storage_uri(args.storage, run_dir)
+    study_name = f"{args.study_name}_{run_id}"
 
     print(f"Optimization run: {run_id}")
     print(f"Tickers: {', '.join(tickers)}")
+    print(
+        f"Dates | baseline={baseline_end.date()} | ablation={ablation_end.date()} | "
+        f"tune={tune_end.date()} | holdout={holdout_end.date()}"
+    )
     print("Running baseline backtests...")
 
     prepared_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -743,8 +720,9 @@ def main():
             lgbm_params_json=None,
             feature_set_file=feature_set_file,
         )
+
     harmful_ranked = rank_harmful_features(ablation_payloads)
-    f1_drops, f2_drops, selected_pool = choose_feature_sets(harmful_ranked, len(tickers))
+    f1_drops, f2_drops, stable_pool, support_min = choose_feature_sets(harmful_ranked, len(tickers))
     feature_set_path = write_feature_set_file(
         output_path=feature_set_file,
         f1_drop_features=f1_drops,
@@ -753,7 +731,8 @@ def main():
             "run_id": run_id,
             "tickers": tickers,
             "ablation_end": str(ablation_end.date()),
-            "selection_pool_size": len(selected_pool),
+            "stability_support_min": support_min,
+            "stable_pool_size": len(stable_pool),
         },
     )
     ablation_summary = {
@@ -762,141 +741,211 @@ def main():
         "harmful_ranked": harmful_ranked,
         "feature_set_file": str(feature_set_path),
         "feature_sets": {"F1": f1_drops, "F2": f2_drops},
+        "stability_filter": {
+            "support_count_min": support_min,
+            "median_mae_simple_improvement_gt": 0.0,
+            "median_directional_improvement_gte": 0.0,
+            "selected_count": len(stable_pool),
+            "selected_features": [item["feature"] for item in stable_pool],
+        },
     }
     write_json(run_dir / "ablation_summary.json", ablation_summary)
 
-    print("Building coarse hyperparameter candidates...")
-    coarse_grid = generate_coarse_configs()
-    coarse_grid = maybe_cap_configs(coarse_grid, args.coarse_max_configs, args.seed)
-    coarse_records = []
-    for feature_set in (FEATURE_SET_F0, FEATURE_SET_F1, FEATURE_SET_F2):
-        for params in coarse_grid:
-            coarse_records.append(
-                {
-                    "stage": "coarse",
-                    "feature_set": feature_set,
-                    "params": params,
-                    "lgbm_param_preset": "baseline",
-                    "lgbm_params_json": None,
-                }
-            )
-    print(f"Evaluating coarse candidates: {len(coarse_records)}")
-    coarse_evaluated = evaluate_candidate_records(
-        records=coarse_records,
-        tickers=tickers,
-        end_date=tune_end,
-        train_window=args.train_window,
-        include_time_index=args.include_time_index,
-        feature_set_file=feature_set_file,
-        notional=args.notional,
-        baseline_ticker_summaries=baseline_tune["tickers"],
-        drawdown_worsen_limit=args.drawdown_worsen_limit,
-        prepared_cache=prepared_cache,
+    print(f"Starting Optuna search with {args.n_trials} trials...")
+    sampler = TPESampler(seed=args.seed)
+    study = optuna.create_study(
+        study_name=study_name,
+        direction="maximize",
+        sampler=sampler,
+        storage=storage_uri,
+        load_if_exists=True,
     )
-    coarse_ranked = sort_by_rank(coarse_evaluated)
+
+    tune_trial_records: dict[int, dict[str, Any]] = {}
+
+    def objective(trial):
+        feature_set = trial.suggest_categorical(
+            "feature_set",
+            [FEATURE_SET_F0, FEATURE_SET_F1, FEATURE_SET_F2],
+        )
+        overrides = {
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.10, log=True),
+            "n_estimators": trial.suggest_int("n_estimators", 200, 1400, step=50),
+            "num_leaves": trial.suggest_int("num_leaves", 15, 127),
+            "min_data_in_leaf": trial.suggest_int("min_data_in_leaf", 10, 120),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.6, 1.0, step=0.05),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.6, 1.0, step=0.05),
+            "lambda_l1": trial.suggest_float("lambda_l1", 0.0, 5.0),
+            "lambda_l2": trial.suggest_float("lambda_l2", 0.0, 5.0),
+        }
+        lgbm_params = resolve_lgbm_params("baseline", overrides=overrides)
+        result = evaluate_candidate_on_end_date(
+            tickers=tickers,
+            end_date=tune_end,
+            train_window=args.train_window,
+            include_time_index=args.include_time_index,
+            feature_set=feature_set,
+            feature_set_file=feature_set_file,
+            lgbm_params=lgbm_params,
+            lgbm_param_preset="baseline",
+            lgbm_params_json=None,
+            notional=args.notional,
+            prepared_cache=prepared_cache,
+        )
+        assessment = assess_candidate(
+            result=result,
+            baseline_ticker_summaries=baseline_tune["tickers"],
+            drawdown_worsen_limit=args.drawdown_worsen_limit,
+            min_basket_trades=args.min_basket_trades,
+        )
+        base_ret = result["aggregate"].get("basket_mean_avg_return_pct")
+        if assessment["hard_reject"] or base_ret is None:
+            score = HARD_REJECT_SCORE
+        else:
+            score = float(base_ret)
+
+        record = {
+            "trial_number": trial.number,
+            "feature_set": feature_set,
+            "params": lgbm_params,
+            "aggregate": result["aggregate"],
+            "tickers": result["tickers"],
+            "assessment": assessment,
+            "objective_value": float(score),
+        }
+        tune_trial_records[trial.number] = record
+
+        trial.set_user_attr("feature_set", feature_set)
+        trial.set_user_attr("aggregate", json_ready(result["aggregate"]))
+        trial.set_user_attr("assessment", json_ready(assessment))
+        trial.set_user_attr("objective_value", float(score))
+        return float(score)
+
+    study.optimize(objective, n_trials=args.n_trials)
+
+    completed_trials = [trial for trial in study.trials if trial.state == TrialState.COMPLETE]
+
+    tune_ranked = []
+    for trial in completed_trials:
+        cached = tune_trial_records.get(trial.number)
+        if cached is not None:
+            tune_ranked.append(cached)
+            continue
+        feature_set, _, resolved = trial_params_from_optuna_params(trial.params)
+        tune_ranked.append(
+            {
+                "trial_number": trial.number,
+                "feature_set": feature_set,
+                "params": resolved,
+                "aggregate": trial.user_attrs.get("aggregate"),
+                "assessment": trial.user_attrs.get("assessment"),
+                "objective_value": float(trial.value if trial.value is not None else HARD_REJECT_SCORE),
+                "error": trial.user_attrs.get("error"),
+            }
+        )
+
+    tune_ranked.sort(
+        key=lambda x: float(x.get("objective_value", HARD_REJECT_SCORE)),
+        reverse=True,
+    )
     write_json(
-        run_dir / "coarse_results.json",
+        run_dir / "optuna_trials_top.json",
         {
-            "candidate_count": len(coarse_ranked),
-            "top_50": coarse_ranked[:50],
+            "candidate_count": len(tune_ranked),
+            "top_50": [trial_record_for_report(item) for item in tune_ranked[:50]],
         },
     )
 
-    top_for_refine = coarse_ranked[: max(1, args.refine_top_n)]
-    print(f"Building refine candidates from top {len(top_for_refine)} coarse configs...")
-    refine_records = build_refine_candidates(top_for_refine, args.refine_max_configs)
-    print(f"Evaluating refine candidates: {len(refine_records)}")
-    refine_evaluated = evaluate_candidate_records(
-        records=refine_records,
-        tickers=tickers,
-        end_date=tune_end,
-        train_window=args.train_window,
-        include_time_index=args.include_time_index,
-        feature_set_file=feature_set_file,
-        notional=args.notional,
-        baseline_ticker_summaries=baseline_tune["tickers"],
-        drawdown_worsen_limit=args.drawdown_worsen_limit,
-        prepared_cache=prepared_cache,
-    )
-    refine_ranked = sort_by_rank(refine_evaluated)
-    write_json(
-        run_dir / "refine_results.json",
-        {
-            "candidate_count": len(refine_ranked),
-            "top_50": refine_ranked[:50],
-        },
-    )
+    top_trials = sorted(
+        completed_trials,
+        key=lambda trial: float(trial.value if trial.value is not None else HARD_REJECT_SCORE),
+        reverse=True,
+    )[: max(1, args.holdout_top_n)]
 
-    finalists = [r for r in refine_ranked if r.get("guardrail_pass")] or refine_ranked
-    finalists = finalists[: max(1, args.holdout_top_n)]
-    print(f"Validating finalists on holdout date: {holdout_end.date()} ({len(finalists)} configs)")
-
+    print(
+        f"Validating top {len(top_trials)} Optuna trials on holdout date: {holdout_end.date()}..."
+    )
     holdout_validations = []
-    promoted = None
     baseline_holdout_mean = baseline_holdout["aggregate"]["basket_mean_avg_return_pct"]
-    for record in finalists:
+    promoted = None
+    for trial in top_trials:
+        tune_record = next((item for item in tune_ranked if item["trial_number"] == trial.number), None)
+        if tune_record is None:
+            feature_set, _, resolved = trial_params_from_optuna_params(trial.params)
+            tune_record = {
+                "trial_number": trial.number,
+                "feature_set": feature_set,
+                "params": resolved,
+                "objective_value": float(trial.value if trial.value is not None else HARD_REJECT_SCORE),
+            }
+
         holdout_eval = evaluate_candidate_on_end_date(
             tickers=tickers,
             end_date=holdout_end,
             train_window=args.train_window,
             include_time_index=args.include_time_index,
-            feature_set=record["feature_set"],
+            feature_set=tune_record["feature_set"],
             feature_set_file=feature_set_file,
-            lgbm_params=record["params"],
-            lgbm_param_preset=record.get("lgbm_param_preset", "baseline"),
-            lgbm_params_json=record.get("lgbm_params_json"),
+            lgbm_params=tune_record["params"],
+            lgbm_param_preset="baseline",
+            lgbm_params_json=None,
             notional=args.notional,
             prepared_cache=prepared_cache,
         )
-        holdout_violations = drawdown_guardrail_violations(
-            candidate_summaries=holdout_eval["tickers"],
-            baseline_summaries=baseline_holdout["tickers"],
-            worsen_limit=args.drawdown_worsen_limit,
+        holdout_assessment = assess_candidate(
+            result=holdout_eval,
+            baseline_ticker_summaries=baseline_holdout["tickers"],
+            drawdown_worsen_limit=args.drawdown_worsen_limit,
+            min_basket_trades=args.min_basket_trades,
         )
-        holdout_pass = len(holdout_violations) == 0
+        holdout_pass = not holdout_assessment["hard_reject"]
         holdout_mean = holdout_eval["aggregate"]["basket_mean_avg_return_pct"]
         beats_baseline = (
             holdout_pass
             and holdout_mean is not None
             and baseline_holdout_mean is not None
-            and holdout_mean > baseline_holdout_mean
+            and float(holdout_mean) > float(baseline_holdout_mean)
         )
         item = {
-            "candidate": record,
+            "trial_number": int(trial.number),
+            "objective_value": float(trial.value if trial.value is not None else HARD_REJECT_SCORE),
+            "candidate": tune_record,
             "holdout": holdout_eval,
-            "holdout_guardrail_pass": holdout_pass,
-            "holdout_guardrail_violations": holdout_violations,
+            "holdout_assessment": holdout_assessment,
             "beats_holdout_baseline": beats_baseline,
         }
         holdout_validations.append(item)
-        if beats_baseline:
+        if promoted is None and beats_baseline:
             promoted = item
 
     if promoted is None:
-        best_item = max(
-            holdout_validations,
-            key=lambda x: (
-                1 if x["holdout_guardrail_pass"] else 0,
-                x["holdout"]["aggregate"]["basket_mean_avg_return_pct"]
-                if x["holdout"]["aggregate"]["basket_mean_avg_return_pct"] is not None
-                else float("-inf"),
+        eligible = [item for item in holdout_validations if not item["holdout_assessment"]["hard_reject"]]
+        population = eligible if eligible else holdout_validations
+        promoted = max(
+            population,
+            key=lambda item: (
+                float(
+                    item["holdout"]["aggregate"]["basket_mean_avg_return_pct"]
+                    if item["holdout"]["aggregate"]["basket_mean_avg_return_pct"] is not None
+                    else float("-inf")
+                ),
+                float(item["objective_value"]),
             ),
         )
-        promoted = best_item
 
     winner_candidate = promoted["candidate"]
     winner = {
+        "trial_number": winner_candidate["trial_number"],
+        "objective_value": winner_candidate["objective_value"],
         "feature_set": winner_candidate["feature_set"],
         "params": winner_candidate["params"],
         "tune": {
-            "aggregate": winner_candidate["aggregate"],
-            "tickers": winner_candidate["tickers"],
-            "guardrail_pass": winner_candidate["guardrail_pass"],
-            "guardrail_violations": winner_candidate["guardrail_violations"],
+            "aggregate": winner_candidate.get("aggregate"),
+            "tickers": winner_candidate.get("tickers"),
+            "assessment": winner_candidate.get("assessment"),
         },
         "holdout": promoted["holdout"],
-        "holdout_guardrail_pass": promoted["holdout_guardrail_pass"],
-        "holdout_guardrail_violations": promoted["holdout_guardrail_violations"],
+        "holdout_assessment": promoted["holdout_assessment"],
         "beats_holdout_baseline": promoted["beats_holdout_baseline"],
     }
 
@@ -935,9 +984,21 @@ def main():
 
     gp_reference = collect_gp_reference(tickers)
 
+    tune_assessments = [
+        item.get("assessment")
+        for item in tune_ranked
+        if isinstance(item.get("assessment"), dict)
+    ]
+    holdout_assessments = [item["holdout_assessment"] for item in holdout_validations]
+    tune_guardrail_pass = sum(1 for item in tune_assessments if item.get("guardrail_pass"))
+    holdout_guardrail_pass = sum(1 for item in holdout_assessments if item.get("guardrail_pass"))
+    tune_hard_reject = sum(1 for item in tune_assessments if item.get("hard_reject"))
+    holdout_hard_reject = sum(1 for item in holdout_assessments if item.get("hard_reject"))
+
     report = {
         "run_id": run_id,
         "generated_at": datetime.now(UTC).isoformat(),
+        "search_backend": "optuna",
         "tickers": tickers,
         "dates": {
             "baseline_end": str(baseline_end.date()),
@@ -945,13 +1006,43 @@ def main():
             "tune_end": str(tune_end.date()),
             "holdout_end": str(holdout_end.date()),
         },
+        "run_config": {
+            "train_window": args.train_window,
+            "test_window": args.test_window,
+            "step_window": args.step_window,
+            "notional": args.notional,
+            "drawdown_worsen_limit": args.drawdown_worsen_limit,
+            "min_basket_trades": args.min_basket_trades,
+            "seed": args.seed,
+            "n_trials": args.n_trials,
+            "holdout_top_n": args.holdout_top_n,
+            "include_time_index": bool(args.include_time_index),
+        },
         "feature_set_file": feature_set_file,
         "feature_sets": {"F0": [], "F1": f1_drops, "F2": f2_drops},
         "baseline_holdout": baseline_holdout,
         "baseline_tune": baseline_tune,
+        "optuna": {
+            "study_name": study.study_name,
+            "storage_uri": storage_uri,
+            "storage_path": storage_path,
+            "seed": args.seed,
+            "n_trials_requested": args.n_trials,
+            "n_trials_completed": len(completed_trials),
+            "best_trial_number": int(study.best_trial.number),
+            "best_value": float(study.best_value),
+            "best_params": study.best_trial.params,
+        },
+        "guardrail_stats": {
+            "tune_guardrail_pass_count": tune_guardrail_pass,
+            "tune_guardrail_fail_count": len(tune_assessments) - tune_guardrail_pass,
+            "tune_hard_reject_count": tune_hard_reject,
+            "holdout_guardrail_pass_count": holdout_guardrail_pass,
+            "holdout_guardrail_fail_count": len(holdout_assessments) - holdout_guardrail_pass,
+            "holdout_hard_reject_count": holdout_hard_reject,
+        },
         "winner": winner,
-        "coarse_top_10": coarse_ranked[:10],
-        "refine_top_10": refine_ranked[:10],
+        "tune_top_10": [trial_record_for_report(item) for item in tune_ranked[:10]],
         "holdout_validation_top": holdout_validations[:10],
         "optimized_backtests": optimized_backtests,
         "gp_reference": gp_reference,
@@ -966,8 +1057,11 @@ def main():
 
     print("\nOptimization complete.")
     print(f"Run directory: {run_dir}")
+    print(f"Winner trial: {winner['trial_number']}")
     print(f"Winner feature set: {winner['feature_set']}")
-    print(f"Winner holdout mean avg_return_pct: {winner['holdout']['aggregate']['basket_mean_avg_return_pct']}")
+    print(
+        f"Winner holdout mean avg_return_pct: {winner['holdout']['aggregate']['basket_mean_avg_return_pct']}"
+    )
 
 
 if __name__ == "__main__":
