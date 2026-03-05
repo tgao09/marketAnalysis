@@ -302,6 +302,28 @@ def normalize_features(train_df, test_df, feature_cols):
     return train_x, test_x, scaler
 
 
+def set_time_index(frame, start_date):
+    out = frame.copy()
+    out["time_index"] = (out.index - start_date).days.astype(int)
+    return out
+
+
+def latest_train_window(data, train_window, min_train_rows=60):
+    if data.empty:
+        raise ValueError("Cannot build final training window from empty dataset.")
+
+    train_offset = parse_window(train_window)
+    latest_end = data.index.max()
+    latest_start = latest_end - train_offset
+    train_df = data.loc[(data.index > latest_start) & (data.index <= latest_end)]
+    if len(train_df) < min_train_rows:
+        raise ValueError(
+            f"Not enough rows for final training window ({len(train_df)} < {min_train_rows}). "
+            f"window={train_window}, latest_end={latest_end.date()}"
+        )
+    return train_df
+
+
 class VolGPModel(gpytorch.models.ExactGP):
     def __init__(self, train_x, train_y, likelihood, kernel_config):
         super().__init__(train_x, train_y, likelihood)
@@ -490,6 +512,9 @@ def save_artifacts(
     summary_metrics,
     config,
     feature_cols,
+    train_x,
+    train_y,
+    train_noise,
 ):
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -503,6 +528,9 @@ def save_artifacts(
             "model_state_dict": model.state_dict(),
             "likelihood_state_dict": likelihood.state_dict(),
             "feature_columns": feature_cols,
+            "train_inputs": train_x.detach().cpu(),
+            "train_targets": train_y.detach().cpu(),
+            "train_noise": train_noise.detach().cpu(),
         },
         model_path,
     )
@@ -568,9 +596,6 @@ def main():
         feature_cols = [col for col in feature_cols if col != "time_index"]
 
     fold_metrics = []
-    last_model = None
-    last_likelihood = None
-    last_scaler = None
 
     horizon_embargo = WINDOW_VOL
     if horizon_embargo < 0:
@@ -587,12 +612,8 @@ def main():
 
     print("\nTraining GP model (walk-forward)...")
     for split in splits:
-        train_df = split.train.copy()
-        test_df = split.test.copy()
-
-        fold_start = split.train_start
-        train_df["time_index"] = (train_df.index - fold_start).days.astype(int)
-        test_df["time_index"] = (test_df.index - fold_start).days.astype(int)
+        train_df = set_time_index(split.train.copy(), split.train_start)
+        test_df = set_time_index(split.test.copy(), split.train_start)
 
         train_x_df, test_x_df, scaler = normalize_features(train_df, test_df, feature_cols)
 
@@ -636,11 +657,6 @@ def main():
                 "avg_interval_width": metrics["avg_interval_width"],
             }
         )
-
-        last_model = model
-        last_likelihood = likelihood
-        last_scaler = scaler
-
     summary_metrics = summarize_fold_metrics(fold_metrics)
     print(
         f"\nSummary | Folds: {summary_metrics['folds']} | "
@@ -649,15 +665,42 @@ def main():
         f"Coverage95 mean: {summary_metrics['coverage_95_mean']:.2%}"
     )
 
+    final_train_raw = latest_train_window(dataset, config["train_window"], min_train_rows=60)
+    final_train_df = set_time_index(final_train_raw.copy(), final_train_raw.index.min())
+    final_train_x_df, _, final_scaler = normalize_features(final_train_df, final_train_df, feature_cols)
+    final_train_x = torch.tensor(final_train_x_df.values, dtype=torch.float32)
+    final_train_y = torch.tensor(final_train_df["target"].values, dtype=torch.float32)
+    final_train_noise = torch.tensor(final_train_df["noise"].values, dtype=torch.float32).clamp_min(1e-8)
+
+    print(
+        f"\nFinal model fit | Train: {final_train_df.index.min().date()} -> "
+        f"{final_train_df.index.max().date()}"
+    )
+    final_model, final_likelihood = train_gp(
+        final_train_x,
+        final_train_y,
+        final_train_noise,
+        config["kernel"],
+        config["train_iters"],
+    )
+    config["final_train_window"] = {
+        "start": str(final_train_df.index.min().date()),
+        "end": str(final_train_df.index.max().date()),
+        "rows": int(len(final_train_df)),
+    }
+
     save_artifacts(
         Path(config["artifact_dir"]),
-        last_model,
-        last_likelihood,
-        last_scaler,
+        final_model,
+        final_likelihood,
+        final_scaler,
         fold_metrics,
         summary_metrics,
         config,
         feature_cols,
+        final_train_x,
+        final_train_y,
+        final_train_noise,
     )
 
 

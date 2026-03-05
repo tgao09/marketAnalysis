@@ -78,7 +78,10 @@ def load_artifacts(artifact_dir: Path, device: torch.device, pca_enabled: bool):
     else:
         scaler = json.loads(scaler_path.read_text())
 
-    return model_blob, scaler, pca_transformer, config, feature_cols, raw_feature_cols
+    train_x = model_blob["train_inputs"].to(device=device, dtype=torch.float32)
+    train_y = model_blob["train_targets"].to(device=device, dtype=torch.float32)
+    model_init_kwargs = dict(model_blob.get("model_init_kwargs") or {})
+    return model_blob, scaler, pca_transformer, config, feature_cols, raw_feature_cols, train_x, train_y, model_init_kwargs
 
 
 def resolve_regime_config(config):
@@ -102,15 +105,10 @@ def scale_with_saved_scaler(frame, feature_cols, scaler):
     return scaled, mean, std
 
 
-def rebuild_training_data(
+def rebuild_latest_features(
     config,
-    model_feature_cols,
     raw_feature_cols,
-    scaler,
-    pca_transformer,
-    pca_enabled: bool,
     history_cache,
-    device: torch.device,
 ):
     regime_config = resolve_regime_config(config)
     end_date = pd.Timestamp.today().normalize()
@@ -158,27 +156,17 @@ def rebuild_training_data(
 
     features["regime_score"] = regime_score
 
-    dataset = features.join([target])
-    dataset = dataset.dropna()
-    final_train_raw = latest_train_window(
-        dataset,
-        train_window=config["train_window"],
-        min_train_rows=60,
-    )
-    fold_start = final_train_raw.index.min()
-    train_df = set_time_index(final_train_raw.copy(), fold_start)
-    features = set_time_index(features, fold_start)
-
-    if pca_enabled:
-        train_x_df = pca_transformer.transform(train_df)
-        mean = None
-        std = None
-    else:
-        train_x_df, mean, std = scale_with_saved_scaler(train_df, model_feature_cols, scaler)
-    train_x = torch.tensor(train_x_df.values, dtype=torch.float32, device=device)
-    train_y = torch.tensor(train_df["target"].values, dtype=torch.float32, device=device)
-
-    return train_x, train_y, features, mean, std
+    dataset = features.join([target]).dropna()
+    final_start = pd.Timestamp(config["final_train_window"]["start"])
+    if pd.isna(final_start):
+        final_train_raw = latest_train_window(
+            dataset,
+            train_window=config["train_window"],
+            min_train_rows=60,
+        )
+        final_start = final_train_raw.index.min()
+    features = set_time_index(features, final_start)
+    return features
 
 
 def get_latest_feature_row(features, feature_cols):
@@ -188,24 +176,29 @@ def get_latest_feature_row(features, feature_cols):
 
 
 def predict_next_window(artifact_dir: Path, device: torch.device, pca_enabled: bool):
-    model_blob, scaler, pca_transformer, config, model_feature_cols, raw_feature_cols = load_artifacts(
+    (
+        model_blob,
+        scaler,
+        pca_transformer,
+        config,
+        model_feature_cols,
+        raw_feature_cols,
+        train_x,
+        train_y,
+        model_init_kwargs,
+    ) = load_artifacts(
         artifact_dir, device, pca_enabled
     )
 
     history_cache = {}
-    train_x, train_y, features, mean, std = rebuild_training_data(
+    features = rebuild_latest_features(
         config,
-        model_feature_cols,
         raw_feature_cols,
-        scaler,
-        pca_transformer,
-        pca_enabled,
         history_cache,
-        device,
     )
 
     likelihood = gpytorch.likelihoods.GaussianLikelihood().to(device)
-    model = ReturnGPModel(train_x, train_y, likelihood).to(device)
+    model = ReturnGPModel(train_x, train_y, likelihood, **model_init_kwargs).to(device)
     model.load_state_dict(model_blob["model_state_dict"])
     likelihood.load_state_dict(model_blob["likelihood_state_dict"])
 
@@ -216,6 +209,7 @@ def predict_next_window(artifact_dir: Path, device: torch.device, pca_enabled: b
         latest_transformed = pca_transformer.transform(latest_frame)
         x = torch.tensor(latest_transformed.values, dtype=torch.float32, device=device)
     else:
+        _, mean, std = scale_with_saved_scaler(features.loc[[asof_date]], model_feature_cols, scaler)
         latest_scaled = (latest_features - mean.reindex(model_feature_cols)) / std.reindex(model_feature_cols)
         latest_scaled = latest_scaled.replace([np.inf, -np.inf], np.nan)
         x = torch.tensor(latest_scaled.values, dtype=torch.float32, device=device).unsqueeze(0)

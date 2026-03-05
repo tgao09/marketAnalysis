@@ -13,16 +13,15 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from common import parse_window, walk_forward_splits
+from common import parse_window
 from gp_vol.train import (
     NOISE_WINDOW,
     WINDOW_VOL,
     VolGPModel,
     build_features,
-    build_target,
     extract_field,
     fetch_data,
-    normalize_features,
+    set_time_index,
 )
 
 
@@ -38,10 +37,13 @@ def load_artifacts(artifact_dir: Path):
     scaler = json.loads(scaler_path.read_text())
     config = json.loads(config_path.read_text())
 
-    return model_blob, scaler, config, model_blob["feature_columns"]
+    train_x = model_blob["train_inputs"].to(dtype=torch.float32)
+    train_y = model_blob["train_targets"].to(dtype=torch.float32)
+    train_noise = model_blob["train_noise"].to(dtype=torch.float32)
+    return model_blob, scaler, config, model_blob["feature_columns"], train_x, train_y, train_noise
 
 
-def rebuild_training_data(config, feature_cols):
+def rebuild_latest_features(config, feature_cols):
     end_date = pd.Timestamp.today().normalize()
     start_date = end_date - pd.DateOffset(years=config["data_years"])
     train_offset = parse_window(config["train_window"])
@@ -69,31 +71,9 @@ def rebuild_training_data(config, feature_cols):
     price_vix = extract_field(data, "Close", tickers[3])
 
     features = build_features(price_xlk, volume_xlk, price_gld, price_spy, price_vix)
-    target, noise = build_target(price_xlk)
-    dataset = features.join([target, noise]).dropna()
-    if dataset.empty:
-        raise ValueError("No rows left after feature/target alignment.")
-
-    splits = list(
-        walk_forward_splits(
-            dataset,
-            train_window=config["train_window"],
-            test_window=config["test_window"],
-            embargo=int(config["window_vol"]),
-            step=config["step_window"],
-            min_train_rows=60,
-        )
-    )
-    last_split = splits[-1]
-    train_df = last_split.train
-    train_x_df, _, _ = normalize_features(train_df, train_df, feature_cols)
-    train_x = torch.tensor(train_x_df.values, dtype=torch.float32)
-    train_y = torch.tensor(train_df["target"].values, dtype=torch.float32)
-    train_noise = (
-        torch.tensor(train_df["noise"].values, dtype=torch.float32).clamp_min(1e-8)
-    )
-
-    return train_x, train_y, train_noise, features
+    final_start = pd.Timestamp(config["final_train_window"]["start"])
+    features = set_time_index(features, final_start)
+    return features
 
 
 def get_latest_feature_row(features, feature_cols):
@@ -103,16 +83,14 @@ def get_latest_feature_row(features, feature_cols):
 
 
 def predict_next_week(artifact_dir: Path):
-    model_blob, scaler, config, feature_cols = load_artifacts(artifact_dir)
+    model_blob, scaler, config, feature_cols, train_x, train_y, train_noise = load_artifacts(artifact_dir)
 
-    train_x, train_y, train_noise, features = rebuild_training_data(
-        config, feature_cols
-    )
+    features = rebuild_latest_features(config, feature_cols)
 
     kernel_config = config["kernel"]
     likelihood = gpytorch.likelihoods.FixedNoiseGaussianLikelihood(
         noise=train_noise,
-        learn_additional_noise=False,
+        learn_additional_noise=True,
     )
     model = VolGPModel(train_x, train_y, likelihood, kernel_config)
     model.load_state_dict(model_blob["model_state_dict"])

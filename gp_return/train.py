@@ -631,6 +631,9 @@ def save_artifacts(
     config,
     feature_cols,
     raw_feature_cols,
+    train_x,
+    train_y,
+    model_init_kwargs,
     scaler=None,
 ):
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -646,6 +649,9 @@ def save_artifacts(
             "likelihood_state_dict": likelihood.state_dict(),
             "feature_columns": feature_cols,
             "raw_feature_columns": raw_feature_cols,
+            "train_inputs": train_x.detach().cpu(),
+            "train_targets": train_y.detach().cpu(),
+            "model_init_kwargs": model_init_kwargs,
         },
         model_path,
     )
@@ -917,8 +923,8 @@ def train_for_ticker(ticker, config, history_cache, device):
             "artifact_variant": artifact_variant,
             "kernel": {
                 "matern_nu": 0.5,
-                "matern_ard": True,
-                "rational_quadratic_ard": True,
+                "use_rq": True,
+                "use_linear": True,
             },
             "noise_model": "gaussian",
             "final_train_window": {
@@ -938,6 +944,9 @@ def train_for_ticker(ticker, config, history_cache, device):
         config_out,
         final_model_feature_cols,
         feature_cols,
+        final_train_x,
+        final_train_y,
+        model_init_kwargs=config_out["kernel"],
         scaler=final_scaler,
     )
     pca_path = artifact_dir / "pca.json"
