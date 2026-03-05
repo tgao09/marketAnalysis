@@ -278,12 +278,13 @@ def build_features(price_xlk, volume_xlk, price_gld, price_spy, price_vix):
 
 def build_target(price_xlk):
     returns = price_xlk.pct_change()
-    forward_vol = returns.rolling(WINDOW_VOL).std().shift(-WINDOW_VOL)
-    forward_vol = forward_vol * math.sqrt(ANNUALIZATION)
-    forward_vol = forward_vol.replace(0.0, np.nan)
+    realized_vol = returns.rolling(WINDOW_VOL).std() * math.sqrt(ANNUALIZATION)
+    realized_vol = realized_vol.replace(0.0, np.nan)
+    forward_vol = realized_vol.shift(-WINDOW_VOL)
     target = np.log(forward_vol)
 
-    noise = target.rolling(NOISE_WINDOW).std()
+    # Estimate heteroskedastic observation noise from trailing realized vol only.
+    noise = np.log(realized_vol).rolling(NOISE_WINDOW).std().shift(1)
     noise = noise.pow(2)
     return target.rename("target"), noise.rename("noise")
 
