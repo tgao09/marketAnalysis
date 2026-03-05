@@ -17,7 +17,7 @@ from hmm_regime.train import (
     ARTIFACT_DIR_DEFAULT,
     DEFAULT_MIN_TRAIN_ROWS,
     DEFAULT_N_ITER,
-    DEFAULT_N_STATES,
+    N_STATES,
     DEFAULT_RANDOM_STATE,
     DEFAULT_RETRAIN_CADENCE,
     DEFAULT_TRAIN_WINDOW,
@@ -49,7 +49,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-years", type=int, default=DEFAULT_TEST_YEARS)
     parser.add_argument("--train-window", default=DEFAULT_TRAIN_WINDOW)
     parser.add_argument("--step-bdays", type=int, default=DEFAULT_STEP_BDAYS)
-    parser.add_argument("--n-states", type=int, default=DEFAULT_N_STATES)
     parser.add_argument("--n-iter", type=int, default=DEFAULT_N_ITER)
     parser.add_argument("--random-state", type=int, default=DEFAULT_RANDOM_STATE)
     parser.add_argument("--min-train-rows", type=int, default=DEFAULT_MIN_TRAIN_ROWS)
@@ -261,7 +260,6 @@ def main() -> None:
         )
         bundle = fit_hmm_bundle(
             train_features=train_features,
-            n_states=args.n_states,
             n_iter=args.n_iter,
             random_state=args.random_state,
         )
@@ -322,7 +320,7 @@ def main() -> None:
     summary = {
         "generated_at": datetime.now(UTC).isoformat(),
         "model_type": "GaussianHMM",
-        "n_states": int(args.n_states),
+        "n_states": N_STATES,
         "feature_columns": FEATURE_COLUMNS,
         "train_window": args.train_window,
         "retrain_cadence": DEFAULT_RETRAIN_CADENCE,

@@ -25,7 +25,7 @@ ZSCORE_WINDOW = 252
 FEATURE_LOOKBACK_MAX = 252
 DEFAULT_TRAIN_WINDOW = "3y"
 DEFAULT_RETRAIN_CADENCE = "weekly"
-DEFAULT_N_STATES = 4
+N_STATES = 4
 DEFAULT_N_ITER = 500
 DEFAULT_RANDOM_STATE = 42
 DEFAULT_MIN_TRAIN_ROWS = 252
@@ -58,7 +58,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-window", default=DEFAULT_TRAIN_WINDOW, help="Rolling train window like '3y'.")
     parser.add_argument("--end", default=None, help="Training end date YYYY-MM-DD (default: today).")
     parser.add_argument("--artifact-dir", default=str(ARTIFACT_DIR_DEFAULT))
-    parser.add_argument("--n-states", type=int, default=DEFAULT_N_STATES)
     parser.add_argument("--n-iter", type=int, default=DEFAULT_N_ITER)
     parser.add_argument("--random-state", type=int, default=DEFAULT_RANDOM_STATE)
     parser.add_argument("--min-train-rows", type=int, default=DEFAULT_MIN_TRAIN_ROWS)
@@ -349,7 +348,6 @@ def build_state_output(
 
 def fit_hmm_bundle(
     train_features: pd.DataFrame,
-    n_states: int,
     n_iter: int,
     random_state: int,
 ) -> Dict[str, Any]:
@@ -357,7 +355,7 @@ def fit_hmm_bundle(
     train_scaled = apply_scaler(train_features, scaler)
 
     model = GaussianHMM(
-        n_components=int(n_states),
+        n_components=N_STATES,
         covariance_type="diag",
         n_iter=int(n_iter),
         random_state=int(random_state),
@@ -406,7 +404,6 @@ def save_artifacts(
     train_states: pd.DataFrame,
     train_window: str,
     retrain_cadence: str,
-    n_states: int,
     n_iter: int,
     random_state: int,
 ) -> None:
@@ -425,7 +422,7 @@ def save_artifacts(
         },
         "train_window": train_window,
         "retrain_cadence": retrain_cadence,
-        "n_states": int(n_states),
+        "n_states": N_STATES,
         "n_iter": int(n_iter),
         "random_state": int(random_state),
         "train_start": str(pd.Timestamp(bundle["train_start"]).date()),
@@ -435,7 +432,7 @@ def save_artifacts(
 
     config = {
         "model_type": "GaussianHMM",
-        "n_states": int(n_states),
+        "n_states": N_STATES,
         "feature_columns": FEATURE_COLUMNS,
         "train_window": train_window,
         "retrain_cadence": retrain_cadence,
@@ -486,7 +483,6 @@ def main() -> None:
 
     bundle = fit_hmm_bundle(
         train_features=train_features,
-        n_states=args.n_states,
         n_iter=args.n_iter,
         random_state=args.random_state,
     )
@@ -502,7 +498,6 @@ def main() -> None:
         train_states=train_states,
         train_window=args.train_window,
         retrain_cadence=args.retrain_cadence,
-        n_states=args.n_states,
         n_iter=args.n_iter,
         random_state=args.random_state,
     )
