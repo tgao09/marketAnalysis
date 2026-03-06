@@ -585,6 +585,8 @@ def append_tech_results(
     report: dict[str, Any],
 ):
     winner = report["winner"]
+    if not winner or not winner.get("holdout"):
+        return
     holdout = winner["holdout"]
     summary = holdout["aggregate"]
     run_id = report["run_id"]
@@ -921,36 +923,47 @@ def main():
     if promoted is None:
         eligible = [item for item in holdout_validations if not item["holdout_assessment"]["hard_reject"]]
         population = eligible if eligible else holdout_validations
-        promoted = max(
-            population,
-            key=lambda item: (
-                float(
-                    item["holdout"]["aggregate"]["basket_mean_avg_return_pct"]
-                    if item["holdout"]["aggregate"]["basket_mean_avg_return_pct"] is not None
-                    else float("-inf")
+        if population:
+            promoted = max(
+                population,
+                key=lambda item: (
+                    float(
+                        item["holdout"]["aggregate"]["basket_mean_avg_return_pct"]
+                        if item["holdout"]["aggregate"]["basket_mean_avg_return_pct"] is not None
+                        else float("-inf")
+                    ),
+                    float(item["objective_value"]),
                 ),
-                float(item["objective_value"]),
-            ),
-        )
+            )
 
-    winner_candidate = promoted["candidate"]
-    winner = {
-        "trial_number": winner_candidate["trial_number"],
-        "objective_value": winner_candidate["objective_value"],
-        "feature_set": winner_candidate["feature_set"],
-        "params": winner_candidate["params"],
-        "tune": {
-            "aggregate": winner_candidate.get("aggregate"),
-            "tickers": winner_candidate.get("tickers"),
-            "assessment": winner_candidate.get("assessment"),
+    write_json(
+        run_dir / "holdout_validations.json",
+        {
+            "count": len(holdout_validations),
+            "items": holdout_validations,
         },
-        "holdout": promoted["holdout"],
-        "holdout_assessment": promoted["holdout_assessment"],
-        "beats_holdout_baseline": promoted["beats_holdout_baseline"],
-    }
+    )
+
+    winner = None
+    if promoted is not None:
+        winner_candidate = promoted["candidate"]
+        winner = {
+            "trial_number": winner_candidate["trial_number"],
+            "objective_value": winner_candidate["objective_value"],
+            "feature_set": winner_candidate["feature_set"],
+            "params": winner_candidate["params"],
+            "tune": {
+                "aggregate": winner_candidate.get("aggregate"),
+                "tickers": winner_candidate.get("tickers"),
+                "assessment": winner_candidate.get("assessment"),
+            },
+            "holdout": promoted["holdout"],
+            "holdout_assessment": promoted["holdout_assessment"],
+            "beats_holdout_baseline": promoted["beats_holdout_baseline"],
+        }
 
     retrain_summaries = None
-    if not args.skip_retrain:
+    if winner is not None and not args.skip_retrain:
         print("Retraining winner artifacts...")
         retrain_summaries = retrain_winner(
             tickers=tickers,
@@ -964,23 +977,24 @@ def main():
 
     optimized_backtests = {}
     optimized_output_dir = run_dir / "optimized_backtests"
-    for ticker in tickers:
-        backtest_result = gbm_backtest.run_backtest(
-            ticker=ticker,
-            end_date=holdout_end,
-            train_window=args.train_window,
-            notional=args.notional,
-            include_time_index=args.include_time_index,
-            feature_set=winner["feature_set"],
-            feature_set_file=feature_set_file,
-            lgbm_params=winner["params"],
-            output_dir=optimized_output_dir,
-            lgbm_param_preset="baseline",
-            lgbm_params_json=None,
-            write_outputs=True,
-            verbose=False,
-        )
-        optimized_backtests[ticker] = backtest_result["summary"]
+    if winner is not None:
+        for ticker in tickers:
+            backtest_result = gbm_backtest.run_backtest(
+                ticker=ticker,
+                end_date=holdout_end,
+                train_window=args.train_window,
+                notional=args.notional,
+                include_time_index=args.include_time_index,
+                feature_set=winner["feature_set"],
+                feature_set_file=feature_set_file,
+                lgbm_params=winner["params"],
+                output_dir=optimized_output_dir,
+                lgbm_param_preset="baseline",
+                lgbm_params_json=None,
+                write_outputs=True,
+                verbose=False,
+            )
+            optimized_backtests[ticker] = backtest_result["summary"]
 
     gp_reference = collect_gp_reference(tickers)
 
@@ -1050,18 +1064,21 @@ def main():
     }
     write_json(run_dir / "final_report.json", report)
 
-    if not args.skip_tech_update:
+    if winner is not None and not args.skip_tech_update:
         tech_path = ROOT_DIR / "gbm_return" / "TECH.md"
         append_tech_results(tech_path, report)
         print(f"Updated TECH.md: {tech_path}")
 
     print("\nOptimization complete.")
     print(f"Run directory: {run_dir}")
-    print(f"Winner trial: {winner['trial_number']}")
-    print(f"Winner feature set: {winner['feature_set']}")
-    print(
-        f"Winner holdout mean avg_return_pct: {winner['holdout']['aggregate']['basket_mean_avg_return_pct']}"
-    )
+    if winner is None:
+        print("No holdout winner selected.")
+    else:
+        print(f"Winner trial: {winner['trial_number']}")
+        print(f"Winner feature set: {winner['feature_set']}")
+        print(
+            f"Winner holdout mean avg_return_pct: {winner['holdout']['aggregate']['basket_mean_avg_return_pct']}"
+        )
 
 
 if __name__ == "__main__":

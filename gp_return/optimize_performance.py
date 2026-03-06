@@ -28,6 +28,7 @@ from gp_return.train import (
     ARTIFACT_DIR_DEFAULT,
     WINDOW_RET,
     normalize_features,
+    resolve_device,
     select_feature_columns,
     set_time_index,
     train_gp,
@@ -408,7 +409,7 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    device = torch.device("cpu")
+    device = resolve_device()
     print(f"Using device: {device.type}")
 
     holdout_end = pd.Timestamp(args.holdout_end).normalize() if args.holdout_end else pd.Timestamp.today().normalize()
