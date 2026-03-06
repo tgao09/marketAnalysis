@@ -1,10 +1,21 @@
 .claude
 .venv
-training_stocks.txt
-ClAUDE.md
+CLAUDE.md
 *.pyc
-*.csv
 __pycache__/
 .ipynb_checkpoints/
 .env
-*.pkl
+.devcontainer
+
+# Pytest cache
+.pytest_cache/
+
+# Frontend Streamlit secrets
+frontend/.streamlit/secrets.toml
+
+# Frontend test artifacts
+frontend/tests/.pytest_cache/
+frontend/tests/playwright-report/
+frontend/tests/test-results/
+frontend/tests/.playwright/
+frontend/tests/screenshots/
