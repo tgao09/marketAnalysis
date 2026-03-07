@@ -13,7 +13,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from common import PCATransformer, parse_window
+from common import parse_window
 from gp_return.train import (
     ARTIFACT_DIR_DEFAULT,
     DATA_YEARS,
@@ -24,9 +24,9 @@ from gp_return.train import (
     REGIME_SCORE_WEIGHTS,
     REGIME_SCORE_WINDOW,
     WINDOW_RET,
+    build_pca_transformer,
     build_features,
     build_target,
-    compute_regime_score,
     extract_field,
     fetch_history_cached,
     normalize_features,
@@ -88,6 +88,12 @@ def compute_dataset_start(end_date: pd.Timestamp, train_window: str):
 
 def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp):
     history_cache: dict[str, pd.DataFrame] = {}
+    regime_config = {
+        "enabled": True,
+        "score_window": REGIME_SCORE_WINDOW,
+        "score_clip": REGIME_SCORE_CLIP,
+        "weights": REGIME_SCORE_WEIGHTS,
+    }
 
     sector_etf, sector_name, sector_error = resolve_sector_etf(ticker)
     if sector_error:
@@ -113,21 +119,11 @@ def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp)
         price_gld,
         price_spy,
         price_vix,
+        regime_config,
     )
     target = build_target(price_stock)
 
-    price_spy_regime = price_spy.reindex(price_stock.index).ffill()
-    price_vix_regime = price_vix.reindex(price_stock.index).ffill()
-    regime_score = compute_regime_score(
-        price_vix_regime,
-        price_spy_regime,
-        REGIME_SCORE_WINDOW,
-        REGIME_SCORE_CLIP,
-        REGIME_SCORE_WEIGHTS,
-    )
-
     dataset = features.join([target])
-    dataset["regime_score"] = regime_score
     dataset = dataset.dropna()
     if dataset.index.has_duplicates:
         dataset = dataset.loc[~dataset.index.duplicated(keep="last")]
@@ -167,18 +163,6 @@ def summarize_trades(trades: pd.DataFrame):
         "std_pnl": float(pnl.std(ddof=1)) if len(pnl) > 1 else 0.0,
         "max_drawdown": max_drawdown,
     }
-
-
-def build_backtest_pca_transformer() -> PCATransformer:
-    return PCATransformer(
-        threshold=0.80,
-        max_pcs=12,
-        impute_strategy="median",
-        mode="replace",
-        pc_prefix="pc_",
-    )
-
-
 def main():
     args = parse_args()
     device = resolve_device()
@@ -239,7 +223,7 @@ def main():
         test_df = set_time_index(test_df.copy(), fold_start)
         fold_pca_k = None
         if args.pca:
-            fold_pca = build_backtest_pca_transformer()
+            fold_pca = build_pca_transformer()
             train_x_df, test_x_df = fold_pca.transform_train_test(train_df, test_df, feature_cols)
             fold_pca_k = int(fold_pca.k_selected_)
         else:

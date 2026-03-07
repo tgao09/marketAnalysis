@@ -32,10 +32,13 @@ TICKER_SPY = "SPY"
 TICKER_VIX = "^VIX"
 WINDOW_RET = 5
 DATA_YEARS = 3
-DEFAULT_TRAIN_ITERS = 400
+DEFAULT_TRAIN_ITERS = 140
 DEFAULT_TRAIN_WINDOW = "2y"
 DEFAULT_TEST_WINDOW = "1m"
 DEFAULT_STEP_WINDOW = "1m"
+DEFAULT_LEARNING_RATE = 0.024631869668246882
+DEFAULT_WEIGHT_DECAY = 5.336375586115967e-06
+DEFAULT_MATERN_NU = 2.5
 FEATURE_LOOKBACK_MAX = 60
 REGIME_SCORE_WINDOW = 252
 REGIME_SCORE_CLIP = 4.0
@@ -230,7 +233,15 @@ def trading_day_in_quarter(index):
     return day_in_quarter, quarter_len
 
 
-def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix):
+def build_features(
+    price_stock,
+    volume_stock,
+    price_sector,
+    price_gld,
+    price_spy,
+    price_vix,
+    regime_config,
+):
     index = price_stock.index
 
     volume_stock = volume_stock.reindex(index).ffill()
@@ -245,69 +256,82 @@ def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy
     log_ret_spy = compute_log_return(price_spy, 1)
 
     features = pd.DataFrame(index=price_stock.index)
-    features["time_index"] = (features.index - features.index[0]).days.astype(int)
+    # features["time_index"] = (features.index - features.index[0]).days.astype(int)
 
     # Stock returns (log) and summary stats
-    features["ret_1d"] = log_ret_stock
+    # features["ret_1d"] = log_ret_stock
     features["ret_5d"] = compute_log_return(price_stock, WINDOW_RET)
     features["ret_10d"] = compute_log_return(price_stock, 10)
     ret_20d = compute_log_return(price_stock, 20)
-    features["ret_20d"] = ret_20d
+    # features["ret_20d"] = ret_20d
     features["ret_60d"] = compute_log_return(price_stock, 60)
 
     # Stock volatility and standardized returns
-    features["vol_5d"] = log_ret_stock.rolling(WINDOW_RET).std()
+    vol_5d = log_ret_stock.rolling(WINDOW_RET).std()
+    vol_20d = log_ret_stock.rolling(20).std()
+    # features["vol_5d"] = vol_5d
     features["vol_10d"] = log_ret_stock.rolling(10).std()
-    features["vol_20d"] = log_ret_stock.rolling(20).std()
+    # features["vol_20d"] = vol_20d
     features["vol_60d"] = log_ret_stock.rolling(60).std()
 
     # Volume and distribution shape
-    features["vol_chg_1d"] = volume_stock.pct_change()
+    # features["vol_chg_1d"] = volume_stock.pct_change()
     features["skew_20d"] = log_ret_stock.rolling(20).skew()
 
     # Trend, range, and volatility structure
     features["stock_ma20_gap"] = (price_stock / price_stock.rolling(20).mean()) - 1.0
     features["stock_ma60_gap"] = (price_stock / price_stock.rolling(60).mean()) - 1.0
-    roll_min_60 = price_stock.rolling(60).min()
+    # roll_min_60 = price_stock.rolling(60).min()
     roll_max_60 = price_stock.rolling(60).max()
     features["drawdown_60d"] = (price_stock / roll_max_60) - 1.0
-    features["momentum_5_20"] = features["ret_5d"] - ret_20d
-    features["vol_ratio_5_20"] = (features["vol_5d"] / features["vol_20d"]).replace(
+    # features["momentum_5_20"] = features["ret_5d"] - ret_20d
+    features["vol_ratio_5_20"] = (vol_5d / vol_20d).replace(
         [np.inf, -np.inf], np.nan
     )
 
     # Sector ETF features
-    features["sector_ret_1d"] = log_ret_sector
-    features["sector_ret_5d"] = compute_log_return(price_sector, WINDOW_RET)
+    # features["sector_ret_1d"] = log_ret_sector
+    # features["sector_ret_5d"] = compute_log_return(price_sector, WINDOW_RET)
     features["sector_vol_5d"] = log_ret_sector.rolling(WINDOW_RET).std()
     features["rel_strength_sector_20d"] = ret_20d - compute_log_return(price_sector, 20)
 
     # GLD features
-    features["gld_ret_1d"] = log_ret_gld
+    # features["gld_ret_1d"] = log_ret_gld
     features["gld_ret_5d"] = compute_log_return(price_gld, WINDOW_RET)
     features["gld_vol_5d"] = log_ret_gld.rolling(WINDOW_RET).std()
 
     # Market regime (SPY + VIX)
     features["spy_ret_5d"] = compute_log_return(price_spy, WINDOW_RET)
-    features["spy_vol_20d"] = log_ret_spy.rolling(20).std()
-    features["spy_ma20_gap"] = (price_spy / price_spy.rolling(20).mean()) - 1.0
-    features["vix_level"] = price_vix
+    # features["spy_vol_20d"] = log_ret_spy.rolling(20).std()
+    # features["spy_ma20_gap"] = (price_spy / price_spy.rolling(20).mean()) - 1.0
+    # features["vix_level"] = price_vix
     features["vix_chg_1d"] = compute_log_return(price_vix, 1)
-    features["corr_spy_60d"] = log_ret_stock.rolling(60).corr(log_ret_spy)
+    # features["corr_spy_60d"] = log_ret_stock.rolling(60).corr(log_ret_spy)
 
     # Calendar features
     day_in_quarter, quarter_len = trading_day_in_quarter(features.index)
     quarter_len = quarter_len.replace(0, 1)
     phase = (2.0 * np.pi * day_in_quarter) / quarter_len
-    features["q_phase_sin"] = np.sin(phase)
+    # features["q_phase_sin"] = np.sin(phase)
     features["q_phase_cos"] = np.cos(phase)
+
+    if regime_config.get("enabled", True):
+        features["regime_score"] = compute_regime_score(
+            price_vix,
+            price_spy,
+            regime_config["score_window"],
+            regime_config["score_clip"],
+            regime_config["weights"],
+        )
+    else:
+        features["regime_score"] = pd.Series(0.0, index=price_stock.index)
 
     return features
 
 
 def set_time_index(features, start_date):
     features = features.copy()
-    features["time_index"] = (features.index - start_date).days.astype(int)
+    # features["time_index"] = (features.index - start_date).days.astype(int)
     return features
 
 
@@ -416,9 +440,7 @@ class ReturnGPModel(gpytorch.models.ExactGP):
         train_x,
         train_y,
         likelihood,
-        matern_nu: float = 0.5,
-        use_rq: bool = True,
-        use_linear: bool = True,
+        matern_nu: float = DEFAULT_MATERN_NU,
     ):
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ConstantMean()
@@ -427,16 +449,10 @@ class ReturnGPModel(gpytorch.models.ExactGP):
         kernels = [
             gpytorch.kernels.ScaleKernel(
                 gpytorch.kernels.MaternKernel(nu=matern_nu, ard_num_dims=ard_num_dims)
-            )
+            ),
+            # gpytorch.kernels.ScaleKernel(gpytorch.kernels.RQKernel(ard_num_dims=ard_num_dims)),
+            gpytorch.kernels.ScaleKernel(gpytorch.kernels.LinearKernel(ard_num_dims=ard_num_dims)),
         ]
-        if use_rq:
-            kernels.append(
-                gpytorch.kernels.ScaleKernel(gpytorch.kernels.RQKernel(ard_num_dims=ard_num_dims))
-            )
-        if use_linear:
-            kernels.append(
-                gpytorch.kernels.ScaleKernel(gpytorch.kernels.LinearKernel(ard_num_dims=ard_num_dims))
-            )
 
         covar_module = kernels[0]
         for kernel in kernels[1:]:
@@ -454,11 +470,9 @@ def train_gp(
     train_y,
     train_iters=DEFAULT_TRAIN_ITERS,
     device=None,
-    learning_rate: float = 0.05,
-    weight_decay: float = 0.0,
-    matern_nu: float = 0.5,
-    use_rq: bool = True,
-    use_linear: bool = True,
+    learning_rate: float = DEFAULT_LEARNING_RATE,
+    weight_decay: float = DEFAULT_WEIGHT_DECAY,
+    matern_nu: float = DEFAULT_MATERN_NU,
 ):
     device = train_x.device if device is None else device
     train_x = train_x.to(device)
@@ -470,8 +484,6 @@ def train_gp(
         train_y,
         likelihood,
         matern_nu=matern_nu,
-        use_rq=use_rq,
-        use_linear=use_linear,
     ).to(device)
 
     model.train()
@@ -714,24 +726,17 @@ def train_for_ticker(ticker, config, history_cache, device):
     price_spy = extract_field(spy_history, "Close", TICKER_SPY)
     price_vix = extract_field(vix_history, "Close", TICKER_VIX)
 
-    features = build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix)
-    target = build_target(price_stock)
-
     regime_config = config["regime_score"]
-    
-    price_spy_regime = price_spy.reindex(price_stock.index).ffill()
-    price_vix_regime = price_vix.reindex(price_stock.index).ffill()
-
-    if regime_config.get("enabled", True):
-        regime_score = compute_regime_score(
-            price_vix_regime,
-            price_spy_regime,
-            regime_config["score_window"],
-            regime_config["score_clip"],
-            regime_config["weights"],
-        )
-    else:
-        regime_score = pd.Series(0.0, index=price_stock.index, name="regime_score")
+    features = build_features(
+        price_stock,
+        volume_stock,
+        price_sector,
+        price_gld,
+        price_spy,
+        price_vix,
+        regime_config,
+    )
+    target = build_target(price_stock)
 
     validate_alignment_and_nan(
         ticker,
@@ -745,7 +750,6 @@ def train_for_ticker(ticker, config, history_cache, device):
     )
 
     dataset = features.join([target])
-    dataset["regime_score"] = regime_score
     before_rows = int(dataset.shape[0])
     nan_counts = dataset.isna().sum().sort_values(ascending=False)
     dataset = dataset.dropna()
@@ -827,6 +831,9 @@ def train_for_ticker(ticker, config, history_cache, device):
             train_y,
             train_iters=config["train_iters"],
             device=device,
+            learning_rate=config["learning_rate"],
+            weight_decay=config["weight_decay"],
+            matern_nu=config["kernel"]["matern_nu"],
         )
 
         metrics = evaluate(model, likelihood, test_x, test_y)
@@ -911,6 +918,9 @@ def train_for_ticker(ticker, config, history_cache, device):
         final_train_y,
         train_iters=config["train_iters"],
         device=device,
+        learning_rate=config["learning_rate"],
+        weight_decay=config["weight_decay"],
+        matern_nu=config["kernel"]["matern_nu"],
     )
 
     artifact_dir = Path(config["artifact_dir"]) / ticker / artifact_variant
@@ -921,11 +931,7 @@ def train_for_ticker(ticker, config, history_cache, device):
             "sector": sector_name,
             "sector_etf": sector_etf,
             "artifact_variant": artifact_variant,
-            "kernel": {
-                "matern_nu": 0.5,
-                "use_rq": True,
-                "use_linear": True,
-            },
+            "kernel": dict(config["kernel"]),
             "noise_model": "gaussian",
             "final_train_window": {
                 "start": str(final_train_df.index.min().date()),
@@ -975,6 +981,8 @@ def main():
         "test_window": DEFAULT_TEST_WINDOW,
         "step_window": DEFAULT_STEP_WINDOW,
         "train_iters": DEFAULT_TRAIN_ITERS,
+        "learning_rate": DEFAULT_LEARNING_RATE,
+        "weight_decay": DEFAULT_WEIGHT_DECAY,
         "artifact_dir": str(ARTIFACT_DIR_DEFAULT),
         "drop_time_index": args.drop_time_index,
         "pca": {
@@ -990,6 +998,9 @@ def main():
             "score_window": REGIME_SCORE_WINDOW,
             "score_clip": REGIME_SCORE_CLIP,
             "weights": REGIME_SCORE_WEIGHTS,
+        },
+        "kernel": {
+            "matern_nu": DEFAULT_MATERN_NU,
         },
     }
 
