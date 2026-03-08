@@ -30,6 +30,7 @@ from gbm_return.train import (
     compute_start_date,
     extract_field,
     fetch_history_cached,
+    resolve_direction_mode,
     resolve_sector_etf,
     resolve_artifact_variant,
     set_time_index,
@@ -139,11 +140,19 @@ def predict_next_window(artifact_dir: Path):
     x = np.asarray([latest_features.values], dtype=float)
     mean_log = float(booster.predict(x)[0])
     mean_simple = math.exp(mean_log) - 1.0
+    direction_mode = resolve_direction_mode(config.get("direction_mode"))
+    if direction_mode == "long_only":
+        action = "long"
+    elif direction_mode == "short_only":
+        action = "short"
+    else:
+        action = "long" if mean_log >= 0.0 else "short"
     return {
         "asof_date": asof_date,
         "mean_log": mean_log,
         "mean_simple": mean_simple,
         "feature_count": len(model_feature_cols),
+        "action": action,
     }
 
 
@@ -164,6 +173,7 @@ def main():
         print(f"As of: {asof.date()} (last trading day with full features)")
         print(f"Mean log return: {result['mean_log']:.6f}")
         print(f"Mean simple return: {result['mean_simple']:.2%}")
+        print(f"Action: {result['action']}")
 
 
 if __name__ == "__main__":

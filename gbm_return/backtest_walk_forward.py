@@ -34,6 +34,8 @@ from gbm_return.train import (
     compute_regime_score,
     extract_field,
     fetch_history_cached,
+    prepare_lgbm_training_data,
+    resolve_direction_mode,
     resolve_sector_etf,
     resolve_artifact_variant,
     select_feature_columns,
@@ -170,12 +172,27 @@ def summarize_trades(trades: pd.DataFrame):
             "median_pnl": None,
             "std_pnl": None,
             "max_drawdown": None,
+            "avg_return_pct": None,
+            "median_return_pct": None,
+            "std_return_pct": None,
+            "return_tstat": None,
+            "profit_factor": None,
         }
     pnl = trades["pnl"]
+    returns = trades["return_pct"]
     daily = trades.groupby("trade_date")["pnl"].sum().sort_index()
     equity = daily.cumsum()
     drawdown = equity - equity.cummax()
     max_drawdown = float(drawdown.min()) if not drawdown.empty else None
+    gross_profit = float(pnl[pnl > 0].sum())
+    gross_loss = float(-pnl[pnl < 0].sum())
+    std_return = float(returns.std(ddof=1)) if len(returns) > 1 else 0.0
+    return_tstat = None
+    if len(returns) > 1 and std_return > 0.0:
+        return_tstat = float((returns.mean() / std_return) * math.sqrt(len(returns)))
+    profit_factor = None
+    if gross_loss > 0.0:
+        profit_factor = gross_profit / gross_loss
     return {
         "total_trades": int(len(trades)),
         "win_rate": float((pnl > 0).mean()),
@@ -183,6 +200,11 @@ def summarize_trades(trades: pd.DataFrame):
         "median_pnl": float(pnl.median()),
         "std_pnl": float(pnl.std(ddof=1)) if len(pnl) > 1 else 0.0,
         "max_drawdown": max_drawdown,
+        "avg_return_pct": float(returns.mean()),
+        "median_return_pct": float(returns.median()),
+        "std_return_pct": std_return,
+        "return_tstat": return_tstat,
+        "profit_factor": profit_factor,
     }
 
 
@@ -234,6 +256,8 @@ def run_backtest_prepared(
     feature_set: str,
     feature_set_file: str | None,
     lgbm_params: dict[str, Any],
+    training_policy: dict[str, Any] | None = None,
+    direction_mode: str | None = None,
     verbose: bool = True,
 ):
     dataset = prepared["dataset"]
@@ -248,6 +272,7 @@ def run_backtest_prepared(
         feature_set=feature_set,
         feature_set_file=feature_set_file,
     )
+    resolved_direction_mode = resolve_direction_mode(direction_mode)
 
     trades = []
     for test_date in test_dates:
@@ -266,9 +291,19 @@ def run_backtest_prepared(
         fold_start = train_df.index.min()
         train_df = set_time_index(train_df.copy(), fold_start)
         test_df = set_time_index(test_df.copy(), fold_start)
-        model = train_lgbm(train_df[feature_cols], train_df["target"], lgbm_params)
+        train_x, train_y, sample_weight, _ = prepare_lgbm_training_data(
+            train_df,
+            feature_cols,
+            training_policy,
+        )
+        model = train_lgbm(train_x, train_y, lgbm_params, sample_weight=sample_weight)
         mean_log = float(model.predict(test_df[feature_cols])[0])
-        direction = "long" if mean_log > 0.0 else "short"
+        if resolved_direction_mode == "long_only":
+            direction = "long"
+        elif resolved_direction_mode == "short_only":
+            direction = "short"
+        else:
+            direction = "long" if mean_log >= 0.0 else "short"
 
         entry_close = float(candidates.at[test_date, "entry_close"])
         exit_dt = candidates.at[test_date, "exit_date"]
@@ -310,7 +345,6 @@ def run_backtest_prepared(
     if not trades_df.empty:
         trades_df = trades_df.sort_values("trade_date")
     summary = summarize_trades(trades_df)
-    avg_return_pct = float(trades_df["return_pct"].mean()) if not trades_df.empty else None
     summary.update(
         {
             "generated_at": datetime.now(UTC).isoformat(),
@@ -321,10 +355,12 @@ def run_backtest_prepared(
             "test_years": DEFAULT_TEST_YEARS,
             "window_ret": WINDOW_RET,
             "notional": notional,
-            "avg_return_pct": avg_return_pct,
+            "candidate_trade_days": int(len(test_dates)),
+            "trade_rate": float(len(trades_df) / len(test_dates)) if len(test_dates) else 0.0,
             "feature_set": feature_set,
             "feature_count": len(feature_cols),
             "lgbm_params": dict(lgbm_params),
+            "direction_mode": resolved_direction_mode,
         }
     )
     return trades_df, summary, feature_cols
@@ -339,6 +375,8 @@ def run_backtest(
     feature_set: str,
     feature_set_file: str | None,
     lgbm_params: dict[str, Any],
+    training_policy: dict[str, Any] | None,
+    direction_mode: str | None,
     output_dir: str | Path,
     lgbm_param_preset: str = "baseline",
     lgbm_params_json: str | None = None,
@@ -355,6 +393,8 @@ def run_backtest(
         feature_set=feature_set,
         feature_set_file=feature_set_file,
         lgbm_params=lgbm_params,
+        training_policy=training_policy,
+        direction_mode=direction_mode,
         verbose=verbose,
     )
     summary.update(
@@ -363,6 +403,8 @@ def run_backtest(
             "feature_set_file": feature_set_file,
             "lgbm_param_preset": lgbm_param_preset,
             "lgbm_params_json": lgbm_params_json,
+            "training_policy": training_policy,
+            "direction_mode": summary.get("direction_mode"),
         }
     )
 
@@ -410,6 +452,8 @@ def main():
         feature_set=args.feature_set,
         feature_set_file=args.feature_set_file,
         lgbm_params=lgbm_params,
+        training_policy=None,
+        direction_mode=None,
         output_dir=args.output_dir,
         lgbm_param_preset=args.lgbm_param_preset,
         lgbm_params_json=args.lgbm_params_json,

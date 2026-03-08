@@ -49,6 +49,13 @@ REGIME_SCORE_WEIGHTS = {"vix": 0.5, "spy_vol": 0.5}
 MIN_TRAIN_ROWS = 60
 LGBM_PARAMS = dict(BASE_LGBM_PARAMS)
 FEATURE_SET_FILE_DEFAULT = ARTIFACT_DIR_DEFAULT / "feature_sets.json"
+VALID_DIRECTION_MODES = ("long_short", "long_only", "short_only")
+DEFAULT_DIRECTION_MODE = "long_short"
+DEFAULT_TRAINING_POLICY = {
+    "target_clip_lower_quantile": 0.02,
+    "target_clip_upper_quantile": 0.98,
+    "recency_min_weight": 0.35,
+}
 COMMENTED_FEATURES = [
     "vol_chg_1d",
     "momentum_5_20",
@@ -61,6 +68,34 @@ COMMENTED_FEATURES = [
 
 def resolve_artifact_variant() -> str:
     return ARTIFACT_VARIANT_REGULAR
+
+
+def resolve_direction_mode(direction_mode: str | None = None) -> str:
+    direction_mode = str(direction_mode or DEFAULT_DIRECTION_MODE)
+    if direction_mode not in VALID_DIRECTION_MODES:
+        valid = ", ".join(VALID_DIRECTION_MODES)
+        raise ValueError(f"Unknown direction_mode '{direction_mode}'. Valid values: {valid}")
+    return direction_mode
+
+
+def resolve_training_policy(overrides: dict | None = None) -> dict:
+    resolved = dict(DEFAULT_TRAINING_POLICY)
+    if overrides:
+        resolved.update(overrides)
+
+    lower_q = float(resolved["target_clip_lower_quantile"])
+    upper_q = float(resolved["target_clip_upper_quantile"])
+    if not 0.0 <= lower_q < upper_q <= 1.0:
+        raise ValueError("Target clip quantiles must satisfy 0 <= lower < upper <= 1.")
+
+    recency_min_weight = float(resolved["recency_min_weight"])
+    if not 0.0 < recency_min_weight <= 1.0:
+        raise ValueError("recency_min_weight must be in (0, 1].")
+
+    resolved["target_clip_lower_quantile"] = lower_q
+    resolved["target_clip_upper_quantile"] = upper_q
+    resolved["recency_min_weight"] = recency_min_weight
+    return resolved
 
 
 def parse_args():
@@ -397,9 +432,62 @@ def latest_train_window(data, train_window, min_train_rows=MIN_TRAIN_ROWS):
     return train_df
 
 
-def train_lgbm(train_x: pd.DataFrame, train_y: pd.Series, params: dict):
+def clip_target_series(target: pd.Series, training_policy: dict | None = None):
+    policy = resolve_training_policy(training_policy)
+    lower_bound = float(target.quantile(policy["target_clip_lower_quantile"]))
+    upper_bound = float(target.quantile(policy["target_clip_upper_quantile"]))
+    if not np.isfinite(lower_bound) or not np.isfinite(upper_bound):
+        clipped = target.copy()
+        lower_bound = None
+        upper_bound = None
+    else:
+        clipped = target.clip(lower=lower_bound, upper=upper_bound)
+    return clipped, {
+        "lower_bound": lower_bound,
+        "upper_bound": upper_bound,
+        "lower_quantile": policy["target_clip_lower_quantile"],
+        "upper_quantile": policy["target_clip_upper_quantile"],
+    }
+
+
+def compute_recency_weights(index: pd.Index, min_weight: float) -> pd.Series:
+    if len(index) <= 1:
+        return pd.Series(1.0, index=index, dtype=float)
+    progress = np.linspace(0.0, 1.0, len(index), dtype=float)
+    weights = min_weight + (1.0 - min_weight) * np.power(progress, 1.5)
+    return pd.Series(weights, index=index, dtype=float)
+
+
+def prepare_lgbm_training_data(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    training_policy: dict | None = None,
+):
+    policy = resolve_training_policy(training_policy)
+    train_x = train_df[feature_cols]
+    clipped_target, clip_info = clip_target_series(train_df["target"], policy)
+    sample_weight = compute_recency_weights(train_df.index, policy["recency_min_weight"])
+    metadata = {
+        "target_clip": clip_info,
+        "sample_weight": {
+            "min_weight": policy["recency_min_weight"],
+            "max_weight": 1.0,
+        },
+    }
+    return train_x, clipped_target, sample_weight, metadata
+
+
+def train_lgbm(
+    train_x: pd.DataFrame,
+    train_y: pd.Series,
+    params: dict,
+    sample_weight: pd.Series | np.ndarray | None = None,
+):
     model = lgb.LGBMRegressor(**params)
-    model.fit(train_x, train_y)
+    fit_kwargs = {}
+    if sample_weight is not None:
+        fit_kwargs["sample_weight"] = np.asarray(sample_weight, dtype=float)
+    model.fit(train_x, train_y, **fit_kwargs)
     return model
 
 
@@ -411,11 +499,13 @@ def evaluate(model, test_x: pd.DataFrame, test_y: pd.Series):
     actual_simple = np.exp(test_y) - 1.0
     mae_simple = float(np.mean(np.abs(pred_simple - actual_simple)))
     directional = float(np.mean(np.sign(pred) == np.sign(test_y)))
+    corr = float(pred.corr(test_y)) if len(pred) > 1 else None
     return {
         "mae": mae,
         "mse": mse,
         "mae_simple": mae_simple,
         "directional": directional,
+        "corr": corr,
         "coverage_95": None,
         "avg_interval_width": None,
     }
@@ -426,6 +516,7 @@ def summarize_fold_metrics(fold_metrics):
     mse_values = [fold["mse"] for fold in fold_metrics]
     mae_simple_values = [fold["mae_simple"] for fold in fold_metrics]
     dir_values = [fold["directional"] for fold in fold_metrics]
+    corr_values = [fold["corr"] for fold in fold_metrics if fold.get("corr") is not None]
     summary = {
         "folds": len(fold_metrics),
         "mae_mean": float(np.mean(mae_values)) if mae_values else None,
@@ -436,6 +527,8 @@ def summarize_fold_metrics(fold_metrics):
         "mae_simple_median": float(np.median(mae_simple_values)) if mae_simple_values else None,
         "directional_mean": float(np.mean(dir_values)) if dir_values else None,
         "directional_median": float(np.median(dir_values)) if dir_values else None,
+        "corr_mean": float(np.mean(corr_values)) if corr_values else None,
+        "corr_median": float(np.median(corr_values)) if corr_values else None,
         "coverage_95_mean": None,
         "coverage_95_median": None,
         "avg_interval_width_mean": None,
@@ -598,12 +691,20 @@ def train_for_ticker(ticker, config, history_cache):
     for split in splits:
         train_df = set_time_index(split.train.copy(), split.train_start)
         test_df = set_time_index(split.test.copy(), split.train_start)
-        train_x = train_df[feature_cols]
-        train_y = train_df["target"]
+        train_x, train_y, sample_weight, train_meta = prepare_lgbm_training_data(
+            train_df,
+            feature_cols,
+            config.get("training_policy"),
+        )
         test_x = test_df[feature_cols]
         test_y = test_df["target"]
 
-        model = train_lgbm(train_x, train_y, config["lgbm_params"])
+        model = train_lgbm(
+            train_x,
+            train_y,
+            config["lgbm_params"],
+            sample_weight=sample_weight,
+        )
         metrics = evaluate(model, test_x, test_y)
         print(
             f"Fold {split.fold} | Train: {split.train_start.date()} -> {split.train_end.date()} | "
@@ -624,8 +725,10 @@ def train_for_ticker(ticker, config, history_cache):
                 "mse": metrics["mse"],
                 "mae_simple": metrics["mae_simple"],
                 "directional": metrics["directional"],
+                "corr": metrics["corr"],
                 "coverage_95": metrics["coverage_95"],
                 "avg_interval_width": metrics["avg_interval_width"],
+                "train_target_clip": train_meta["target_clip"],
             }
         )
 
@@ -635,13 +738,23 @@ def train_for_ticker(ticker, config, history_cache):
         f"MAE(log) mean: {summary_metrics['mae_mean']:.6f} | "
         f"MAE(simple) mean: {summary_metrics['mae_simple_mean']:.4%} | "
         f"MSE mean: {summary_metrics['mse_mean']:.6f} | "
-        f"Dir mean: {summary_metrics['directional_mean']:.2%}"
+        f"Dir mean: {summary_metrics['directional_mean']:.2%} | "
+        f"Corr mean: {summary_metrics['corr_mean'] if summary_metrics['corr_mean'] is not None else float('nan'):.4f}"
     )
 
     final_train_raw = latest_train_window(dataset, config["train_window"], min_train_rows=MIN_TRAIN_ROWS)
     final_train_df = set_time_index(final_train_raw.copy(), final_train_raw.index.min())
-    final_model = train_lgbm(final_train_df[feature_cols], final_train_df["target"], config["lgbm_params"])
-
+    final_train_x, final_train_y, final_sample_weight, final_train_meta = prepare_lgbm_training_data(
+        final_train_df,
+        feature_cols,
+        config.get("training_policy"),
+    )
+    final_model = train_lgbm(
+        final_train_x,
+        final_train_y,
+        config["lgbm_params"],
+        sample_weight=final_sample_weight,
+    )
     config_out = dict(config)
     configured_drop_features = resolve_feature_drops(
         feature_set=str(config.get("feature_set", FEATURE_SET_F0)),
@@ -656,6 +769,9 @@ def train_for_ticker(ticker, config, history_cache):
             "feature_set": config.get("feature_set", FEATURE_SET_F0),
             "feature_set_drop_features": configured_drop_features,
             "commented_features": COMMENTED_FEATURES,
+            "direction_mode": resolve_direction_mode(config.get("direction_mode")),
+            "training_policy": resolve_training_policy(config.get("training_policy")),
+            "final_target_clip": final_train_meta["target_clip"],
             "final_train_window": {
                 "start": str(final_train_df.index.min().date()),
                 "end": str(final_train_df.index.max().date()),
@@ -701,6 +817,8 @@ def main():
         "lgbm_param_preset": args.lgbm_param_preset,
         "lgbm_params_json": args.lgbm_params_json,
         "lgbm_params": lgbm_params,
+        "training_policy": resolve_training_policy(),
+        "direction_mode": DEFAULT_DIRECTION_MODE,
         "regime_score": {
             "enabled": True,
             "score_window": REGIME_SCORE_WINDOW,

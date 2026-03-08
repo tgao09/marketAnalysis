@@ -36,6 +36,7 @@ from gbm_return.train import (
     evaluate,
     extract_field,
     fetch_history_cached,
+    prepare_lgbm_training_data,
     resolve_sector_etf,
     select_feature_columns,
     set_time_index,
@@ -172,12 +173,14 @@ def run_candidate(candidate_feature_cols, selected_splits, lgbm_params):
     for split in selected_splits:
         train_df = set_time_index(split.train.copy(), split.train_start)
         test_df = set_time_index(split.test.copy(), split.train_start)
-        train_x = train_df[candidate_feature_cols]
-        train_y = train_df["target"]
+        train_x, train_y, sample_weight, _ = prepare_lgbm_training_data(
+            train_df,
+            candidate_feature_cols,
+        )
         test_x = test_df[candidate_feature_cols]
         test_y = test_df["target"]
 
-        model = train_lgbm(train_x, train_y, lgbm_params)
+        model = train_lgbm(train_x, train_y, lgbm_params, sample_weight=sample_weight)
         metrics = evaluate(model, test_x, test_y)
         fold_metrics.append(
             {
@@ -186,6 +189,7 @@ def run_candidate(candidate_feature_cols, selected_splits, lgbm_params):
                 "mse": metrics["mse"],
                 "mae_simple": metrics["mae_simple"],
                 "directional": metrics["directional"],
+                "corr": metrics["corr"],
                 "coverage_95": metrics["coverage_95"],
                 "avg_interval_width": metrics["avg_interval_width"],
             }

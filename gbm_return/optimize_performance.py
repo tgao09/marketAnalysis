@@ -35,6 +35,7 @@ DEFAULT_HOLDOUT_TOP_N = 15
 DEFAULT_MIN_BASKET_TRADES = 80
 DEFAULT_N_TRIALS = 300
 HARD_REJECT_SCORE = -1.0e12
+OBJECTIVE_TSTAT_WEIGHT = 0.001
 
 
 def parse_args():
@@ -152,17 +153,33 @@ def aggregate_basket_summary(ticker_summaries: dict[str, dict[str, Any]]) -> dic
     win_rate_values = collect("win_rate")
     avg_pnl_values = collect("avg_pnl")
     max_drawdowns = collect("max_drawdown")
+    return_tstats = collect("return_tstat")
+    trade_rates = collect("trade_rate")
     total_trades = sum(
         int(summary.get("total_trades", 0) or 0) for summary in ticker_summaries.values()
     )
-
-    return {
+    aggregate = {
         "basket_mean_avg_return_pct": float(np.mean(avg_return_values)) if avg_return_values else None,
         "basket_mean_win_rate": float(np.mean(win_rate_values)) if win_rate_values else None,
         "basket_mean_avg_pnl": float(np.mean(avg_pnl_values)) if avg_pnl_values else None,
         "basket_worst_max_drawdown": float(np.min(max_drawdowns)) if max_drawdowns else None,
+        "basket_mean_return_tstat": float(np.mean(return_tstats)) if return_tstats else None,
+        "basket_mean_trade_rate": float(np.mean(trade_rates)) if trade_rates else None,
         "basket_total_trades": int(total_trades),
     }
+    aggregate["basket_objective_score"] = compute_objective_score(aggregate)
+    return aggregate
+
+
+def compute_objective_score(aggregate: dict[str, Any]) -> float | None:
+    mean_ret = aggregate.get("basket_mean_avg_return_pct")
+    if mean_ret is None or not np.isfinite(float(mean_ret)):
+        return None
+    mean_tstat = aggregate.get("basket_mean_return_tstat")
+    tstat_bonus = 0.0
+    if mean_tstat is not None and np.isfinite(float(mean_tstat)):
+        tstat_bonus = OBJECTIVE_TSTAT_WEIGHT * float(mean_tstat)
+    return float(mean_ret) + tstat_bonus
 
 
 def drawdown_guardrail_violations(
@@ -231,15 +248,16 @@ def assess_candidate(
     guardrail_pass = len(violations) == 0
     total_trades = int(result["aggregate"].get("basket_total_trades") or 0)
     min_trades_pass = total_trades >= min_basket_trades
-    mean_ret = result["aggregate"].get("basket_mean_avg_return_pct")
-    has_return = mean_ret is not None and np.isfinite(float(mean_ret))
-    hard_reject = (not guardrail_pass) or (not min_trades_pass) or (not has_return)
+    objective_score = result["aggregate"].get("basket_objective_score")
+    has_objective = objective_score is not None and np.isfinite(float(objective_score))
+    hard_reject = (not guardrail_pass) or (not min_trades_pass) or (not has_objective)
     return {
         "guardrail_pass": guardrail_pass,
         "guardrail_violations": violations,
         "min_trades_pass": min_trades_pass,
         "min_basket_trades": int(min_basket_trades),
         "basket_total_trades": total_trades,
+        "basket_objective_score": objective_score,
         "hard_reject": hard_reject,
     }
 
@@ -252,6 +270,8 @@ def evaluate_candidate_on_end_date(
     feature_set: str,
     feature_set_file: str,
     lgbm_params: dict[str, Any],
+    training_policy: dict[str, Any],
+    direction_mode: str,
     lgbm_param_preset: str,
     lgbm_params_json: str | None,
     notional: float,
@@ -274,8 +294,12 @@ def evaluate_candidate_on_end_date(
             feature_set=feature_set,
             feature_set_file=feature_set_file,
             lgbm_params=lgbm_params,
+            training_policy=training_policy,
+            direction_mode=direction_mode,
             verbose=False,
         )
+        summary["training_policy"] = training_policy
+        summary["direction_mode"] = direction_mode
         summary["lgbm_param_preset"] = lgbm_param_preset
         summary["lgbm_params_json"] = lgbm_params_json
         ticker_summaries[ticker] = summary
@@ -552,9 +576,11 @@ def resolve_storage_uri(storage_arg: str | None, run_dir: Path) -> tuple[str, st
     return storage_uri, str(storage_path)
 
 
-def trial_params_from_optuna_params(params: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any]]:
+def trial_params_from_optuna_params(
+    params: dict[str, Any],
+) -> tuple[str, dict[str, Any], dict[str, Any], dict[str, Any], str]:
     feature_set = str(params.get("feature_set", FEATURE_SET_F0))
-    overrides = {
+    lgbm_overrides = {
         "learning_rate": float(params["learning_rate"]),
         "n_estimators": int(params["n_estimators"]),
         "num_leaves": int(params["num_leaves"]),
@@ -564,8 +590,17 @@ def trial_params_from_optuna_params(params: dict[str, Any]) -> tuple[str, dict[s
         "lambda_l1": float(params["lambda_l1"]),
         "lambda_l2": float(params["lambda_l2"]),
     }
-    resolved = resolve_lgbm_params("baseline", overrides=overrides)
-    return feature_set, overrides, resolved
+    resolved_lgbm = resolve_lgbm_params("baseline", overrides=lgbm_overrides)
+    clip_upper = float(params["target_clip_upper_quantile"])
+    training_policy = gbm_train.resolve_training_policy(
+        {
+            "target_clip_lower_quantile": 1.0 - clip_upper,
+            "target_clip_upper_quantile": clip_upper,
+            "recency_min_weight": float(params["recency_min_weight"]),
+        }
+    )
+    direction_mode = gbm_train.resolve_direction_mode(str(params["direction_mode"]))
+    return feature_set, lgbm_overrides, resolved_lgbm, training_policy, direction_mode
 
 
 def trial_record_for_report(record: dict[str, Any]) -> dict[str, Any]:
@@ -574,6 +609,8 @@ def trial_record_for_report(record: dict[str, Any]) -> dict[str, Any]:
         "objective_value": record.get("objective_value"),
         "feature_set": record.get("feature_set"),
         "params": record.get("params"),
+        "training_policy": record.get("training_policy"),
+        "direction_mode": record.get("direction_mode"),
         "aggregate": record.get("aggregate"),
         "assessment": record.get("assessment"),
         "error": record.get("error"),
@@ -599,10 +636,15 @@ def append_tech_results(
         f"- Search backend: `{report['search_backend']}`",
         f"- Winner feature set: `{winner['feature_set']}`",
         f"- Winner params: `{json.dumps(winner['params'], sort_keys=True)}`",
+        f"- Winner training policy: `{json.dumps(winner['training_policy'], sort_keys=True)}`",
+        f"- Winner direction mode: `{winner['direction_mode']}`",
         f"- Winner tuning basket mean avg_return_pct: `{winner['tune']['aggregate']['basket_mean_avg_return_pct']}`",
+        f"- Winner tuning objective score: `{winner['tune']['aggregate']['basket_objective_score']}`",
         f"- Winner holdout basket mean avg_return_pct: `{summary['basket_mean_avg_return_pct']}`",
+        f"- Winner holdout objective score: `{summary['basket_objective_score']}`",
         f"- Winner holdout basket worst max_drawdown: `{summary['basket_worst_max_drawdown']}`",
         f"- Baseline holdout basket mean avg_return_pct: `{report['baseline_holdout']['aggregate']['basket_mean_avg_return_pct']}`",
+        f"- Baseline holdout objective score: `{report['baseline_holdout']['aggregate']['basket_objective_score']}`",
         f"- F1 drops: `{', '.join(report['feature_sets']['F1']) if report['feature_sets']['F1'] else '(none)'}`",
         f"- F2 drops: `{', '.join(report['feature_sets']['F2']) if report['feature_sets']['F2'] else '(none)'}`",
     ]
@@ -635,6 +677,8 @@ def retrain_winner(
         "lgbm_param_preset": "baseline",
         "lgbm_params_json": None,
         "lgbm_params": winner["params"],
+        "training_policy": winner["training_policy"],
+        "direction_mode": winner["direction_mode"],
         "regime_score": {
             "enabled": True,
             "score_window": gbm_train.REGIME_SCORE_WINDOW,
@@ -675,6 +719,8 @@ def main():
 
     prepared_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
     baseline_params = resolve_lgbm_params("baseline")
+    baseline_training_policy = gbm_train.resolve_training_policy()
+    baseline_direction_mode = gbm_train.resolve_direction_mode()
     baseline_holdout = evaluate_candidate_on_end_date(
         tickers=tickers,
         end_date=baseline_end,
@@ -683,6 +729,8 @@ def main():
         feature_set=FEATURE_SET_F0,
         feature_set_file=feature_set_file,
         lgbm_params=baseline_params,
+        training_policy=baseline_training_policy,
+        direction_mode=baseline_direction_mode,
         lgbm_param_preset="baseline",
         lgbm_params_json=None,
         notional=args.notional,
@@ -696,6 +744,8 @@ def main():
         feature_set=FEATURE_SET_F0,
         feature_set_file=feature_set_file,
         lgbm_params=baseline_params,
+        training_policy=baseline_training_policy,
+        direction_mode=baseline_direction_mode,
         lgbm_param_preset="baseline",
         lgbm_params_json=None,
         notional=args.notional,
@@ -770,7 +820,7 @@ def main():
             "feature_set",
             [FEATURE_SET_F0, FEATURE_SET_F1, FEATURE_SET_F2],
         )
-        overrides = {
+        lgbm_overrides = {
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.10, log=True),
             "n_estimators": trial.suggest_int("n_estimators", 200, 1400, step=50),
             "num_leaves": trial.suggest_int("num_leaves", 15, 127),
@@ -780,7 +830,21 @@ def main():
             "lambda_l1": trial.suggest_float("lambda_l1", 0.0, 5.0),
             "lambda_l2": trial.suggest_float("lambda_l2", 0.0, 5.0),
         }
-        lgbm_params = resolve_lgbm_params("baseline", overrides=overrides)
+        lgbm_params = resolve_lgbm_params("baseline", overrides=lgbm_overrides)
+        clip_upper = trial.suggest_float("target_clip_upper_quantile", 0.96, 0.995, step=0.005)
+        training_policy = gbm_train.resolve_training_policy(
+            {
+                "target_clip_lower_quantile": 1.0 - clip_upper,
+                "target_clip_upper_quantile": clip_upper,
+                "recency_min_weight": trial.suggest_float("recency_min_weight", 0.2, 0.8, step=0.1),
+            }
+        )
+        direction_mode = gbm_train.resolve_direction_mode(
+            trial.suggest_categorical(
+                "direction_mode",
+                ["long_short", "long_only", "short_only"],
+            )
+        )
         result = evaluate_candidate_on_end_date(
             tickers=tickers,
             end_date=tune_end,
@@ -789,6 +853,8 @@ def main():
             feature_set=feature_set,
             feature_set_file=feature_set_file,
             lgbm_params=lgbm_params,
+            training_policy=training_policy,
+            direction_mode=direction_mode,
             lgbm_param_preset="baseline",
             lgbm_params_json=None,
             notional=args.notional,
@@ -800,16 +866,18 @@ def main():
             drawdown_worsen_limit=args.drawdown_worsen_limit,
             min_basket_trades=args.min_basket_trades,
         )
-        base_ret = result["aggregate"].get("basket_mean_avg_return_pct")
-        if assessment["hard_reject"] or base_ret is None:
+        candidate_score = result["aggregate"].get("basket_objective_score")
+        if assessment["hard_reject"] or candidate_score is None:
             score = HARD_REJECT_SCORE
         else:
-            score = float(base_ret)
+            score = float(candidate_score)
 
         record = {
             "trial_number": trial.number,
             "feature_set": feature_set,
             "params": lgbm_params,
+            "training_policy": training_policy,
+            "direction_mode": direction_mode,
             "aggregate": result["aggregate"],
             "tickers": result["tickers"],
             "assessment": assessment,
@@ -833,12 +901,16 @@ def main():
         if cached is not None:
             tune_ranked.append(cached)
             continue
-        feature_set, _, resolved = trial_params_from_optuna_params(trial.params)
+        feature_set, _, resolved, training_policy, direction_mode = trial_params_from_optuna_params(
+            trial.params
+        )
         tune_ranked.append(
             {
                 "trial_number": trial.number,
                 "feature_set": feature_set,
                 "params": resolved,
+                "training_policy": training_policy,
+                "direction_mode": direction_mode,
                 "aggregate": trial.user_attrs.get("aggregate"),
                 "assessment": trial.user_attrs.get("assessment"),
                 "objective_value": float(trial.value if trial.value is not None else HARD_REJECT_SCORE),
@@ -868,16 +940,20 @@ def main():
         f"Validating top {len(top_trials)} Optuna trials on holdout date: {holdout_end.date()}..."
     )
     holdout_validations = []
-    baseline_holdout_mean = baseline_holdout["aggregate"]["basket_mean_avg_return_pct"]
+    baseline_holdout_score = baseline_holdout["aggregate"]["basket_objective_score"]
     promoted = None
     for trial in top_trials:
         tune_record = next((item for item in tune_ranked if item["trial_number"] == trial.number), None)
         if tune_record is None:
-            feature_set, _, resolved = trial_params_from_optuna_params(trial.params)
+            feature_set, _, resolved, training_policy, direction_mode = trial_params_from_optuna_params(
+                trial.params
+            )
             tune_record = {
                 "trial_number": trial.number,
                 "feature_set": feature_set,
                 "params": resolved,
+                "training_policy": training_policy,
+                "direction_mode": direction_mode,
                 "objective_value": float(trial.value if trial.value is not None else HARD_REJECT_SCORE),
             }
 
@@ -889,6 +965,8 @@ def main():
             feature_set=tune_record["feature_set"],
             feature_set_file=feature_set_file,
             lgbm_params=tune_record["params"],
+            training_policy=tune_record["training_policy"],
+            direction_mode=tune_record["direction_mode"],
             lgbm_param_preset="baseline",
             lgbm_params_json=None,
             notional=args.notional,
@@ -901,12 +979,12 @@ def main():
             min_basket_trades=args.min_basket_trades,
         )
         holdout_pass = not holdout_assessment["hard_reject"]
-        holdout_mean = holdout_eval["aggregate"]["basket_mean_avg_return_pct"]
+        holdout_score = holdout_eval["aggregate"]["basket_objective_score"]
         beats_baseline = (
             holdout_pass
-            and holdout_mean is not None
-            and baseline_holdout_mean is not None
-            and float(holdout_mean) > float(baseline_holdout_mean)
+            and holdout_score is not None
+            and baseline_holdout_score is not None
+            and float(holdout_score) > float(baseline_holdout_score)
         )
         item = {
             "trial_number": int(trial.number),
@@ -927,6 +1005,11 @@ def main():
             promoted = max(
                 population,
                 key=lambda item: (
+                    float(
+                        item["holdout"]["aggregate"]["basket_objective_score"]
+                        if item["holdout"]["aggregate"]["basket_objective_score"] is not None
+                        else float("-inf")
+                    ),
                     float(
                         item["holdout"]["aggregate"]["basket_mean_avg_return_pct"]
                         if item["holdout"]["aggregate"]["basket_mean_avg_return_pct"] is not None
@@ -952,6 +1035,8 @@ def main():
             "objective_value": winner_candidate["objective_value"],
             "feature_set": winner_candidate["feature_set"],
             "params": winner_candidate["params"],
+            "training_policy": winner_candidate["training_policy"],
+            "direction_mode": winner_candidate["direction_mode"],
             "tune": {
                 "aggregate": winner_candidate.get("aggregate"),
                 "tickers": winner_candidate.get("tickers"),
@@ -988,6 +1073,8 @@ def main():
                 feature_set=winner["feature_set"],
                 feature_set_file=feature_set_file,
                 lgbm_params=winner["params"],
+                training_policy=winner["training_policy"],
+                direction_mode=winner["direction_mode"],
                 output_dir=optimized_output_dir,
                 lgbm_param_preset="baseline",
                 lgbm_params_json=None,
