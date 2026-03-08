@@ -41,6 +41,7 @@ from gp_return.train import (
 
 DEFAULT_TEST_YEARS = 1
 MIN_TRAIN_ROWS = 60
+MIN_ABS_PRED_MEAN_LOG = 0.01
 
 
 def parse_args():
@@ -163,6 +164,8 @@ def summarize_trades(trades: pd.DataFrame):
         "std_pnl": float(pnl.std(ddof=1)) if len(pnl) > 1 else 0.0,
         "max_drawdown": max_drawdown,
     }
+
+
 def main():
     args = parse_args()
     device = resolve_device()
@@ -205,6 +208,7 @@ def main():
     test_dates = candidates.index
     dataset_index = dataset.index
     trades = []
+    filtered_out_signals = 0
     for test_date in test_dates:
         test_pos = int(dataset_index.searchsorted(test_date, side="left"))
         train_end_pos = test_pos - WINDOW_RET - 1
@@ -246,6 +250,16 @@ def main():
             preds = likelihood(model(test_x))
             mean_log = float(preds.mean.item())
             std_log = float(preds.variance.sqrt().item())
+        abs_mean_log = abs(mean_log)
+        mean_simple = math.exp(mean_log) - 1.0
+        if abs_mean_log < MIN_ABS_PRED_MEAN_LOG:
+            filtered_out_signals += 1
+            print(
+                f"{test_date.date()} | Train: {train_df.index.min().date()} -> {train_df.index.max().date()} | "
+                f"Pred: {mean_simple:+.2%} | Skipped by threshold "
+                f"({abs_mean_log:.6f} < {MIN_ABS_PRED_MEAN_LOG:.6f})"
+            )
+            continue
 
         direction = "long" if mean_log > 0.0 else "short"
         entry_close = float(candidates.at[test_date, "entry_close"])
@@ -255,7 +269,6 @@ def main():
         pnl_per_share = (exit_close - entry_close) if direction == "long" else (entry_close - exit_close)
         pnl = shares * pnl_per_share
         return_pct = pnl / args.notional
-        mean_simple = math.exp(mean_log) - 1.0
         actual_simple = (exit_close / entry_close) - 1.0
 
         trades.append(
@@ -270,6 +283,7 @@ def main():
                 "shares": shares,
                 "pnl_per_share": pnl_per_share,
                 "pred_mean_log": mean_log,
+                "abs_pred_mean_log": abs_mean_log,
                 "pred_std_log": std_log,
                 "pred_mean_simple": mean_simple,
                 "actual_simple_return": actual_simple,
@@ -285,7 +299,9 @@ def main():
             f"Pred: {mean_simple:+.2%} | PnL: {pnl:+.2f}"
         )
 
-    trades_df = pd.DataFrame(trades).sort_values("trade_date")
+    trades_df = pd.DataFrame(trades)
+    if not trades_df.empty:
+        trades_df = trades_df.sort_values("trade_date")
     summary = summarize_trades(trades_df)
     summary.update(
         {
@@ -297,7 +313,12 @@ def main():
             "test_years": DEFAULT_TEST_YEARS,
             "window_ret": WINDOW_RET,
             "notional": args.notional,
-            "avg_return_pct": float(trades_df["return_pct"].mean()),
+            "avg_return_pct": (
+                float(trades_df["return_pct"].mean()) if not trades_df.empty else None
+            ),
+            "candidate_trades": int(len(test_dates)),
+            "signals_filtered_by_threshold": int(filtered_out_signals),
+            "min_abs_pred_mean_log": float(MIN_ABS_PRED_MEAN_LOG),
             "pca_enabled": bool(args.pca),
             "artifact_variant": resolve_artifact_variant(args.pca),
         }
