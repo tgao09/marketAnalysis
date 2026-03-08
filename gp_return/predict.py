@@ -44,6 +44,11 @@ from gp_return.train import (
 def parse_args():
     parser = argparse.ArgumentParser(description="Predict next 5-day return with trained GP artifacts.")
     parser.add_argument(
+        "--tickers",
+        default=None,
+        help="Comma-separated ticker list. Falls back to interactive prompt when omitted.",
+    )
+    parser.add_argument(
         "--pca",
         action="store_true",
         help="Use PCA artifact variant (ticker/pca). Default uses regular variant (ticker/regular).",
@@ -51,12 +56,15 @@ def parse_args():
     return parser.parse_args()
 
 
-def prompt_tickers():
-    raw = input("Tickers to predict (comma separated): ").strip()
+def parse_tickers(raw: str) -> list[str]:
     if not raw:
         return []
-    tickers = [item.strip().upper() for item in raw.split(",") if item.strip()]
-    return tickers
+    return [item.strip().upper() for item in raw.split(",") if item.strip()]
+
+
+def prompt_tickers():
+    raw = input("Tickers to predict (comma separated): ").strip()
+    return parse_tickers(raw)
 
 
 def load_artifacts(artifact_dir: Path, device: torch.device, pca_enabled: bool):
@@ -136,25 +144,16 @@ def rebuild_latest_features(
     price_spy = extract_field(spy_history, "Close", TICKER_SPY)
     price_vix = extract_field(vix_history, "Close", TICKER_VIX)
 
-    features = build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix)
+    features = build_features(
+        price_stock,
+        volume_stock,
+        price_sector,
+        price_gld,
+        price_spy,
+        price_vix,
+        regime_config,
+    )
     target = build_target(price_stock)
-
-    # Keep regime inputs causal to avoid leaking future values.
-    price_spy_regime = price_spy.reindex(price_stock.index).ffill()
-    price_vix_regime = price_vix.reindex(price_stock.index).ffill()
-
-    if regime_config.get("enabled", True):
-        regime_score = compute_regime_score(
-            price_vix_regime,
-            price_spy_regime,
-            regime_config["score_window"],
-            regime_config["score_clip"],
-            regime_config["weights"],
-        )
-    else:
-        regime_score = pd.Series(0.0, index=price_stock.index, name="regime_score")
-
-    features["regime_score"] = regime_score
 
     dataset = features.join([target]).dropna()
     final_start = pd.Timestamp(config["final_train_window"]["start"])
@@ -237,7 +236,7 @@ def predict_next_window(artifact_dir: Path, device: torch.device, pca_enabled: b
 
 def main():
     args = parse_args()
-    tickers = prompt_tickers()
+    tickers = parse_tickers(args.tickers) if args.tickers else prompt_tickers()
     if not tickers:
         print("No ticker provided. Exiting.")
         return

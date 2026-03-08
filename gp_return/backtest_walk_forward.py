@@ -59,6 +59,12 @@ def parse_args():
     parser.add_argument("--train-iters", type=int, default=DEFAULT_TRAIN_ITERS)
     parser.add_argument("--train-window", default=DEFAULT_TRAIN_WINDOW)
     parser.add_argument(
+        "--threshold",
+        type=float,
+        default=MIN_ABS_PRED_MEAN_LOG,
+        help="Minimum absolute predicted log return required to enter a trade.",
+    )
+    parser.add_argument(
         "--include-time-index",
         action="store_true",
         help="Include time_index in features (default is to exclude).",
@@ -252,12 +258,12 @@ def main():
             std_log = float(preds.variance.sqrt().item())
         abs_mean_log = abs(mean_log)
         mean_simple = math.exp(mean_log) - 1.0
-        if abs_mean_log < MIN_ABS_PRED_MEAN_LOG:
+        if abs_mean_log < args.threshold:
             filtered_out_signals += 1
             print(
                 f"{test_date.date()} | Train: {train_df.index.min().date()} -> {train_df.index.max().date()} | "
                 f"Pred: {mean_simple:+.2%} | Skipped by threshold "
-                f"({abs_mean_log:.6f} < {MIN_ABS_PRED_MEAN_LOG:.6f})"
+                f"({abs_mean_log:.6f} < {args.threshold:.6f})"
             )
             continue
 
@@ -318,7 +324,7 @@ def main():
             ),
             "candidate_trades": int(len(test_dates)),
             "signals_filtered_by_threshold": int(filtered_out_signals),
-            "min_abs_pred_mean_log": float(MIN_ABS_PRED_MEAN_LOG),
+            "min_abs_pred_mean_log": float(args.threshold),
             "pca_enabled": bool(args.pca),
             "artifact_variant": resolve_artifact_variant(args.pca),
         }

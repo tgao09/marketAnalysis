@@ -47,6 +47,48 @@ KERNEL_BUILDERS = [
 def parse_args():
     parser = argparse.ArgumentParser(description="Train GP volatility model.")
     parser.add_argument(
+        "--train-window",
+        default=None,
+        help="Rolling train window like '2y'. Falls back to interactive config when omitted.",
+    )
+    parser.add_argument(
+        "--test-window",
+        choices=("1m", "2m"),
+        default=None,
+        help="Walk-forward test window. Also used for the default step window.",
+    )
+    parser.add_argument(
+        "--step-window",
+        choices=("1m", "2m"),
+        default=None,
+        help="Walk-forward step window. Defaults to --test-window when omitted.",
+    )
+    parser.add_argument(
+        "--train-iters",
+        type=int,
+        default=None,
+        help="Number of optimizer iterations for each GP fit.",
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        default=None,
+        help="Artifact output directory. Falls back to the standard artifacts folder.",
+    )
+    parser.add_argument(
+        "--kernel-mode",
+        choices=("default", "custom"),
+        default=None,
+        help="Use default kernel hyperparameters or provide custom values non-interactively.",
+    )
+    parser.add_argument(
+        "--kernel-equation",
+        default=None,
+        help="Kernel equation such as '1*2*4'. Falls back to the interactive default when omitted.",
+    )
+    parser.add_argument("--kernel-lengthscale", type=float, default=None)
+    parser.add_argument("--kernel-period-length", type=float, default=None)
+    parser.add_argument("--kernel-outputscale", type=float, default=None)
+    parser.add_argument(
         "--drop-time-index",
         action="store_true",
         help="Exclude time_index from training features.",
@@ -221,6 +263,42 @@ def get_config_interactive():
         "kernel": kernel_config,
     }
     return config
+
+
+def get_config_from_args(args):
+    custom_requested = args.kernel_mode == "custom" or any(
+        value is not None
+        for value in (
+            args.kernel_lengthscale,
+            args.kernel_period_length,
+            args.kernel_outputscale,
+        )
+    )
+    test_window = args.test_window or "1m"
+    step_window = args.step_window or test_window
+    kernel_config = {
+        "custom": custom_requested,
+        "lengthscale": args.kernel_lengthscale,
+        "period_length": args.kernel_period_length,
+        "outputscale": args.kernel_outputscale,
+        "equation": args.kernel_equation or DEFAULT_KERNEL_EQUATION,
+    }
+    return {
+        "ticker_target": TICKER_TARGET,
+        "ticker_gold": TICKER_GOLD,
+        "ticker_spy": TICKER_SPY,
+        "ticker_vix": TICKER_VIX,
+        "data_years": DATA_YEARS,
+        "window_vol": WINDOW_VOL,
+        "noise_window": NOISE_WINDOW,
+        "annualization": ANNUALIZATION,
+        "train_window": args.train_window or "2y",
+        "test_window": test_window,
+        "step_window": step_window,
+        "train_iters": args.train_iters or DEFAULT_TRAIN_ITERS,
+        "artifact_dir": args.artifact_dir or str(ARTIFACT_DIR_DEFAULT),
+        "kernel": kernel_config,
+    }
 
 
 def fetch_data(tickers, start_date, end_date):
@@ -553,7 +631,22 @@ def save_artifacts(
 
 def main():
     args = parse_args()
-    config = get_config_interactive()
+    uses_cli_config = any(
+        value is not None
+        for value in (
+            args.train_window,
+            args.test_window,
+            args.step_window,
+            args.train_iters,
+            args.artifact_dir,
+            args.kernel_mode,
+            args.kernel_equation,
+            args.kernel_lengthscale,
+            args.kernel_period_length,
+            args.kernel_outputscale,
+        )
+    )
+    config = get_config_from_args(args) if uses_cli_config else get_config_interactive()
     config["drop_time_index"] = args.drop_time_index
 
     end_date = pd.Timestamp.today().normalize()

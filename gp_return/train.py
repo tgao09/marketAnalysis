@@ -73,6 +73,11 @@ def resolve_device():
 def parse_args():
     parser = argparse.ArgumentParser(description="Train GP return model.")
     parser.add_argument(
+        "--tickers",
+        default=None,
+        help="Comma/space-separated ticker list. Falls back to interactive prompt when omitted.",
+    )
+    parser.add_argument(
         "--train-window",
         default=DEFAULT_TRAIN_WINDOW,
         help="Rolling train window like '2y', '18m', or '260d'.",
@@ -110,8 +115,7 @@ def build_pca_transformer() -> PCATransformer:
     )
 
 
-def prompt_tickers():
-    raw = input("Enter tickers (comma-separated): ").strip()
+def parse_tickers(raw: str) -> list[str]:
     tokens = [token.strip().upper() for token in re.split(r"[,\s]+", raw) if token.strip()]
     seen = set()
     tickers = []
@@ -120,6 +124,11 @@ def prompt_tickers():
             seen.add(token)
             tickers.append(token)
     return tickers
+
+
+def prompt_tickers():
+    raw = input("Enter tickers (comma-separated): ").strip()
+    return parse_tickers(raw)
 
 
 def resolve_sector_etf(ticker):
@@ -970,7 +979,10 @@ def main():
         args.drop_time_index = False
     # Validate early so invalid window strings fail before any data fetch/training.
     parse_window(args.train_window)
-    tickers = prompt_tickers()
+    tickers = parse_tickers(args.tickers) if args.tickers else prompt_tickers()
+    if not tickers:
+        print("No ticker provided. Exiting.")
+        return
     device = resolve_device()
     print(f"Using device: {device.type}")
 

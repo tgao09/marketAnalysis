@@ -1,3 +1,4 @@
+import argparse
 import json
 import math
 import pickle
@@ -37,8 +38,17 @@ from gbm_return.train import (
 )
 
 
-def prompt_tickers():
-    raw = input("Tickers to predict (comma/space separated): ").strip()
+def parse_args():
+    parser = argparse.ArgumentParser(description="Predict next 5-day return with trained GBM artifacts.")
+    parser.add_argument(
+        "--tickers",
+        default=None,
+        help="Comma/space-separated ticker list. Falls back to interactive prompt when omitted.",
+    )
+    return parser.parse_args()
+
+
+def parse_tickers(raw: str) -> list[str]:
     if not raw:
         return []
     tokens = [token.strip().upper() for token in re.split(r"[,\s]+", raw) if token.strip()]
@@ -49,6 +59,11 @@ def prompt_tickers():
             seen.add(token)
             tickers.append(token)
     return tickers
+
+
+def prompt_tickers():
+    raw = input("Tickers to predict (comma/space separated): ").strip()
+    return parse_tickers(raw)
 
 
 def load_artifacts(artifact_dir: Path):
@@ -157,7 +172,8 @@ def predict_next_window(artifact_dir: Path):
 
 
 def main():
-    tickers = prompt_tickers()
+    args = parse_args()
+    tickers = parse_tickers(args.tickers) if args.tickers else prompt_tickers()
     if not tickers:
         print("No ticker provided. Exiting.")
         return

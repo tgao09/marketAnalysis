@@ -616,7 +616,6 @@ def trial_record_for_report(record: dict[str, Any]) -> dict[str, Any]:
         "error": record.get("error"),
     }
 
-
 def append_tech_results(
     tech_path: Path,
     report: dict[str, Any],
@@ -653,8 +652,6 @@ def append_tech_results(
     else:
         existing = "# GBM Return Technical Notes"
     tech_path.write_text(existing + "\n" + "\n".join(section) + "\n")
-
-
 def retrain_winner(
     tickers: list[str],
     winner: dict[str, Any],
