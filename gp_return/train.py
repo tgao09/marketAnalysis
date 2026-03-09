@@ -450,6 +450,8 @@ class ReturnGPModel(gpytorch.models.ExactGP):
         train_y,
         likelihood,
         matern_nu: float = DEFAULT_MATERN_NU,
+        use_rq: bool = True,
+        use_linear: bool = True,
     ):
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ConstantMean()
@@ -458,10 +460,20 @@ class ReturnGPModel(gpytorch.models.ExactGP):
         kernels = [
             gpytorch.kernels.ScaleKernel(
                 gpytorch.kernels.MaternKernel(nu=matern_nu, ard_num_dims=ard_num_dims)
-            ),
-            # gpytorch.kernels.ScaleKernel(gpytorch.kernels.RQKernel(ard_num_dims=ard_num_dims)),
-            gpytorch.kernels.ScaleKernel(gpytorch.kernels.LinearKernel(ard_num_dims=ard_num_dims)),
+            )
         ]
+        if use_rq:
+            kernels.append(
+                gpytorch.kernels.ScaleKernel(
+                    gpytorch.kernels.RQKernel(ard_num_dims=ard_num_dims)
+                )
+            )
+        if use_linear:
+            kernels.append(
+                gpytorch.kernels.ScaleKernel(
+                    gpytorch.kernels.LinearKernel(ard_num_dims=ard_num_dims)
+                )
+            )
 
         covar_module = kernels[0]
         for kernel in kernels[1:]:
@@ -482,6 +494,8 @@ def train_gp(
     learning_rate: float = DEFAULT_LEARNING_RATE,
     weight_decay: float = DEFAULT_WEIGHT_DECAY,
     matern_nu: float = DEFAULT_MATERN_NU,
+    use_rq: bool = True,
+    use_linear: bool = True,
 ):
     device = train_x.device if device is None else device
     train_x = train_x.to(device)
@@ -493,6 +507,8 @@ def train_gp(
         train_y,
         likelihood,
         matern_nu=matern_nu,
+        use_rq=use_rq,
+        use_linear=use_linear,
     ).to(device)
 
     model.train()
