@@ -32,13 +32,15 @@ TICKER_SPY = "SPY"
 TICKER_VIX = "^VIX"
 WINDOW_RET = 5
 DATA_YEARS = 3
-DEFAULT_TRAIN_ITERS = 140
+DEFAULT_TRAIN_ITERS = 100
 DEFAULT_TRAIN_WINDOW = "2y"
 DEFAULT_TEST_WINDOW = "1m"
 DEFAULT_STEP_WINDOW = "1m"
-DEFAULT_LEARNING_RATE = 0.024631869668246882
-DEFAULT_WEIGHT_DECAY = 5.336375586115967e-06
+DEFAULT_LEARNING_RATE = 0.004612347544714488
+DEFAULT_WEIGHT_DECAY = 0.0002882805911430782
 DEFAULT_MATERN_NU = 2.5
+DEFAULT_RQ = False
+DEFAULT_LINEAR = False
 FEATURE_LOOKBACK_MAX = 60
 REGIME_SCORE_WINDOW = 252
 REGIME_SCORE_CLIP = 4.0
@@ -270,29 +272,29 @@ def build_features(
     # Stock returns (log) and summary stats
     # features["ret_1d"] = log_ret_stock
     features["ret_5d"] = compute_log_return(price_stock, WINDOW_RET)
-    features["ret_10d"] = compute_log_return(price_stock, 10)
-    ret_20d = compute_log_return(price_stock, 20)
+    # features["ret_10d"] = compute_log_return(price_stock, 10)
+    # ret_20d = compute_log_return(price_stock, 20)
     # features["ret_20d"] = ret_20d
-    features["ret_60d"] = compute_log_return(price_stock, 60)
+    # features["ret_60d"] = compute_log_return(price_stock, 60)
 
     # Stock volatility and standardized returns
     vol_5d = log_ret_stock.rolling(WINDOW_RET).std()
     vol_20d = log_ret_stock.rolling(20).std()
     # features["vol_5d"] = vol_5d
-    features["vol_10d"] = log_ret_stock.rolling(10).std()
+    # features["vol_10d"] = log_ret_stock.rolling(10).std()
     # features["vol_20d"] = vol_20d
-    features["vol_60d"] = log_ret_stock.rolling(60).std()
+    # features["vol_60d"] = log_ret_stock.rolling(60).std()
 
     # Volume and distribution shape
     # features["vol_chg_1d"] = volume_stock.pct_change()
-    features["skew_20d"] = log_ret_stock.rolling(20).skew()
+    # features["skew_20d"] = log_ret_stock.rolling(20).skew()
 
     # Trend, range, and volatility structure
-    features["stock_ma20_gap"] = (price_stock / price_stock.rolling(20).mean()) - 1.0
-    features["stock_ma60_gap"] = (price_stock / price_stock.rolling(60).mean()) - 1.0
+    # features["stock_ma20_gap"] = (price_stock / price_stock.rolling(20).mean()) - 1.0
+    # features["stock_ma60_gap"] = (price_stock / price_stock.rolling(60).mean()) - 1.0
     # roll_min_60 = price_stock.rolling(60).min()
-    roll_max_60 = price_stock.rolling(60).max()
-    features["drawdown_60d"] = (price_stock / roll_max_60) - 1.0
+    # roll_max_60 = price_stock.rolling(60).max()
+    # features["drawdown_60d"] = (price_stock / roll_max_60) - 1.0
     # features["momentum_5_20"] = features["ret_5d"] - ret_20d
     features["vol_ratio_5_20"] = (vol_5d / vol_20d).replace(
         [np.inf, -np.inf], np.nan
@@ -301,13 +303,13 @@ def build_features(
     # Sector ETF features
     # features["sector_ret_1d"] = log_ret_sector
     # features["sector_ret_5d"] = compute_log_return(price_sector, WINDOW_RET)
-    features["sector_vol_5d"] = log_ret_sector.rolling(WINDOW_RET).std()
-    features["rel_strength_sector_20d"] = ret_20d - compute_log_return(price_sector, 20)
+    # features["sector_vol_5d"] = log_ret_sector.rolling(WINDOW_RET).std()
+    # features["rel_strength_sector_20d"] = ret_20d - compute_log_return(price_sector, 20)
 
     # GLD features
     # features["gld_ret_1d"] = log_ret_gld
-    features["gld_ret_5d"] = compute_log_return(price_gld, WINDOW_RET)
-    features["gld_vol_5d"] = log_ret_gld.rolling(WINDOW_RET).std()
+    # features["gld_ret_5d"] = compute_log_return(price_gld, WINDOW_RET)
+    # features["gld_vol_5d"] = log_ret_gld.rolling(WINDOW_RET).std()
 
     # Market regime (SPY + VIX)
     features["spy_ret_5d"] = compute_log_return(price_spy, WINDOW_RET)
@@ -322,7 +324,7 @@ def build_features(
     quarter_len = quarter_len.replace(0, 1)
     phase = (2.0 * np.pi * day_in_quarter) / quarter_len
     # features["q_phase_sin"] = np.sin(phase)
-    features["q_phase_cos"] = np.cos(phase)
+    # features["q_phase_cos"] = np.cos(phase)
 
     if regime_config.get("enabled", True):
         features["regime_score"] = compute_regime_score(
@@ -332,8 +334,6 @@ def build_features(
             regime_config["score_clip"],
             regime_config["weights"],
         )
-    else:
-        features["regime_score"] = pd.Series(0.0, index=price_stock.index)
 
     return features
 
@@ -450,8 +450,8 @@ class ReturnGPModel(gpytorch.models.ExactGP):
         train_y,
         likelihood,
         matern_nu: float = DEFAULT_MATERN_NU,
-        use_rq: bool = True,
-        use_linear: bool = True,
+        use_rq: bool = DEFAULT_RQ,
+        use_linear: bool = DEFAULT_LINEAR,
     ):
         super().__init__(train_x, train_y, likelihood)
         self.mean_module = gpytorch.means.ConstantMean()
@@ -494,8 +494,8 @@ def train_gp(
     learning_rate: float = DEFAULT_LEARNING_RATE,
     weight_decay: float = DEFAULT_WEIGHT_DECAY,
     matern_nu: float = DEFAULT_MATERN_NU,
-    use_rq: bool = True,
-    use_linear: bool = True,
+    use_rq: bool = DEFAULT_RQ,
+    use_linear: bool = DEFAULT_LINEAR,
 ):
     device = train_x.device if device is None else device
     train_x = train_x.to(device)
@@ -859,6 +859,8 @@ def train_for_ticker(ticker, config, history_cache, device):
             learning_rate=config["learning_rate"],
             weight_decay=config["weight_decay"],
             matern_nu=config["kernel"]["matern_nu"],
+            use_rq=config["kernel"]["use_rq"],
+            use_linear=config["kernel"]["use_linear"],
         )
 
         metrics = evaluate(model, likelihood, test_x, test_y)
@@ -946,6 +948,8 @@ def train_for_ticker(ticker, config, history_cache, device):
         learning_rate=config["learning_rate"],
         weight_decay=config["weight_decay"],
         matern_nu=config["kernel"]["matern_nu"],
+        use_rq=config["kernel"]["use_rq"],
+        use_linear=config["kernel"]["use_linear"],
     )
 
     artifact_dir = Path(config["artifact_dir"]) / ticker / artifact_variant
@@ -1022,13 +1026,15 @@ def main():
             "pc_prefix": PCA_PC_PREFIX,
         },
         "regime_score": {
-            "enabled": True,
+            "enabled": False,
             "score_window": REGIME_SCORE_WINDOW,
             "score_clip": REGIME_SCORE_CLIP,
             "weights": REGIME_SCORE_WEIGHTS,
         },
         "kernel": {
             "matern_nu": DEFAULT_MATERN_NU,
+            "use_rq": DEFAULT_RQ,
+            "use_linear": DEFAULT_LINEAR,
         },
     }
 
