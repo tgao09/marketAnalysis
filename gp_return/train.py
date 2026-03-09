@@ -451,10 +451,20 @@ class ReturnGPModel(gpytorch.models.ExactGP):
         kernels = [
             gpytorch.kernels.ScaleKernel(
                 gpytorch.kernels.MaternKernel(nu=matern_nu, ard_num_dims=ard_num_dims)
-            ),
-            # gpytorch.kernels.ScaleKernel(gpytorch.kernels.RQKernel(ard_num_dims=ard_num_dims)),
-            gpytorch.kernels.ScaleKernel(gpytorch.kernels.LinearKernel(ard_num_dims=ard_num_dims)),
+            )
         ]
+        if use_rq:
+            kernels.append(
+                gpytorch.kernels.ScaleKernel(
+                    gpytorch.kernels.RQKernel(ard_num_dims=ard_num_dims)
+                )
+            )
+        if use_linear:
+            kernels.append(
+                gpytorch.kernels.ScaleKernel(
+                    gpytorch.kernels.LinearKernel(ard_num_dims=ard_num_dims)
+                )
+            )
 
         covar_module = kernels[0]
         for kernel in kernels[1:]:
@@ -488,6 +498,8 @@ def train_gp(
         train_y,
         likelihood,
         matern_nu=matern_nu,
+        use_rq=use_rq,
+        use_linear=use_linear,
     ).to(device)
 
     model.train()
