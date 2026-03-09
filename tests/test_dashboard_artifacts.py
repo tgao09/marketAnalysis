@@ -36,10 +36,12 @@ class ArtifactSnapshotTests(unittest.TestCase):
             tmp = Path(tmpdir)
             summary_path = tmp / "gbm_return_summary.json"
             trades_path = tmp / "gbm_return_trades.csv"
-            summary_path.write_text(json.dumps({"avg_return_pct": 0.08, "avg_pnl": 120.0, "total_trades": 2}))
+            summary_path.write_text(json.dumps({"avg_return_pct": 0.08, "avg_pnl": 40.0, "total_trades": 2}))
             pd.DataFrame({"pnl": [100.0, -20.0]}).to_csv(trades_path, index=False)
             snapshot = collect_artifact_snapshot(spec, [summary_path, trades_path])
             self.assertEqual(snapshot["cards"]["avg_return_pct"], 0.08)
+            self.assertEqual(snapshot["cards"]["max_drawdown"], -20.0)
+            self.assertEqual(snapshot["cards"]["max_drawdown_pct"], 0.2)
             self.assertIn("cumulative_pnl", snapshot["series"])
 
     def test_optimization_snapshot_reads_final_report(self):

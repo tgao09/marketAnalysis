@@ -75,6 +75,21 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
+def _format_currency(value: float) -> str:
+    sign = "-" if value < 0 else ""
+    return f"{sign}${abs(value):,.2f}"
+
+
+def _format_card_value(key: str, scalars: dict[str, Any]) -> str:
+    value = scalars.get(key)
+    if key == "max_drawdown" and isinstance(value, (int, float)):
+        percent = scalars.get("max_drawdown_pct")
+        if isinstance(percent, (int, float)):
+            return f"{_format_currency(float(value))} ({percent:.2%})"
+        return _format_currency(float(value))
+    return _format_value(value)
+
+
 def _open_path(path: Path) -> None:
     if not path.exists():
         return
@@ -337,8 +352,14 @@ class WorkflowTab(ttk.Frame):
         self.last_run_card = snapshot
 
     def _render_cards(self, scalars: dict[str, Any]) -> None:
-        visible_keys = [key for key in CARD_LABELS if key in scalars][: len(self.card_frames)]
+        visible_keys = [
+            key
+            for key in CARD_LABELS
+            if key in scalars and not (key == "total_trades" and "max_drawdown" in scalars)
+        ][: len(self.card_frames)]
         card_values = {key: scalars[key] for key in visible_keys}
+        if "max_drawdown_pct" in scalars and "max_drawdown" in visible_keys:
+            card_values["max_drawdown_pct"] = scalars["max_drawdown_pct"]
         if card_values == self.last_card_values:
             return
         self.last_card_values = dict(card_values)
@@ -351,7 +372,7 @@ class WorkflowTab(ttk.Frame):
         for idx, key in enumerate(visible_keys):
             self.card_frames[idx].grid()
             self.card_label_vars[idx].set(CARD_LABELS[key])
-            self.card_value_vars[idx].set(_format_value(scalars[key]))
+            self.card_value_vars[idx].set(_format_card_value(key, scalars))
         for idx in range(len(visible_keys), len(self.card_frames)):
             self.card_frames[idx].grid_remove()
 
@@ -438,16 +459,20 @@ class WorkflowTab(ttk.Frame):
             self.axis_primary.text(0.5, 0.5, "Waiting for loss output", ha="center", va="center", transform=self.axis_primary.transAxes)
         self.axis_primary.set_title("Training Loss")
 
-        metric_keys = [key for key in ("mae", "mse", "mae_simple", "directional", "coverage_95") if key in state.series]
-        colors = ["#2563eb", "#f59e0b", "#7c3aed", "#ef4444", "#059669"]
-        for key, color in zip(metric_keys, colors):
-            points = state.series[key]
-            self.axis_secondary.plot([x for x, _ in points], [y for _, y in points], marker="o", label=key, color=color)
-        self.axis_secondary.set_title("Fold Metrics")
-        if metric_keys:
-            self.axis_secondary.legend(loc="best")
+        mae_points = {x: y for x, y in state.series.get("mae", [])}
+        directional_points = {x: y for x, y in state.series.get("directional", [])}
+        shared_folds = sorted(set(mae_points) & set(directional_points))
+        if shared_folds:
+            self.axis_secondary.scatter(
+                [mae_points[fold] for fold in shared_folds],
+                [directional_points[fold] for fold in shared_folds],
+                color="#2563eb",
+            )
+            self.axis_secondary.set_xlabel("MAE")
+            self.axis_secondary.set_ylabel("Directional")
         else:
-            self.axis_secondary.text(0.5, 0.5, "Fold metrics will appear here", ha="center", va="center", transform=self.axis_secondary.transAxes)
+            self.axis_secondary.text(0.5, 0.5, "MAE and directional pairs will appear here", ha="center", va="center", transform=self.axis_secondary.transAxes)
+        self.axis_secondary.set_title("MAE vs Directional")
 
     def _draw_optimization(self, state: RunState) -> None:
         objectives = state.series.get("objective", [])

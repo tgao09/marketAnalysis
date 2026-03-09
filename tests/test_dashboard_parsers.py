@@ -57,6 +57,8 @@ class LineParserTests(unittest.TestCase):
         self.assertEqual(scalar_values["cumulative_pnl"], 12.5)
         self.assertEqual(scalar_values["avg_pnl"], 12.5)
         self.assertEqual(scalar_values["win_rate"], 1.0)
+        self.assertEqual(scalar_values["max_drawdown"], 0.0)
+        self.assertEqual(scalar_values["max_drawdown_pct"], 0.0)
 
         events = parser.parse("2025-01-10 | Train: 2024-01-08 -> 2025-01-07 | Pred: -0.50% | PnL: -2.50")
         scalar_values = {
@@ -68,6 +70,8 @@ class LineParserTests(unittest.TestCase):
         self.assertEqual(scalar_values["cumulative_pnl"], 10.0)
         self.assertEqual(scalar_values["avg_pnl"], 5.0)
         self.assertEqual(scalar_values["win_rate"], 0.5)
+        self.assertEqual(scalar_values["max_drawdown"], -2.5)
+        self.assertEqual(scalar_values["max_drawdown_pct"], 0.2)
 
 
 if __name__ == "__main__":

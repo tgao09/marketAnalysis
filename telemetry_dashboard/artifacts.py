@@ -99,13 +99,20 @@ def collect_artifact_snapshot(spec: WorkflowSpec, artifact_paths: list[Path]) ->
                 cumulative_points = []
                 trade_points = []
                 cumulative = 0.0
+                peak = 0.0
+                max_drawdown = 0.0
                 for idx, pnl in enumerate(trades["pnl"].tolist(), start=1):
                     pnl_value = float(pnl)
                     cumulative += pnl_value
+                    peak = max(peak, cumulative)
+                    max_drawdown = min(max_drawdown, cumulative - peak)
                     trade_points.append((idx, pnl_value))
                     cumulative_points.append((idx, cumulative))
                 snapshot["series"]["trade_pnl"] = trade_points
                 snapshot["series"]["cumulative_pnl"] = cumulative_points
+                snapshot["cards"]["max_drawdown"] = snapshot["cards"].get("max_drawdown", max_drawdown)
+                if peak > 0:
+                    snapshot["cards"]["max_drawdown_pct"] = abs(max_drawdown) / peak
             snapshot["rows"].append({"label": "trades", "path": trades_path})
     elif spec.history_kind == "optimization_report":
         run_dir = None

@@ -59,6 +59,8 @@ class LineParser:
         self.trade_index = 0
         self.trade_wins = 0
         self.trade_cumulative_pnl = 0.0
+        self.trade_peak_cumulative_pnl = 0.0
+        self.trade_max_drawdown = 0.0
         self.prediction_index = 0
         self.best_objective: float | None = None
         self.current_prediction_label: str | None = None
@@ -142,6 +144,9 @@ class LineParser:
             pnl = float(trade_match.group("pnl"))
             pred = float(trade_match.group("pred")) / 100.0
             self.trade_cumulative_pnl += pnl
+            self.trade_peak_cumulative_pnl = max(self.trade_peak_cumulative_pnl, self.trade_cumulative_pnl)
+            current_drawdown = self.trade_cumulative_pnl - self.trade_peak_cumulative_pnl
+            self.trade_max_drawdown = min(self.trade_max_drawdown, current_drawdown)
             if pnl > 0:
                 self.trade_wins += 1
             events.append({"kind": "series", "name": "trade_pnl", "x": self.trade_index, "y": pnl})
@@ -150,6 +155,15 @@ class LineParser:
             events.append({"kind": "scalar", "name": "cumulative_pnl", "value": self.trade_cumulative_pnl})
             events.append({"kind": "scalar", "name": "avg_pnl", "value": self.trade_cumulative_pnl / self.trade_index})
             events.append({"kind": "scalar", "name": "win_rate", "value": self.trade_wins / self.trade_index})
+            events.append({"kind": "scalar", "name": "max_drawdown", "value": self.trade_max_drawdown})
+            if self.trade_peak_cumulative_pnl > 0:
+                events.append(
+                    {
+                        "kind": "scalar",
+                        "name": "max_drawdown_pct",
+                        "value": abs(self.trade_max_drawdown) / self.trade_peak_cumulative_pnl,
+                    }
+                )
 
         trial_match = OPTUNA_TRIAL_RE.search(stripped)
         if trial_match:
