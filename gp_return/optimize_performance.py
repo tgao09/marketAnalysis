@@ -19,7 +19,6 @@ if str(ROOT_DIR) not in sys.path:
 from common.walk_forward import walk_forward_splits
 from gp_return.backtest_walk_forward import (
     DEFAULT_TEST_YEARS,
-    build_backtest_pca_transformer,
     build_dataset,
     compute_dataset_start,
     summarize_trades,
@@ -27,6 +26,7 @@ from gp_return.backtest_walk_forward import (
 from gp_return.train import (
     ARTIFACT_DIR_DEFAULT,
     WINDOW_RET,
+    build_pca_transformer,
     normalize_features,
     resolve_device,
     select_feature_columns,
@@ -95,6 +95,16 @@ def write_json(path: Path, payload: dict[str, Any]):
     path.write_text(json.dumps(json_ready(payload), indent=2))
 
 
+def compute_objective_score(aggregate: dict[str, Any]) -> float | None:
+    mean_pnl = aggregate.get("basket_mean_avg_pnl")
+    if mean_pnl is None or not np.isfinite(float(mean_pnl)):
+        return None
+    max_drawdown = aggregate.get("basket_worst_max_drawdown")
+    if max_drawdown is None or not np.isfinite(float(max_drawdown)):
+        return float(mean_pnl)
+    return float(mean_pnl) - abs(float(max_drawdown))
+
+
 def aggregate_basket_summary(ticker_summaries: dict[str, dict[str, Any]]) -> dict[str, Any]:
     def collect(field: str):
         values = [
@@ -110,13 +120,15 @@ def aggregate_basket_summary(ticker_summaries: dict[str, dict[str, Any]]) -> dic
     max_drawdowns = collect("max_drawdown")
     total_trades = sum(int(summary.get("total_trades", 0) or 0) for summary in ticker_summaries.values())
 
-    return {
+    aggregate = {
         "basket_mean_avg_return_pct": float(np.mean(avg_return_values)) if avg_return_values else None,
         "basket_mean_win_rate": float(np.mean(win_rate_values)) if win_rate_values else None,
         "basket_mean_avg_pnl": float(np.mean(avg_pnl_values)) if avg_pnl_values else None,
         "basket_worst_max_drawdown": float(np.min(max_drawdowns)) if max_drawdowns else None,
         "basket_total_trades": int(total_trades),
     }
+    aggregate["basket_objective_score"] = compute_objective_score(aggregate)
+    return aggregate
 
 
 def drawdown_guardrail_violations(
@@ -241,7 +253,7 @@ def run_backtest_prepared_gp(
         test_df = set_time_index(test_df, fold_start)
 
         if pca_enabled:
-            fold_pca = build_backtest_pca_transformer()
+            fold_pca = build_pca_transformer()
             train_x_df, test_x_df = fold_pca.transform_train_test(train_df, test_df, feature_columns)
         else:
             train_x_df, test_x_df, _ = normalize_features(train_df, test_df, feature_columns)
@@ -482,13 +494,13 @@ def main():
             trial.set_user_attr("guardrail_violations", [{"reason": "no_features_selected"}])
             return PENALTY_SCORE
 
-        rolling_returns: list[float] = []
+        rolling_summaries: dict[str, dict[str, Any]] = {}
 
         def on_ticker_done(idx: int, _ticker: str, summary: dict[str, Any]):
-            avg_return = summary.get("avg_return_pct")
-            if avg_return is not None:
-                rolling_returns.append(float(avg_return))
-            intermediate = float(np.mean(rolling_returns)) if rolling_returns else PENALTY_SCORE
+            rolling_summaries[_ticker] = summary
+            intermediate = aggregate_basket_summary(rolling_summaries).get("basket_objective_score")
+            if intermediate is None:
+                intermediate = PENALTY_SCORE
             trial.report(intermediate, step=idx + 1)
             if trial.should_prune():
                 raise optuna.TrialPruned()
@@ -513,10 +525,8 @@ def main():
             worsen_limit=args.drawdown_worsen_limit,
         )
         guardrail_pass = len(violations) == 0
-        score = result["aggregate"]["basket_mean_avg_return_pct"]
+        score = result["aggregate"].get("basket_objective_score")
         if score is None:
-            score = PENALTY_SCORE
-        elif not guardrail_pass:
             score = PENALTY_SCORE
 
         trial.set_user_attr("aggregate", result["aggregate"])
@@ -535,7 +545,7 @@ def main():
     completed_trials.sort(key=lambda t: float(t.value if t.value is not None else PENALTY_SCORE), reverse=True)
     finalists = completed_trials[: max(1, args.holdout_top_n)]
 
-    baseline_holdout_mean = baseline_holdout["aggregate"]["basket_mean_avg_return_pct"]
+    baseline_holdout_score = baseline_holdout["aggregate"].get("basket_objective_score")
     holdout_validations: list[dict[str, Any]] = []
     for trial in finalists:
         model_params = dict(trial.user_attrs.get("model_params", {}))
@@ -559,12 +569,11 @@ def main():
             worsen_limit=args.drawdown_worsen_limit,
         )
         holdout_pass = len(holdout_violations) == 0
-        holdout_mean = holdout_result["aggregate"]["basket_mean_avg_return_pct"]
+        holdout_score = holdout_result["aggregate"].get("basket_objective_score")
         beats_baseline = (
-            holdout_pass
-            and holdout_mean is not None
-            and baseline_holdout_mean is not None
-            and holdout_mean > baseline_holdout_mean
+            holdout_score is not None
+            and baseline_holdout_score is not None
+            and holdout_score > baseline_holdout_score
         )
         holdout_validations.append(
             {
@@ -579,6 +588,7 @@ def main():
                     "guardrail_violations": trial.user_attrs.get("guardrail_violations"),
                 },
                 "holdout": holdout_result,
+                "holdout_score": holdout_score,
                 "holdout_guardrail_pass": holdout_pass,
                 "holdout_guardrail_violations": holdout_violations,
                 "beats_holdout_baseline": beats_baseline,
@@ -587,9 +597,8 @@ def main():
 
     holdout_validations.sort(
         key=lambda x: (
-            1 if x["holdout_guardrail_pass"] else 0,
-            x["holdout"]["aggregate"]["basket_mean_avg_return_pct"]
-            if x["holdout"]["aggregate"]["basket_mean_avg_return_pct"] is not None
+            x["holdout_score"]
+            if x["holdout_score"] is not None
             else PENALTY_SCORE,
         ),
         reverse=True,

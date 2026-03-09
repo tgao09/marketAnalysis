@@ -35,7 +35,6 @@ DEFAULT_HOLDOUT_TOP_N = 15
 DEFAULT_MIN_BASKET_TRADES = 80
 DEFAULT_N_TRIALS = 300
 HARD_REJECT_SCORE = -1.0e12
-OBJECTIVE_TSTAT_WEIGHT = 0.001
 
 
 def parse_args():
@@ -172,14 +171,13 @@ def aggregate_basket_summary(ticker_summaries: dict[str, dict[str, Any]]) -> dic
 
 
 def compute_objective_score(aggregate: dict[str, Any]) -> float | None:
-    mean_ret = aggregate.get("basket_mean_avg_return_pct")
-    if mean_ret is None or not np.isfinite(float(mean_ret)):
+    mean_pnl = aggregate.get("basket_mean_avg_pnl")
+    if mean_pnl is None or not np.isfinite(float(mean_pnl)):
         return None
-    mean_tstat = aggregate.get("basket_mean_return_tstat")
-    tstat_bonus = 0.0
-    if mean_tstat is not None and np.isfinite(float(mean_tstat)):
-        tstat_bonus = OBJECTIVE_TSTAT_WEIGHT * float(mean_tstat)
-    return float(mean_ret) + tstat_bonus
+    max_drawdown = aggregate.get("basket_worst_max_drawdown")
+    if max_drawdown is None or not np.isfinite(float(max_drawdown)):
+        return float(mean_pnl)
+    return float(mean_pnl) - abs(float(max_drawdown))
 
 
 def drawdown_guardrail_violations(
@@ -250,7 +248,7 @@ def assess_candidate(
     min_trades_pass = total_trades >= min_basket_trades
     objective_score = result["aggregate"].get("basket_objective_score")
     has_objective = objective_score is not None and np.isfinite(float(objective_score))
-    hard_reject = (not guardrail_pass) or (not min_trades_pass) or (not has_objective)
+    hard_reject = (not min_trades_pass) or (not has_objective)
     return {
         "guardrail_pass": guardrail_pass,
         "guardrail_violations": violations,
@@ -976,7 +974,7 @@ def main():
             min_basket_trades=args.min_basket_trades,
         )
         holdout_pass = not holdout_assessment["hard_reject"]
-        holdout_score = holdout_eval["aggregate"]["basket_objective_score"]
+        holdout_score = holdout_eval["aggregate"].get("basket_objective_score")
         beats_baseline = (
             holdout_pass
             and holdout_score is not None
