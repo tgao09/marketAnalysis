@@ -34,7 +34,6 @@ DEFAULT_OPTUNA_STUDY = "gbm_return_optuna"
 DEFAULT_HOLDOUT_TOP_N = 15
 DEFAULT_MIN_BASKET_TRADES = 80
 DEFAULT_N_TRIALS = 300
-HARD_REJECT_SCORE = -1.0e12
 
 
 def parse_args():
@@ -247,8 +246,6 @@ def assess_candidate(
     total_trades = int(result["aggregate"].get("basket_total_trades") or 0)
     min_trades_pass = total_trades >= min_basket_trades
     objective_score = result["aggregate"].get("basket_objective_score")
-    has_objective = objective_score is not None and np.isfinite(float(objective_score))
-    hard_reject = (not min_trades_pass) or (not has_objective)
     return {
         "guardrail_pass": guardrail_pass,
         "guardrail_violations": violations,
@@ -256,7 +253,6 @@ def assess_candidate(
         "min_basket_trades": int(min_basket_trades),
         "basket_total_trades": total_trades,
         "basket_objective_score": objective_score,
-        "hard_reject": hard_reject,
     }
 
 
@@ -862,10 +858,9 @@ def main():
             min_basket_trades=args.min_basket_trades,
         )
         candidate_score = result["aggregate"].get("basket_objective_score")
-        if assessment["hard_reject"] or candidate_score is None:
-            score = HARD_REJECT_SCORE
-        else:
-            score = float(candidate_score)
+        if candidate_score is None or not np.isfinite(float(candidate_score)):
+            raise optuna.TrialPruned("Candidate produced no objective score.")
+        score = float(candidate_score)
 
         record = {
             "trial_number": trial.number,
@@ -908,13 +903,13 @@ def main():
                 "direction_mode": direction_mode,
                 "aggregate": trial.user_attrs.get("aggregate"),
                 "assessment": trial.user_attrs.get("assessment"),
-                "objective_value": float(trial.value if trial.value is not None else HARD_REJECT_SCORE),
+                "objective_value": float(trial.value),
                 "error": trial.user_attrs.get("error"),
             }
         )
 
     tune_ranked.sort(
-        key=lambda x: float(x.get("objective_value", HARD_REJECT_SCORE)),
+        key=lambda x: float(x["objective_value"]),
         reverse=True,
     )
     write_json(
@@ -927,7 +922,7 @@ def main():
 
     top_trials = sorted(
         completed_trials,
-        key=lambda trial: float(trial.value if trial.value is not None else HARD_REJECT_SCORE),
+        key=lambda trial: float(trial.value),
         reverse=True,
     )[: max(1, args.holdout_top_n)]
 
@@ -936,7 +931,6 @@ def main():
     )
     holdout_validations = []
     baseline_holdout_score = baseline_holdout["aggregate"]["basket_objective_score"]
-    promoted = None
     for trial in top_trials:
         tune_record = next((item for item in tune_ranked if item["trial_number"] == trial.number), None)
         if tune_record is None:
@@ -949,7 +943,7 @@ def main():
                 "params": resolved,
                 "training_policy": training_policy,
                 "direction_mode": direction_mode,
-                "objective_value": float(trial.value if trial.value is not None else HARD_REJECT_SCORE),
+                "objective_value": float(trial.value),
             }
 
         holdout_eval = evaluate_candidate_on_end_date(
@@ -973,46 +967,35 @@ def main():
             drawdown_worsen_limit=args.drawdown_worsen_limit,
             min_basket_trades=args.min_basket_trades,
         )
-        holdout_pass = not holdout_assessment["hard_reject"]
         holdout_score = holdout_eval["aggregate"].get("basket_objective_score")
         beats_baseline = (
-            holdout_pass
-            and holdout_score is not None
+            holdout_score is not None
             and baseline_holdout_score is not None
             and float(holdout_score) > float(baseline_holdout_score)
         )
         item = {
             "trial_number": int(trial.number),
-            "objective_value": float(trial.value if trial.value is not None else HARD_REJECT_SCORE),
+            "objective_value": float(trial.value),
             "candidate": tune_record,
             "holdout": holdout_eval,
+            "holdout_score": holdout_score,
             "holdout_assessment": holdout_assessment,
             "beats_holdout_baseline": beats_baseline,
         }
         holdout_validations.append(item)
-        if promoted is None and beats_baseline:
-            promoted = item
 
-    if promoted is None:
-        eligible = [item for item in holdout_validations if not item["holdout_assessment"]["hard_reject"]]
-        population = eligible if eligible else holdout_validations
-        if population:
-            promoted = max(
-                population,
-                key=lambda item: (
-                    float(
-                        item["holdout"]["aggregate"]["basket_objective_score"]
-                        if item["holdout"]["aggregate"]["basket_objective_score"] is not None
-                        else float("-inf")
-                    ),
-                    float(
-                        item["holdout"]["aggregate"]["basket_mean_avg_return_pct"]
-                        if item["holdout"]["aggregate"]["basket_mean_avg_return_pct"] is not None
-                        else float("-inf")
-                    ),
-                    float(item["objective_value"]),
-                ),
-            )
+    holdout_validations.sort(
+        key=lambda item: (
+            float(item["holdout_score"]) if item["holdout_score"] is not None else float("-inf"),
+            float(
+                item["holdout"]["aggregate"]["basket_mean_avg_return_pct"]
+                if item["holdout"]["aggregate"]["basket_mean_avg_return_pct"] is not None
+                else float("-inf")
+            ),
+            float(item["objective_value"]),
+        ),
+        reverse=True,
+    )
 
     write_json(
         run_dir / "holdout_validations.json",
@@ -1023,7 +1006,8 @@ def main():
     )
 
     winner = None
-    if promoted is not None:
+    if holdout_validations:
+        promoted = holdout_validations[0]
         winner_candidate = promoted["candidate"]
         winner = {
             "trial_number": winner_candidate["trial_number"],
@@ -1088,8 +1072,8 @@ def main():
     holdout_assessments = [item["holdout_assessment"] for item in holdout_validations]
     tune_guardrail_pass = sum(1 for item in tune_assessments if item.get("guardrail_pass"))
     holdout_guardrail_pass = sum(1 for item in holdout_assessments if item.get("guardrail_pass"))
-    tune_hard_reject = sum(1 for item in tune_assessments if item.get("hard_reject"))
-    holdout_hard_reject = sum(1 for item in holdout_assessments if item.get("hard_reject"))
+    tune_min_trades_pass = sum(1 for item in tune_assessments if item.get("min_trades_pass"))
+    holdout_min_trades_pass = sum(1 for item in holdout_assessments if item.get("min_trades_pass"))
 
     report = {
         "run_id": run_id,
@@ -1132,10 +1116,12 @@ def main():
         "guardrail_stats": {
             "tune_guardrail_pass_count": tune_guardrail_pass,
             "tune_guardrail_fail_count": len(tune_assessments) - tune_guardrail_pass,
-            "tune_hard_reject_count": tune_hard_reject,
+            "tune_min_trades_pass_count": tune_min_trades_pass,
+            "tune_min_trades_fail_count": len(tune_assessments) - tune_min_trades_pass,
             "holdout_guardrail_pass_count": holdout_guardrail_pass,
             "holdout_guardrail_fail_count": len(holdout_assessments) - holdout_guardrail_pass,
-            "holdout_hard_reject_count": holdout_hard_reject,
+            "holdout_min_trades_pass_count": holdout_min_trades_pass,
+            "holdout_min_trades_fail_count": len(holdout_assessments) - holdout_min_trades_pass,
         },
         "winner": winner,
         "tune_top_10": [trial_record_for_report(item) for item in tune_ranked[:10]],

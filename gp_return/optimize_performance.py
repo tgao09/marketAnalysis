@@ -41,7 +41,6 @@ DEFAULT_TRIALS = 120
 DEFAULT_HOLDOUT_TOP_N = 20
 DEFAULT_DRAWDOWN_WORSEN_LIMIT = 0.10
 MIN_TRAIN_ROWS = 60
-PENALTY_SCORE = -1e9
 
 
 def parse_args():
@@ -492,16 +491,15 @@ def main():
         if not selected_features:
             trial.set_user_attr("guardrail_pass", False)
             trial.set_user_attr("guardrail_violations", [{"reason": "no_features_selected"}])
-            return PENALTY_SCORE
+            raise optuna.TrialPruned("No features selected.")
 
         rolling_summaries: dict[str, dict[str, Any]] = {}
 
         def on_ticker_done(idx: int, _ticker: str, summary: dict[str, Any]):
             rolling_summaries[_ticker] = summary
             intermediate = aggregate_basket_summary(rolling_summaries).get("basket_objective_score")
-            if intermediate is None:
-                intermediate = PENALTY_SCORE
-            trial.report(intermediate, step=idx + 1)
+            if intermediate is not None and np.isfinite(float(intermediate)):
+                trial.report(float(intermediate), step=idx + 1)
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
@@ -526,8 +524,8 @@ def main():
         )
         guardrail_pass = len(violations) == 0
         score = result["aggregate"].get("basket_objective_score")
-        if score is None:
-            score = PENALTY_SCORE
+        if score is None or not np.isfinite(float(score)):
+            raise optuna.TrialPruned("Candidate produced no objective score.")
 
         trial.set_user_attr("aggregate", result["aggregate"])
         trial.set_user_attr("tickers", result["tickers"])
@@ -541,8 +539,8 @@ def main():
     trial_results = {"trial_count": len(study.trials), "trials": [trial_to_result(t) for t in study.trials]}
     write_json(run_dir / "trial_results.json", trial_results)
 
-    completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
-    completed_trials.sort(key=lambda t: float(t.value if t.value is not None else PENALTY_SCORE), reverse=True)
+    completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE and t.value is not None]
+    completed_trials.sort(key=lambda t: float(t.value), reverse=True)
     finalists = completed_trials[: max(1, args.holdout_top_n)]
 
     baseline_holdout_score = baseline_holdout["aggregate"].get("basket_objective_score")
@@ -597,9 +595,7 @@ def main():
 
     holdout_validations.sort(
         key=lambda x: (
-            x["holdout_score"]
-            if x["holdout_score"] is not None
-            else PENALTY_SCORE,
+            float(x["holdout_score"]) if x["holdout_score"] is not None else float("-inf"),
         ),
         reverse=True,
     )

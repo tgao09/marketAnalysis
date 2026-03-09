@@ -76,10 +76,9 @@ class OptimizePerformanceScoringTests(unittest.TestCase):
         )
 
         self.assertFalse(assessment["guardrail_pass"])
-        self.assertFalse(assessment["hard_reject"])
         self.assertAlmostEqual(assessment["basket_objective_score"], 50.0)
 
-    def test_gbm_assessment_still_hard_rejects_trade_count_failures(self):
+    def test_gbm_assessment_reports_trade_count_failures_without_rejecting(self):
         result = {
             "tickers": {"AAPL": {"max_drawdown": -50.0}},
             "aggregate": {
@@ -97,7 +96,7 @@ class OptimizePerformanceScoringTests(unittest.TestCase):
         )
 
         self.assertTrue(assessment["guardrail_pass"])
-        self.assertTrue(assessment["hard_reject"])
+        self.assertFalse(assessment["min_trades_pass"])
         self.assertAlmostEqual(assessment["basket_objective_score"], 25.0)
 
 
