@@ -14,12 +14,11 @@ from hmm_regime.train import (
     FEATURE_COLUMNS,
     build_market_dataset,
     build_state_output,
-    compute_dataset_start,
-    compute_filtered_canonical_probs,
-    compute_shift_probability,
     apply_scaler,
+    compute_dataset_start,
+    compute_filtered_state_probs,
+    compute_shift_probability,
     load_model_blob,
-    remap_transition_matrix,
 )
 
 
@@ -38,25 +37,25 @@ def main() -> None:
 
     asof_date = pd.Timestamp(args.date).normalize() if args.date else pd.Timestamp.today().normalize()
     train_window = blob["train_window"]
+    feature_columns = list(blob.get("feature_columns", FEATURE_COLUMNS))
     start_date = compute_dataset_start(asof_date, train_window, test_years=0)
     dataset = build_market_dataset(start_date, asof_date)
 
-    features = dataset[FEATURE_COLUMNS].dropna()
+    features = dataset[feature_columns].dropna()
     features = features.loc[:asof_date]
 
-    scaled = apply_scaler(features, blob["scaler"])
+    scaled = apply_scaler(features, blob["scaler"], feature_columns=feature_columns)
     model = blob["model"]
-    canonical_to_raw = [int(x) for x in blob["canonical_to_raw"]]
-
-    canonical_probs = compute_filtered_canonical_probs(model, scaled.values, canonical_to_raw)
-    canonical_transition = remap_transition_matrix(model.transmat_, canonical_to_raw)
-    shift_probability = compute_shift_probability(canonical_probs, canonical_transition)
+    state_probs = compute_filtered_state_probs(model, scaled.values)
+    transition_matrix = np.asarray(model.transmat_, dtype=float)
+    shift_probability = compute_shift_probability(state_probs, transition_matrix)
 
     states = build_state_output(
         index=features.index,
-        canonical_probs=canonical_probs,
+        state_probs=state_probs,
         shift_probability=shift_probability,
         asof_date=features.index.max(),
+        stress_state_id=int(blob.get("stress_state_id", 0)),
     )
     latest = states.iloc[-1]
 
