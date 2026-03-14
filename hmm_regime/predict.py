@@ -11,7 +11,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from hmm_regime.train import (
     ARTIFACT_DIR_DEFAULT,
-    FEATURE_COLUMNS,
+    MARKET_NON_FEATURE_COLUMNS,
     build_market_dataset,
     build_state_output,
     apply_scaler,
@@ -37,14 +37,15 @@ def main() -> None:
 
     asof_date = pd.Timestamp(args.date).normalize() if args.date else pd.Timestamp.today().normalize()
     train_window = blob["train_window"]
-    feature_columns = list(blob.get("feature_columns", FEATURE_COLUMNS))
     start_date = compute_dataset_start(asof_date, train_window, test_years=0)
     dataset = build_market_dataset(start_date, asof_date)
 
-    features = dataset[feature_columns].dropna()
+    features = dataset.drop(columns=MARKET_NON_FEATURE_COLUMNS, errors="ignore").dropna()
+    if blob.get("feature_columns"):
+        features = features.loc[:, list(blob["feature_columns"])]
     features = features.loc[:asof_date]
 
-    scaled = apply_scaler(features, blob["scaler"], feature_columns=feature_columns)
+    scaled = apply_scaler(features, blob["scaler"])
     model = blob["model"]
     state_probs = compute_filtered_state_probs(model, scaled.values)
     transition_matrix = np.asarray(model.transmat_, dtype=float)

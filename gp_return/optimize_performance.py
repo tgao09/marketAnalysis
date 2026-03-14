@@ -29,8 +29,6 @@ from gp_return.train import (
     build_pca_transformer,
     normalize_features,
     resolve_device,
-    select_feature_columns,
-    set_time_index,
     train_gp,
 )
 
@@ -227,11 +225,7 @@ def prepare_backtest_data(
         "eval_start": eval_start,
         "dataset": dataset,
         "splits": selected_splits,
-        "base_feature_columns": select_feature_columns(
-            dataset=dataset,
-            drop_time_index=True,
-            pca_enabled=pca_enabled,
-        ),
+        "base_feature_columns": list(data["feature_columns"]),
     }
 
 
@@ -247,9 +241,6 @@ def run_backtest_prepared_gp(
     for split in prepared["splits"]:
         train_df = split.train.copy()
         test_df = split.test.copy()
-        fold_start = train_df.index.min()
-        train_df = set_time_index(train_df, fold_start)
-        test_df = set_time_index(test_df, fold_start)
 
         if pca_enabled:
             fold_pca = build_pca_transformer()

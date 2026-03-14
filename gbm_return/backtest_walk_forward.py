@@ -15,6 +15,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from common import parse_window
 from gbm_return.configuration import (
+    apply_feature_set,
     FEATURE_SET_CHOICES,
     FEATURE_SET_F0,
     resolve_lgbm_params,
@@ -38,7 +39,6 @@ from gbm_return.train import (
     resolve_direction_mode,
     resolve_sector_etf,
     resolve_artifact_variant,
-    select_feature_columns,
     set_time_index,
     train_lgbm,
 )
@@ -155,6 +155,7 @@ def build_dataset(
     close_stock = price_stock.reindex(dataset.index)
     return {
         "dataset": dataset,
+        "feature_columns": [*features.columns, "regime_score"],
         "close": close_stock,
         "sector_etf": sector_etf,
         "sector_name": sector_name,
@@ -242,6 +243,7 @@ def prepare_backtest_data(
         "candidates": candidates,
         "test_dates": test_dates,
         "dataset_index": dataset.index,
+        "feature_columns": data["feature_columns"],
         "sector_etf": data["sector_etf"],
         "sector_name": data["sector_name"],
     }
@@ -264,12 +266,19 @@ def run_backtest_prepared(
     dataset_index = prepared["dataset_index"]
     train_offset = parse_window(prepared["train_window"])
 
-    feature_cols = select_feature_columns(
-        dataset=dataset,
-        drop_time_index=not include_time_index,
+    feature_cols = list(prepared["feature_columns"])
+    if not include_time_index:
+        feature_cols = [col for col in feature_cols if col != "time_index"]
+    feature_cols, missing = apply_feature_set(
+        feature_cols=feature_cols,
         feature_set=feature_set,
         feature_set_file=feature_set_file,
     )
+    if missing:
+        print(
+            f"feature_set={feature_set}: ignoring drop features not present in current columns: "
+            f"{', '.join(missing)}"
+        )
     resolved_direction_mode = resolve_direction_mode(direction_mode)
 
     trades = []

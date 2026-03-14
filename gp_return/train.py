@@ -52,17 +52,6 @@ PCA_MODE = "replace"
 PCA_PC_PREFIX = "pc_"
 ARTIFACT_VARIANT_REGULAR = "regular"
 ARTIFACT_VARIANT_PCA = "pca"
-PCA_ANALYSIS_EXTRA_FEATURES = [
-    "ret_20d",
-    "vol_chg_1d",
-    "momentum_5_20",
-    "sector_ret_1d",
-    "gld_ret_1d",
-    "vix_level",
-    "corr_spy_60d",
-]
-
-
 def resolve_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -85,21 +74,10 @@ def parse_args():
         help="Rolling train window like '2y', '18m', or '260d'.",
     )
     parser.add_argument(
-        "--drop-time-index",
-        action="store_true",
-        help="Exclude time_index from training features (default).",
-    )
-    parser.add_argument(
-        "--include-time-index",
-        action="store_true",
-        help="Include time_index in training features.",
-    )
-    parser.add_argument(
         "--pca",
         action="store_true",
         help="Enable PCA preprocessing pipeline (saved under ticker/pca artifacts).",
     )
-    parser.set_defaults(drop_time_index=True)
     return parser.parse_args()
 
 
@@ -338,12 +316,6 @@ def build_features(
     return features
 
 
-def set_time_index(features, start_date):
-    features = features.copy()
-    # features["time_index"] = (features.index - start_date).days.astype(int)
-    return features
-
-
 def build_target(price_stock):
     forward_price = price_stock.shift(-WINDOW_RET)
     ratio = forward_price / price_stock
@@ -402,27 +374,24 @@ def validate_alignment_and_nan(
         )
 
 
-def normalize_features(train_df, test_df, feature_cols):
-    mean = train_df[feature_cols].mean()
-    std = train_df[feature_cols].std().replace(0.0, 1.0)
+def normalize_features(train_df, test_df, feature_cols=None):
+    if feature_cols is not None:
+        base_train = train_df[list(feature_cols)]
+        base_test = test_df[list(feature_cols)]
+    else:
+        base_train = train_df.drop(columns=["target"])
+        base_test = test_df.drop(columns=["target"])
+    mean = base_train.mean()
+    std = base_train.std().replace(0.0, 1.0)
 
-    train_x = (train_df[feature_cols] - mean) / std
-    test_x = (test_df[feature_cols] - mean) / std
+    train_x = (base_train - mean) / std
+    test_x = (base_test - mean) / std
 
     scaler = {
         "mean": mean.to_dict(),
         "std": std.to_dict(),
     }
     return train_x, test_x, scaler
-
-
-def select_feature_columns(dataset: pd.DataFrame, drop_time_index: bool, pca_enabled: bool) -> list[str]:
-    feature_cols = [col for col in dataset.columns if col != "target"]
-    if drop_time_index:
-        feature_cols = [col for col in feature_cols if col != "time_index"]
-    if not pca_enabled:
-        feature_cols = [col for col in feature_cols if col not in PCA_ANALYSIS_EXTRA_FEATURES]
-    return feature_cols
 
 
 def latest_train_window(data, train_window, min_train_rows=60):
@@ -667,7 +636,6 @@ def save_artifacts(
     summary_metrics,
     config,
     feature_cols,
-    raw_feature_cols,
     train_x,
     train_y,
     model_init_kwargs,
@@ -685,7 +653,6 @@ def save_artifacts(
             "model_state_dict": model.state_dict(),
             "likelihood_state_dict": likelihood.state_dict(),
             "feature_columns": feature_cols,
-            "raw_feature_columns": raw_feature_cols,
             "train_inputs": train_x.detach().cpu(),
             "train_targets": train_y.detach().cpu(),
             "model_init_kwargs": model_init_kwargs,
@@ -799,11 +766,6 @@ def train_for_ticker(ticker, config, history_cache, device):
         )
 
     pca_enabled = bool(config.get("pca", {}).get("enabled", False))
-    feature_cols = select_feature_columns(
-        dataset=dataset,
-        drop_time_index=bool(config.get("drop_time_index", True)),
-        pca_enabled=pca_enabled,
-    )
     artifact_variant = resolve_artifact_variant(pca_enabled)
 
     splits = list(
@@ -823,17 +785,21 @@ def train_for_ticker(ticker, config, history_cache, device):
 
     print(f"\nTraining {ticker} (sector ETF: {sector_etf}, variant: {artifact_variant})")
     for split in splits:
-        train_df = set_time_index(split.train.copy(), split.train_start)
-        test_df = set_time_index(split.test.copy(), split.train_start)
+        train_df = split.train.copy()
+        test_df = split.test.copy()
 
         if pca_enabled:
             fold_pca = build_pca_transformer()
-            train_x_df, test_x_df = fold_pca.transform_train_test(train_df, test_df, feature_cols)
+            train_x_df, test_x_df = fold_pca.transform_train_test(
+                train_df,
+                test_df,
+                list(train_df.drop(columns=["target"]).columns),
+            )
             model_feature_cols = train_x_df.columns.tolist()
             fold_pca_k = int(fold_pca.k_selected_ or 0)
         else:
-            train_x_df, test_x_df, _ = normalize_features(train_df, test_df, feature_cols)
-            model_feature_cols = list(feature_cols)
+            train_x_df, test_x_df, _ = normalize_features(train_df, test_df)
+            model_feature_cols = train_x_df.columns.tolist()
             fold_pca_k = None
 
         if split.fold == 1:
@@ -918,21 +884,19 @@ def train_for_ticker(ticker, config, history_cache, device):
         train_window=config["train_window"],
         min_train_rows=60,
     )
-    final_fold_start = final_train_raw.index.min()
-    final_train_df = set_time_index(final_train_raw.copy(), final_fold_start)
+    final_train_df = final_train_raw.copy()
     final_pca_transformer = None
     if pca_enabled:
-        final_pca_transformer = build_pca_transformer().fit(final_train_df, feature_cols)
+        final_pca_transformer = build_pca_transformer().fit(
+            final_train_df,
+            list(final_train_df.drop(columns=["target"]).columns),
+        )
         final_train_x_df = final_pca_transformer.transform(final_train_df)
         final_scaler = None
         final_model_feature_cols = final_train_x_df.columns.tolist()
     else:
-        final_train_x_df, _, final_scaler = normalize_features(
-            final_train_df,
-            final_train_df,
-            feature_cols,
-        )
-        final_model_feature_cols = list(feature_cols)
+        final_train_x_df, _, final_scaler = normalize_features(final_train_df, final_train_df)
+        final_model_feature_cols = final_train_x_df.columns.tolist()
     final_train_x = torch.tensor(final_train_x_df.values, dtype=torch.float32, device=device)
     final_train_y = torch.tensor(final_train_df["target"].values, dtype=torch.float32, device=device)
 
@@ -978,7 +942,6 @@ def train_for_ticker(ticker, config, history_cache, device):
         summary_metrics,
         config_out,
         final_model_feature_cols,
-        feature_cols,
         final_train_x,
         final_train_y,
         model_init_kwargs=config_out["kernel"],
@@ -995,8 +958,6 @@ def train_for_ticker(ticker, config, history_cache, device):
 
 def main():
     args = parse_args()
-    if args.include_time_index:
-        args.drop_time_index = False
     # Validate early so invalid window strings fail before any data fetch/training.
     parse_window(args.train_window)
     tickers = parse_tickers(args.tickers) if args.tickers else prompt_tickers()
@@ -1016,7 +977,6 @@ def main():
         "learning_rate": DEFAULT_LEARNING_RATE,
         "weight_decay": DEFAULT_WEIGHT_DECAY,
         "artifact_dir": str(ARTIFACT_DIR_DEFAULT),
-        "drop_time_index": args.drop_time_index,
         "pca": {
             "enabled": args.pca,
             "threshold": PCA_VAR_THRESHOLD,

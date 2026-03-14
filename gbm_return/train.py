@@ -264,7 +264,20 @@ def trading_day_in_quarter(index):
     return day_in_quarter, quarter_len
 
 
-def build_features(price_stock, price_sector, price_gld, price_spy, price_vix):
+def build_features(
+    price_stock,
+    price_sector,
+    price_gld,
+    price_spy,
+    price_vix,
+    drop_time_index: bool = True,
+    feature_set: str = FEATURE_SET_F0,
+    feature_set_file: str | None = None,
+    regime_score_enabled: bool = True,
+    regime_score_window: int = REGIME_SCORE_WINDOW,
+    regime_score_clip: float = REGIME_SCORE_CLIP,
+    regime_score_weights: dict | None = None,
+):
     index = price_stock.index
 
     price_sector = price_sector.reindex(index).ffill()
@@ -311,6 +324,16 @@ def build_features(price_stock, price_sector, price_gld, price_spy, price_vix):
     phase = (2.0 * np.pi * day_in_quarter) / quarter_len
     features["q_phase_sin"] = np.sin(phase)
     features["q_phase_cos"] = np.cos(phase)
+    if regime_score_enabled:
+        features["regime_score"] = compute_regime_score(
+            price_vix,
+            price_spy,
+            regime_score_window,
+            regime_score_clip,
+            regime_score_weights or REGIME_SCORE_WEIGHTS,
+        )
+    else:
+        features["regime_score"] = 0.0
 
     # features["vol_chg_1d"] = volume_stock.pct_change()
     # features["momentum_5_20"] = features["ret_5d"] - ret_20d
@@ -319,7 +342,19 @@ def build_features(price_stock, price_sector, price_gld, price_spy, price_vix):
     # features["vix_level"] = price_vix
     # features["corr_spy_60d"] = log_ret_stock.rolling(60).corr(log_ret_spy)
 
-    return features
+    if drop_time_index:
+        features = features.drop(columns=["time_index"])
+    selected, missing = apply_feature_set(
+        feature_cols=list(features.columns),
+        feature_set=feature_set,
+        feature_set_file=feature_set_file,
+    )
+    if missing:
+        print(
+            f"feature_set={feature_set}: ignoring drop features not present in current columns: "
+            f"{', '.join(missing)}"
+        )
+    return features.loc[:, selected]
 
 
 def set_time_index(features, start_date):
@@ -410,28 +445,6 @@ def select_feature_columns(
     )
     return feature_cols
 
-def select_feature_columns(
-    dataset: pd.DataFrame,
-    drop_time_index: bool,
-    feature_set: str = FEATURE_SET_F0,
-    feature_set_file: str | None = None,
-) -> list[str]:
-    feature_cols = [col for col in dataset.columns if col != "target"]
-    if drop_time_index:
-        feature_cols = [col for col in feature_cols if col != "time_index"]
-    feature_cols, missing = apply_feature_set(
-        feature_cols=feature_cols,
-        feature_set=feature_set,
-        feature_set_file=feature_set_file,
-    )
-    if missing:
-        print(
-            f"feature_set={feature_set}: ignoring drop features not present in current columns: "
-            f"{', '.join(missing)}"
-        )
-    return feature_cols
-
-
 def latest_train_window(data, train_window, min_train_rows=MIN_TRAIN_ROWS):
     if data.empty:
         raise ValueError("Cannot build final training window from empty dataset.")
@@ -478,11 +491,10 @@ def compute_recency_weights(index: pd.Index, min_weight: float) -> pd.Series:
 
 def prepare_lgbm_training_data(
     train_df: pd.DataFrame,
-    feature_cols: list[str],
     training_policy: dict | None = None,
 ):
     policy = resolve_training_policy(training_policy)
-    train_x = train_df[feature_cols]
+    train_x = train_df.drop(columns=["target"])
     clipped_target, clip_info = clip_target_series(train_df["target"], policy)
     sample_weight = compute_recency_weights(train_df.index, policy["recency_min_weight"])
     metadata = {
@@ -561,7 +573,7 @@ def save_artifacts(
     fold_metrics,
     summary_metrics,
     config,
-    feature_cols,
+    model_columns,
 ):
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -572,7 +584,7 @@ def save_artifacts(
 
     payload = {
         "model_str": model.booster_.model_to_string(),
-        "feature_columns": feature_cols,
+        "feature_columns": model_columns,
     }
     with model_path.open("wb") as fh:
         pickle.dump(payload, fh)
@@ -629,20 +641,22 @@ def build_model_dataset(ticker, config, history_cache):
     price_spy = extract_field(spy_history, "Close", TICKER_SPY)
     price_vix = extract_field(vix_history, "Close", TICKER_VIX)
 
-    features = build_features(price_stock, price_sector, price_gld, price_spy, price_vix)
-    target = build_target(price_stock)
     regime_cfg = config["regime_score"]
-
-    if regime_cfg.get("enabled", True):
-        regime_score = compute_regime_score(
-            price_vix.reindex(price_stock.index).ffill(),
-            price_spy.reindex(price_stock.index).ffill(),
-            regime_cfg["score_window"],
-            regime_cfg["score_clip"],
-            regime_cfg["weights"],
-        )
-    else:
-        regime_score = pd.Series(0.0, index=price_stock.index, name="regime_score")
+    features = build_features(
+        price_stock,
+        price_sector,
+        price_gld,
+        price_spy,
+        price_vix,
+        drop_time_index=bool(config.get("drop_time_index", True)),
+        feature_set=str(config.get("feature_set", FEATURE_SET_F0)),
+        feature_set_file=config.get("feature_set_file"),
+        regime_score_enabled=bool(regime_cfg.get("enabled", True)),
+        regime_score_window=int(regime_cfg["score_window"]),
+        regime_score_clip=float(regime_cfg["score_clip"]),
+        regime_score_weights=regime_cfg.get("weights"),
+    )
+    target = build_target(price_stock)
 
     validate_alignment_and_nan(
         ticker,
@@ -656,7 +670,6 @@ def build_model_dataset(ticker, config, history_cache):
     )
 
     dataset = features.join([target])
-    dataset["regime_score"] = regime_score
     before_rows = int(dataset.shape[0])
     nan_counts = dataset.isna().sum().sort_values(ascending=False)
     dataset = dataset.dropna()
@@ -683,12 +696,10 @@ def build_model_dataset(ticker, config, history_cache):
 
 
 def train_for_ticker(ticker, config, history_cache):
-    dataset, sector_etf, sector_name = build_model_dataset(ticker, config, history_cache)
-    feature_cols = select_feature_columns(
-        dataset=dataset,
-        drop_time_index=bool(config.get("drop_time_index", True)),
-        feature_set=str(config.get("feature_set", FEATURE_SET_F0)),
-        feature_set_file=config.get("feature_set_file"),
+    dataset, sector_etf, sector_name = build_model_dataset(
+        ticker,
+        config,
+        history_cache,
     )
 
     splits = list(
@@ -708,10 +719,9 @@ def train_for_ticker(ticker, config, history_cache):
         test_df = set_time_index(split.test.copy(), split.train_start)
         train_x, train_y, sample_weight, train_meta = prepare_lgbm_training_data(
             train_df,
-            feature_cols,
             config.get("training_policy"),
         )
-        test_x = test_df[feature_cols]
+        test_x = test_df.drop(columns=["target"])
         test_y = test_df["target"]
 
         model = train_lgbm(
@@ -761,7 +771,6 @@ def train_for_ticker(ticker, config, history_cache):
     final_train_df = set_time_index(final_train_raw.copy(), final_train_raw.index.min())
     final_train_x, final_train_y, final_sample_weight, final_train_meta = prepare_lgbm_training_data(
         final_train_df,
-        feature_cols,
         config.get("training_policy"),
     )
     final_model = train_lgbm(
@@ -780,7 +789,7 @@ def train_for_ticker(ticker, config, history_cache):
             "ticker": ticker,
             "sector": sector_name,
             "sector_etf": sector_etf,
-            "feature_columns": feature_cols,
+            "feature_columns": list(final_train_x.columns),
             "feature_set": config.get("feature_set", FEATURE_SET_F0),
             "feature_set_drop_features": configured_drop_features,
             "direction_mode": resolve_direction_mode(config.get("direction_mode")),
@@ -801,7 +810,7 @@ def train_for_ticker(ticker, config, history_cache):
         fold_metrics=fold_metrics,
         summary_metrics=summary_metrics,
         config=config_out,
-        feature_cols=feature_cols,
+        model_columns=list(final_train_x.columns),
     )
     return summary_metrics
 

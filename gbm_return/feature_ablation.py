@@ -14,6 +14,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from common import parse_window, walk_forward_splits
 from gbm_return.configuration import (
+    apply_feature_set,
     FEATURE_SET_CHOICES,
     FEATURE_SET_F0,
     resolve_lgbm_params,
@@ -38,7 +39,6 @@ from gbm_return.train import (
     fetch_history_cached,
     prepare_lgbm_training_data,
     resolve_sector_etf,
-    select_feature_columns,
     set_time_index,
     summarize_fold_metrics,
     train_lgbm,
@@ -136,7 +136,12 @@ def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp)
         raise ValueError(f"{ticker}: No rows left after feature/target alignment.")
     if dataset.index.has_duplicates:
         dataset = dataset.loc[~dataset.index.duplicated(keep="last")]
-    return {"dataset": dataset, "sector_etf": sector_etf, "sector_name": sector_name}
+    return {
+        "dataset": dataset,
+        "feature_columns": [*features.columns, "regime_score"],
+        "sector_etf": sector_etf,
+        "sector_name": sector_name,
+    }
 
 
 def select_last_6m_folds(all_splits, end_date, test_window, step_window):
@@ -371,12 +376,19 @@ def main():
         print(f"\nBuilding dataset for {ticker}...")
         data = build_dataset(ticker, dataset_start, end_date)
         dataset = data["dataset"]
-        baseline_feature_cols = select_feature_columns(
-            dataset=dataset,
-            drop_time_index=not args.include_time_index,
+        baseline_feature_cols = list(data["feature_columns"])
+        if not args.include_time_index:
+            baseline_feature_cols = [col for col in baseline_feature_cols if col != "time_index"]
+        baseline_feature_cols, missing = apply_feature_set(
+            feature_cols=baseline_feature_cols,
             feature_set=args.feature_set,
             feature_set_file=args.feature_set_file,
         )
+        if missing:
+            print(
+                f"feature_set={args.feature_set}: ignoring drop features not present in current columns: "
+                f"{', '.join(missing)}"
+            )
 
         all_splits = list(
             walk_forward_splits(

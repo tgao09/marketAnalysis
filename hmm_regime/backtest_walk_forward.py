@@ -18,11 +18,11 @@ from hmm_regime.train import (
     DEFAULT_MIN_TRAIN_ROWS,
     DEFAULT_N_INIT,
     DEFAULT_N_ITER,
+    MARKET_NON_FEATURE_COLUMNS,
     N_STATES,
     DEFAULT_RANDOM_STATE,
     DEFAULT_RETRAIN_CADENCE,
     DEFAULT_TRAIN_WINDOW,
-    FEATURE_COLUMNS,
     apply_scaler,
     build_market_dataset,
     build_state_output,
@@ -216,12 +216,13 @@ def infer_state_for_date(
     dataset: pd.DataFrame,
     target_date: pd.Timestamp,
 ) -> pd.Series:
-    feature_columns = list(bundle.get("feature_columns", FEATURE_COLUMNS))
-    eval_features = dataset.loc[
-        (dataset.index >= train_features.index.min()) & (dataset.index <= target_date),
-        feature_columns,
+    eval_features = dataset.drop(columns=MARKET_NON_FEATURE_COLUMNS, errors="ignore")
+    eval_features = eval_features.loc[
+        (eval_features.index >= train_features.index.min()) & (eval_features.index <= target_date)
     ].dropna()
-    scaled = apply_scaler(eval_features, bundle["scaler"], feature_columns=feature_columns)
+    if bundle.get("feature_columns"):
+        eval_features = eval_features.loc[:, list(bundle["feature_columns"])]
+    scaled = apply_scaler(eval_features, bundle["scaler"])
     state_probs = compute_filtered_state_probs(bundle["model"], scaled.values)
     transition_matrix = np.asarray(bundle["model"].transmat_, dtype=float)
     shift_probability = compute_shift_probability(state_probs, transition_matrix)
@@ -243,7 +244,8 @@ def main() -> None:
 
     print(f"Building dataset from {start_date.date()} to {end_date.date()}...")
     dataset = build_market_dataset(start_date, end_date)
-    usable_idx = dataset[FEATURE_COLUMNS].dropna().index
+    usable_features = dataset.drop(columns=MARKET_NON_FEATURE_COLUMNS, errors="ignore")
+    usable_idx = usable_features.dropna().index
     pred_dates = usable_idx[(usable_idx >= test_start) & (usable_idx <= end_date)]
     pred_dates = pred_dates[:: args.step_bdays]
 
@@ -259,7 +261,6 @@ def main() -> None:
                 asof_date=asof_date,
                 train_window=args.train_window,
                 min_train_rows=args.min_train_rows,
-                feature_columns=FEATURE_COLUMNS,
             )
             bundle = fit_hmm_bundle(
                 train_features=train_features,
@@ -338,7 +339,7 @@ def main() -> None:
         "generated_at": datetime.now(UTC).isoformat(),
         "model_type": "GaussianHMM",
         "n_states": N_STATES,
-        "feature_columns": FEATURE_COLUMNS,
+        "feature_columns": list(usable_features.columns),
         "train_window": args.train_window,
         "retrain_cadence": DEFAULT_RETRAIN_CADENCE,
         "test_start": str(pd.Timestamp(test_start).date()),

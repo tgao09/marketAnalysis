@@ -33,8 +33,6 @@ from gp_return.train import (
     resolve_artifact_variant,
     resolve_sector_etf,
     resolve_device,
-    select_feature_columns,
-    set_time_index,
     train_gp,
 )
 
@@ -64,12 +62,6 @@ def parse_args():
         default=MIN_ABS_PRED_MEAN_LOG,
         help="Minimum absolute predicted log return required to enter a trade.",
     )
-    parser.add_argument(
-        "--include-time-index",
-        action="store_true",
-        help="Include time_index in features (default is to exclude).",
-    )
-    parser.add_argument(
         "--pca",
         action="store_true",
         help="Enable fold-local PCA features for backtest and write outputs under ticker/pca.",
@@ -139,6 +131,7 @@ def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp)
 
     return {
         "dataset": dataset,
+        "feature_columns": list(features.columns),
         "close": close_stock,
         "sector_etf": sector_etf,
         "sector_name": sector_name,
@@ -191,11 +184,7 @@ def main():
     dataset = data["dataset"]
     close_stock = data["close"]
 
-    feature_cols = select_feature_columns(
-        dataset=dataset,
-        drop_time_index=not args.include_time_index,
-        pca_enabled=args.pca,
-    )
+    feature_cols = list(data["feature_columns"])
 
     index_series = pd.Series(dataset.index, index=dataset.index)
     exit_date = index_series.shift(-WINDOW_RET)
@@ -228,9 +217,8 @@ def main():
         
         test_df = dataset.loc[[test_date]]
         
-        fold_start = train_df.index.min()
-        train_df = set_time_index(train_df.copy(), fold_start)
-        test_df = set_time_index(test_df.copy(), fold_start)
+        train_df = train_df.copy()
+        test_df = test_df.copy()
         fold_pca_k = None
         if args.pca:
             fold_pca = build_pca_transformer()

@@ -35,29 +35,14 @@ DEFAULT_RANDOM_STATE = 42
 DEFAULT_MIN_TRAIN_ROWS = 252
 MIN_COLLAPSE_OCCUPANCY = 0.01
 WINSOR_QUANTILE = 0.01
-
-FEATURE_COLUMNS = [
-    "spy_ret_1d",
-    "spy_ret_5d",
-    "spy_ret_20d",
-    "spy_ret_63d",
-    "spy_vol_5d",
-    "spy_vol_20d",
-    "spy_vol_63d",
-    "spy_vol_ratio_5_20",
-    "spy_vol_ratio_20_63",
-    "vix_level_z",
-    "vix_chg_1d",
-    "vix_chg_5d",
-    "vix_chg_20d",
-    "vix_vol_5d",
-    "vix_vol_20d",
-    "vix_trend_gap_20d",
-    "trend_gap_20d",
-    "trend_gap_63d",
-    "spy_drawdown",
-]
-
+MARKET_TARGET_COLUMNS = (
+    "forward_ret_5d",
+    "sign_flip_5d",
+    "forward_vol_5d",
+    "vol_jump_5d",
+    "drawdown",
+)
+MARKET_NON_FEATURE_COLUMNS = (*MARKET_TARGET_COLUMNS, "spy_close")
 
 def state_label(state_id: int) -> str:
     return f"state_{int(state_id)}"
@@ -149,7 +134,7 @@ def compute_dataset_start(end_date: pd.Timestamp, train_window: str, test_years:
     return start
 
 
-def build_market_features(price_spy: pd.Series, price_vix: pd.Series) -> pd.DataFrame:
+def build_features(price_spy: pd.Series, price_vix: pd.Series) -> pd.DataFrame:
     index = price_spy.index
     price_vix = price_vix.reindex(index).ffill()
 
@@ -223,7 +208,7 @@ def build_market_dataset(
     price_spy = extract_field(spy_history, "Close", TICKER_SPY)
     price_vix = extract_field(vix_history, "Close", TICKER_VIX)
 
-    features = build_market_features(price_spy, price_vix)
+    features = build_features(price_spy, price_vix)
     targets = build_market_targets(price_spy)
 
     out = features.join(targets, how="left")
@@ -232,33 +217,16 @@ def build_market_dataset(
     return out
 
 
-def resolve_feature_columns(
-    feature_columns: List[str] | None = None,
-    scaler: Dict[str, Any] | None = None,
-) -> List[str]:
-    if feature_columns is not None:
-        return list(feature_columns)
-    if scaler is not None and "mean" in scaler:
-        scaler_columns = list(pd.Series(scaler["mean"]).index)
-        if scaler_columns:
-            return scaler_columns
-    return list(FEATURE_COLUMNS)
-
-
 def select_training_features(
     dataset: pd.DataFrame,
     asof_date: pd.Timestamp,
     train_window: str,
     min_train_rows: int,
-    feature_columns: List[str] | None = None,
 ) -> pd.DataFrame:
-    active_feature_columns = resolve_feature_columns(feature_columns=feature_columns)
     asof_date = pd.Timestamp(asof_date).normalize()
     train_start = asof_date - parse_window(train_window)
-    train_df = dataset.loc[
-        (dataset.index > train_start) & (dataset.index <= asof_date),
-        active_feature_columns,
-    ]
+    train_df = dataset.drop(columns=MARKET_NON_FEATURE_COLUMNS, errors="ignore")
+    train_df = train_df.loc[(train_df.index > train_start) & (train_df.index <= asof_date)]
     train_df = train_df.dropna()
     if train_df.empty or len(train_df) < int(min_train_rows):
         raise ValueError(
@@ -280,9 +248,9 @@ def fit_scaler(train_features: pd.DataFrame) -> Dict[str, pd.Series]:
 def apply_scaler(
     frame: pd.DataFrame,
     scaler: Dict[str, Any],
-    feature_columns: List[str] | None = None,
 ) -> pd.DataFrame:
-    active_feature_columns = resolve_feature_columns(feature_columns=feature_columns, scaler=scaler)
+    scaler_columns = list(pd.Series(scaler["mean"]).index) if "mean" in scaler else []
+    active_feature_columns = scaler_columns or list(frame.columns)
     mean = pd.Series(scaler["mean"], dtype=float).reindex(active_feature_columns)
     std = pd.Series(scaler["std"], dtype=float).replace(0.0, 1.0).reindex(active_feature_columns)
     clipped = frame[active_feature_columns].copy()
@@ -704,14 +672,13 @@ def main() -> None:
 
     print(f"Building market dataset from {start_date.date()} to {end_date.date()}...")
     dataset = build_market_dataset(start_date, end_date)
-    usable = dataset[FEATURE_COLUMNS].dropna()
+    usable = dataset.drop(columns=MARKET_NON_FEATURE_COLUMNS, errors="ignore").dropna()
     asof_date = usable.index.max()
     train_features = select_training_features(
         dataset,
         asof_date=asof_date,
         train_window=args.train_window,
         min_train_rows=args.min_train_rows,
-        feature_columns=FEATURE_COLUMNS,
     )
     print(
         "Training window: "
