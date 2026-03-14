@@ -56,14 +56,6 @@ DEFAULT_TRAINING_POLICY = {
     "target_clip_upper_quantile": 0.98,
     "recency_min_weight": 0.35,
 }
-COMMENTED_FEATURES = [
-    "vol_chg_1d",
-    "momentum_5_20",
-    "sector_ret_1d",
-    "gld_ret_1d",
-    "vix_level",
-    "corr_spy_60d",
-]
 
 
 def resolve_artifact_variant() -> str:
@@ -263,10 +255,9 @@ def trading_day_in_quarter(index):
     return day_in_quarter, quarter_len
 
 
-def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix):
+def build_features(price_stock, price_sector, price_gld, price_spy, price_vix):
     index = price_stock.index
 
-    volume_stock = volume_stock.reindex(index).ffill()
     price_sector = price_sector.reindex(index).ffill()
     price_gld = price_gld.reindex(index).ffill()
     price_spy = price_spy.reindex(index).ffill()
@@ -312,7 +303,6 @@ def build_features(price_stock, volume_stock, price_sector, price_gld, price_spy
     features["q_phase_sin"] = np.sin(phase)
     features["q_phase_cos"] = np.cos(phase)
 
-    # Kept intentionally commented for parity with TECH.md:
     # features["vol_chg_1d"] = volume_stock.pct_change()
     # features["momentum_5_20"] = features["ret_5d"] - ret_20d
     # features["sector_ret_1d"] = log_ret_sector
@@ -390,6 +380,26 @@ def validate_alignment_and_nan(
             f"Check price coverage and window settings. Stock coverage: {coverage}"
         )
 
+def select_feature_columns(
+    dataset: pd.DataFrame,
+    drop_time_index: bool,
+    feature_set: str = FEATURE_SET_F0,
+    feature_set_file: str | None = None,
+) -> list[str]:
+    feature_cols = [col for col in dataset.columns if col != "target"]
+    if drop_time_index:
+        feature_cols = [col for col in feature_cols if col != "time_index"]
+    feature_cols, missing = apply_feature_set(
+        feature_cols=feature_cols,
+        feature_set=feature_set,
+        feature_set_file=feature_set_file,
+    )
+    if missing:
+        print(
+            f"feature_set={feature_set}: ignoring drop features not present in current columns: "
+            f"{', '.join(missing)}"
+    )
+    return feature_cols
 
 def select_feature_columns(
     dataset: pd.DataFrame,
@@ -400,7 +410,6 @@ def select_feature_columns(
     feature_cols = [col for col in dataset.columns if col != "target"]
     if drop_time_index:
         feature_cols = [col for col in feature_cols if col != "time_index"]
-    feature_cols = [col for col in feature_cols if col not in COMMENTED_FEATURES]
     feature_cols, missing = apply_feature_set(
         feature_cols=feature_cols,
         feature_set=feature_set,
@@ -544,7 +553,6 @@ def save_artifacts(
     summary_metrics,
     config,
     feature_cols,
-    raw_feature_cols,
 ):
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -556,7 +564,6 @@ def save_artifacts(
     payload = {
         "model_str": model.booster_.model_to_string(),
         "feature_columns": feature_cols,
-        "raw_feature_columns": raw_feature_cols,
     }
     with model_path.open("wb") as fh:
         pickle.dump(payload, fh)
@@ -608,13 +615,12 @@ def build_model_dataset(ticker, config, history_cache):
     vix_history = fetch_history_cached(TICKER_VIX, start_date, end_date, history_cache)
 
     price_stock = extract_field(stock_history, "Close", ticker)
-    volume_stock = extract_field(stock_history, "Volume", ticker)
     price_sector = extract_field(sector_history, "Close", sector_etf)
     price_gld = extract_field(gld_history, "Close", TICKER_GOLD)
     price_spy = extract_field(spy_history, "Close", TICKER_SPY)
     price_vix = extract_field(vix_history, "Close", TICKER_VIX)
 
-    features = build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix)
+    features = build_features(price_stock, price_sector, price_gld, price_spy, price_vix)
     target = build_target(price_stock)
     regime_cfg = config["regime_score"]
 
@@ -768,7 +774,6 @@ def train_for_ticker(ticker, config, history_cache):
             "feature_columns": feature_cols,
             "feature_set": config.get("feature_set", FEATURE_SET_F0),
             "feature_set_drop_features": configured_drop_features,
-            "commented_features": COMMENTED_FEATURES,
             "direction_mode": resolve_direction_mode(config.get("direction_mode")),
             "training_policy": resolve_training_policy(config.get("training_policy")),
             "final_target_clip": final_train_meta["target_clip"],
@@ -788,7 +793,6 @@ def train_for_ticker(ticker, config, history_cache):
         summary_metrics=summary_metrics,
         config=config_out,
         feature_cols=feature_cols,
-        raw_feature_cols=feature_cols,
     )
     return summary_metrics
 

@@ -125,7 +125,6 @@ def build_dataset(
     vix_history = fetch_history_cached("^VIX", start_date, end_date, history_cache)
 
     price_stock = extract_field(stock_history, "Close", ticker)
-    volume_stock = extract_field(stock_history, "Volume", ticker)
     price_sector = extract_field(sector_history, "Close", sector_etf)
     price_gld = extract_field(gld_history, "Close", "GLD")
     price_spy = extract_field(spy_history, "Close", "SPY")
@@ -133,7 +132,6 @@ def build_dataset(
 
     features = build_features(
         price_stock,
-        volume_stock,
         price_sector,
         price_gld,
         price_spy,

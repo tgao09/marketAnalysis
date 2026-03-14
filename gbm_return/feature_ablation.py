@@ -115,13 +115,12 @@ def build_dataset(ticker: str, start_date: pd.Timestamp, end_date: pd.Timestamp)
     vix_history = fetch_history_cached("^VIX", start_date, end_date, history_cache)
 
     price_stock = extract_field(stock_history, "Close", ticker)
-    volume_stock = extract_field(stock_history, "Volume", ticker)
     price_sector = extract_field(sector_history, "Close", sector_etf)
     price_gld = extract_field(gld_history, "Close", "GLD")
     price_spy = extract_field(spy_history, "Close", "SPY")
     price_vix = extract_field(vix_history, "Close", "^VIX")
 
-    features = build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix)
+    features = build_features(price_stock, price_sector, price_gld, price_spy, price_vix)
     target = build_target(price_stock)
     regime_score = compute_regime_score(
         price_vix.reindex(price_stock.index).ffill(),
