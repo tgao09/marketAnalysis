@@ -16,9 +16,6 @@ if str(ROOT_DIR) not in sys.path:
 
 from gbm_return.train import (
     ARTIFACT_DIR_DEFAULT,
-    DATA_YEARS,
-    DEFAULT_TEST_WINDOW,
-    DEFAULT_TRAIN_WINDOW,
     REGIME_SCORE_CLIP,
     REGIME_SCORE_WEIGHTS,
     REGIME_SCORE_WINDOW,
@@ -27,7 +24,6 @@ from gbm_return.train import (
     TICKER_VIX,
     build_features,
     build_target,
-    compute_regime_score,
     compute_start_date,
     extract_field,
     fetch_history_cached,
@@ -75,8 +71,7 @@ def load_artifacts(artifact_dir: Path):
     config = json.loads(config_path.read_text())
 
     feature_cols = model_blob["feature_columns"]
-    raw_feature_cols = model_blob.get("raw_feature_columns") or feature_cols
-    return model_blob["model_str"], config, feature_cols, raw_feature_cols
+    return model_blob["model_str"], config, feature_cols
 
 
 def resolve_regime_config(config):
@@ -111,32 +106,33 @@ def rebuild_features(config):
     vix_history = fetch_history_cached(TICKER_VIX, start_date, end_date, history_cache)
 
     price_stock = extract_field(stock_history, "Close", ticker)
-    volume_stock = extract_field(stock_history, "Volume", ticker)
     price_sector = extract_field(sector_history, "Close", sector_etf)
     price_gld = extract_field(gld_history, "Close", TICKER_GOLD)
     price_spy = extract_field(spy_history, "Close", TICKER_SPY)
     price_vix = extract_field(vix_history, "Close", TICKER_VIX)
 
-    features = build_features(price_stock, volume_stock, price_sector, price_gld, price_spy, price_vix)
-    target = build_target(price_stock)
-
-    if regime_config.get("enabled", True):
-        regime_score = compute_regime_score(
-            price_vix.reindex(price_stock.index).ffill(),
-            price_spy.reindex(price_stock.index).ffill(),
-            regime_config["score_window"],
-            regime_config["score_clip"],
-            regime_config["weights"],
-        )
-    else:
-        regime_score = pd.Series(0.0, index=price_stock.index, name="regime_score")
-    features["regime_score"] = regime_score
-
-    dataset = features.join([target]).dropna()
-    final_start = pd.Timestamp(config["final_train_window"]["start"])
-    if pd.isna(final_start):
-        final_start = dataset.index.min()
-    features = set_time_index(features, final_start)
+    features = build_features(
+        price_stock,
+        price_sector,
+        price_gld,
+        price_spy,
+        price_vix,
+        drop_time_index=bool(config.get("drop_time_index", True)),
+        feature_set=str(config.get("feature_set", "f0")),
+        feature_set_file=config.get("feature_set_file"),
+        regime_score_enabled=bool(regime_config.get("enabled", True)),
+        regime_score_window=int(regime_config["score_window"]),
+        regime_score_clip=float(regime_config["score_clip"]),
+        regime_score_weights=regime_config.get("weights"),
+    )
+    if not bool(config.get("drop_time_index", True)):
+        target = build_target(price_stock)
+        dataset = features.join([target]).dropna()
+        final_start_raw = (config.get("final_train_window") or {}).get("start")
+        final_start = pd.Timestamp(final_start_raw) if final_start_raw else pd.NaT
+        if pd.isna(final_start):
+            final_start = dataset.index.min()
+        features = set_time_index(features, final_start)
     return features
 
 
@@ -147,9 +143,9 @@ def get_latest_feature_row(features, feature_cols):
 
 
 def predict_next_window(artifact_dir: Path):
-    model_str, config, model_feature_cols, raw_feature_cols = load_artifacts(artifact_dir)
+    model_str, config, model_feature_cols = load_artifacts(artifact_dir)
     features = rebuild_features(config)
-    asof_date, latest_features = get_latest_feature_row(features, raw_feature_cols)
+    asof_date, latest_features = get_latest_feature_row(features, model_feature_cols)
 
     booster = lgb.Booster(model_str=model_str)
     x = np.asarray([latest_features.values], dtype=float)
