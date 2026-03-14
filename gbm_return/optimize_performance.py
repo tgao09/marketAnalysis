@@ -21,6 +21,7 @@ import gbm_return.backtest_walk_forward as gbm_backtest
 import gbm_return.feature_ablation as gbm_ablation
 import gbm_return.train as gbm_train
 from gbm_return.configuration import (
+    apply_feature_set,
     FEATURE_SET_F0,
     FEATURE_SET_F1,
     FEATURE_SET_F2,
@@ -317,12 +318,19 @@ def run_ablation_for_ticker(
     dataset_start = gbm_ablation.compute_dataset_start(end_date, train_window)
     data = gbm_ablation.build_dataset(ticker, dataset_start, end_date)
     dataset = data["dataset"]
-    baseline_feature_cols = gbm_train.select_feature_columns(
-        dataset=dataset,
-        drop_time_index=not include_time_index,
+    baseline_feature_cols = list(data["feature_columns"])
+    if not include_time_index:
+        baseline_feature_cols = [col for col in baseline_feature_cols if col != "time_index"]
+    baseline_feature_cols, missing = apply_feature_set(
+        feature_cols=baseline_feature_cols,
         feature_set=FEATURE_SET_F0,
         feature_set_file=feature_set_file,
     )
+    if missing:
+        print(
+            f"feature_set={FEATURE_SET_F0}: ignoring drop features not present in current columns: "
+            f"{', '.join(missing)}"
+        )
     if not baseline_feature_cols:
         raise ValueError(f"{ticker}: No features available for ablation.")
 

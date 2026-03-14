@@ -33,7 +33,7 @@ from hmm_regime.train import (
     DEFAULT_RANDOM_STATE,
     DEFAULT_RETRAIN_CADENCE,
     DEFAULT_TRAIN_WINDOW,
-    FEATURE_COLUMNS,
+    MARKET_NON_FEATURE_COLUMNS,
     apply_scaler,
     build_market_dataset,
     build_state_output,
@@ -49,7 +49,6 @@ from hmm_regime.train import (
 DEFAULT_TRIALS = 8
 DEFAULT_OUTPUT_DIR = ARTIFACT_DIR_DEFAULT / "optuna_runs"
 DEFAULT_STUDY_NAME = "hmm_regime_optuna"
-BASE_FEATURE_COLUMNS = list(FEATURE_COLUMNS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -148,11 +147,12 @@ def infer_state_for_date(
     target_date: pd.Timestamp,
     feature_columns: List[str],
 ) -> pd.Series:
-    eval_features = dataset.loc[
-        (dataset.index >= train_features.index.min()) & (dataset.index <= target_date),
-        feature_columns,
-    ].dropna()
-    scaled = apply_scaler(eval_features, bundle["scaler"], feature_columns=feature_columns)
+    eval_features = dataset.drop(columns=MARKET_NON_FEATURE_COLUMNS, errors="ignore")
+    eval_features = eval_features.loc[
+        (eval_features.index >= train_features.index.min()) & (eval_features.index <= target_date)
+    ]
+    eval_features = eval_features.loc[:, feature_columns].dropna()
+    scaled = apply_scaler(eval_features, bundle["scaler"])
     state_probs = compute_filtered_state_probs(bundle["model"], scaled.values)
     transition_matrix = np.asarray(bundle["model"].transmat_, dtype=float)
     shift_probability = compute_shift_probability(state_probs, transition_matrix)
@@ -183,7 +183,7 @@ def run_walk_forward(
     vol_ratio_threshold: float,
 ) -> Dict[str, Any]:
     test_start = end_date - pd.DateOffset(years=int(test_years))
-    usable_idx = dataset[feature_columns].dropna().index
+    usable_idx = dataset.loc[:, feature_columns].dropna().index
     pred_dates = usable_idx[(usable_idx >= test_start) & (usable_idx <= end_date)]
     pred_dates = pred_dates[:: int(step_bdays)]
 
@@ -198,7 +198,6 @@ def run_walk_forward(
                 asof_date=asof_date,
                 train_window=train_window,
                 min_train_rows=min_train_rows,
-                feature_columns=feature_columns,
             )
             bundle = fit_hmm_bundle(
                 train_features=train_features,
@@ -299,14 +298,13 @@ def maybe_retrain_final(
 ) -> Dict[str, Any]:
     start_date = compute_dataset_start(end_date, train_window, test_years=0)
     dataset = build_market_dataset(start_date, end_date)
-    usable = dataset[feature_columns].dropna()
+    usable = dataset.loc[:, feature_columns].dropna()
     asof_date = usable.index.max()
     train_features = select_training_features(
         dataset=dataset,
         asof_date=asof_date,
         train_window=train_window,
         min_train_rows=min_train_rows,
-        feature_columns=feature_columns,
     )
     bundle = fit_hmm_bundle(
         train_features=train_features,
@@ -358,8 +356,14 @@ def main() -> None:
             dataset_cache[key] = build_market_dataset(start_date, end_date)
         return dataset_cache[key]
 
+    base_feature_columns = list(
+        get_dataset(DEFAULT_TRAIN_WINDOW, args.test_years)
+        .drop(columns=MARKET_NON_FEATURE_COLUMNS, errors="ignore")
+        .columns
+    )
+
     baseline_config = {
-        "feature_columns": list(BASE_FEATURE_COLUMNS),
+        "feature_columns": list(base_feature_columns),
         "train_window": DEFAULT_TRAIN_WINDOW,
         "step_bdays": DEFAULT_STEP_BDAYS,
         "n_iter": DEFAULT_N_ITER,
@@ -387,7 +391,7 @@ def main() -> None:
 
     def objective(trial: optuna.Trial) -> float:
         config = {
-            "feature_columns": sample_selected_features(trial, BASE_FEATURE_COLUMNS),
+            "feature_columns": sample_selected_features(trial, base_feature_columns),
             "train_window": trial.suggest_categorical("train_window", ["2y", "3y", "4y"]),
             "step_bdays": trial.suggest_categorical("step_bdays", [3, 5, 10]),
             "n_iter": trial.suggest_categorical("n_iter", [250, 500, 750]),
@@ -440,7 +444,7 @@ def main() -> None:
         final_train = maybe_retrain_final(
             artifact_dir=Path(args.artifact_dir),
             end_date=end_date,
-            feature_columns=list(best_trial.user_attrs.get("selected_features", BASE_FEATURE_COLUMNS)),
+            feature_columns=list(best_trial.user_attrs.get("selected_features", base_feature_columns)),
             train_window=best_trial.params["train_window"],
             n_iter=int(best_trial.params["n_iter"]),
             n_init=int(best_trial.params["n_init"]),
