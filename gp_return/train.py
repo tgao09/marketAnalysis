@@ -289,9 +289,9 @@ def build_features(
     # features["corr_spy_60d"] = log_ret_stock.rolling(60).corr(log_ret_spy)
 
     # Calendar features
-    day_in_quarter, quarter_len = trading_day_in_quarter(features.index)
-    quarter_len = quarter_len.replace(0, 1)
-    phase = (2.0 * np.pi * day_in_quarter) / quarter_len
+    # day_in_quarter, quarter_len = trading_day_in_quarter(features.index)
+    # quarter_len = quarter_len.replace(0, 1)
+    # phase = (2.0 * np.pi * day_in_quarter) / quarter_len
     # features["q_phase_sin"] = np.sin(phase)
     # features["q_phase_cos"] = np.cos(phase)
 
