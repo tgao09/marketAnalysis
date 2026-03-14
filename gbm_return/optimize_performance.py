@@ -429,59 +429,58 @@ def run_ablation_for_ticker(
 
 
 def rank_harmful_features(ablation_payloads: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    stats: dict[str, dict[str, Any]] = {}
     basket_size = len(ablation_payloads)
+    feature_frames: list[pd.DataFrame] = []
     for ticker, payload in ablation_payloads.items():
-        rows = payload.get("per_feature_deltas", [])
-        for row in rows:
-            if row.get("status") != "ok":
-                continue
-            feature = row.get("dropped_feature")
-            improvements = row.get("improvements") or {}
-            mae_improvement = improvements.get("mae_simple_improvement")
-            dir_improvement = improvements.get("directional_improvement")
-            if feature is None or mae_improvement is None or dir_improvement is None:
-                continue
-            if feature not in stats:
-                stats[feature] = {
-                    "feature": feature,
-                    "support_count": 0,
-                    "ticker_hits": [],
-                    "mae_simple_improvements": [],
-                    "directional_improvements": [],
-                }
-            item = stats[feature]
-            item["support_count"] += 1
-            item["ticker_hits"].append(ticker)
-            item["mae_simple_improvements"].append(float(mae_improvement))
-            item["directional_improvements"].append(float(dir_improvement))
+        per_feature = pd.DataFrame(payload.get("per_feature_deltas", []))
+        required_columns = {"status", "dropped_feature", "improvements"}
+        if per_feature.empty or not required_columns.issubset(per_feature.columns):
+            continue
+        ok_rows = per_feature.loc[per_feature["status"].eq("ok"), ["dropped_feature", "improvements"]].copy()
+        if ok_rows.empty:
+            continue
+        improvements = pd.json_normalize(ok_rows["improvements"]).reindex(
+            columns=["mae_simple_improvement", "directional_improvement"]
+        )
+        ok_rows = ok_rows.drop(columns=["improvements"]).join(improvements)
+        ok_rows = ok_rows.dropna(
+            subset=["dropped_feature", "mae_simple_improvement", "directional_improvement"]
+        )
+        if ok_rows.empty:
+            continue
+        ok_rows["ticker"] = ticker
+        feature_frames.append(ok_rows.rename(columns={"dropped_feature": "feature"}))
 
-    ranked: list[dict[str, Any]] = []
-    for feature, item in stats.items():
-        support_count = int(item["support_count"])
-        mae_values = item["mae_simple_improvements"]
-        dir_values = item["directional_improvements"]
-        ranked.append(
-            {
-                "feature": feature,
-                "support_count": support_count,
-                "support_ratio": support_count / basket_size if basket_size else 0.0,
-                "ticker_hits": item["ticker_hits"],
-                "median_mae_simple_improvement": float(np.median(mae_values)),
-                "median_directional_improvement": float(np.median(dir_values)),
-                "avg_mae_simple_improvement": float(np.mean(mae_values)),
-                "avg_directional_improvement": float(np.mean(dir_values)),
-            }
+    if not feature_frames:
+        return []
+
+    feature_stats = pd.concat(feature_frames, ignore_index=True)
+    grouped = (
+        feature_stats.groupby("feature", sort=False)
+        .agg(
+            support_count=("ticker", "size"),
+            ticker_hits=("ticker", list),
+            median_mae_simple_improvement=("mae_simple_improvement", "median"),
+            median_directional_improvement=("directional_improvement", "median"),
+            avg_mae_simple_improvement=("mae_simple_improvement", "mean"),
+            avg_directional_improvement=("directional_improvement", "mean"),
         )
-    ranked.sort(
-        key=lambda x: (
-            -x["support_count"],
-            -x["median_mae_simple_improvement"],
-            -x["median_directional_improvement"],
-            x["feature"],
-        )
+        .reset_index()
     )
-    return ranked
+    grouped["support_ratio"] = (
+        grouped["support_count"] / basket_size if basket_size else 0.0
+    )
+    ranked = grouped.sort_values(
+        by=[
+            "support_count",
+            "median_mae_simple_improvement",
+            "median_directional_improvement",
+            "feature",
+        ],
+        ascending=[False, False, False, True],
+        kind="mergesort",
+    )
+    return ranked.to_dict(orient="records")
 
 
 def choose_feature_sets(
@@ -510,15 +509,6 @@ def collect_gp_reference(tickers: list[str]) -> dict[str, Any]:
         if path.exists():
             gp[ticker] = json.loads(path.read_text())
     return gp
-
-
-def validate_evaluation_dates(
-    baseline_end: pd.Timestamp,
-    ablation_end: pd.Timestamp,
-    tune_end: pd.Timestamp,
-    holdout_end: pd.Timestamp,
-):
-    return
 
 
 def latest_available_holdout_end(tickers: list[str], train_window: str) -> pd.Timestamp:

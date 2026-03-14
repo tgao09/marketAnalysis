@@ -282,7 +282,7 @@ def _compute_drawdown(equity: pd.Series) -> pd.Series:
 
 
 def _compute_underwater_stats(exit_dates: pd.Series, drawdown: pd.Series) -> Dict[str, Any]:
-    underwater = drawdown < 0
+    underwater = drawdown.lt(0).to_numpy()
     if not underwater.any():
         return {
             "max_underwater_days": 0,
@@ -290,33 +290,16 @@ def _compute_underwater_stats(exit_dates: pd.Series, drawdown: pd.Series) -> Dic
             "percent_time_underwater": 0.0,
         }
 
-    max_days = 0
-    max_trades = 0
-    total_underwater = int(underwater.sum())
-    start_idx: Optional[int] = None
-
-    for idx, is_under in enumerate(underwater):
-        if is_under and start_idx is None:
-            start_idx = idx
-        if not is_under and start_idx is not None:
-            end_idx = idx - 1
-            days = (exit_dates.iloc[end_idx] - exit_dates.iloc[start_idx]).days
-            trades = end_idx - start_idx + 1
-            max_days = max(max_days, days)
-            max_trades = max(max_trades, trades)
-            start_idx = None
-
-    if start_idx is not None:
-        end_idx = len(underwater) - 1
-        days = (exit_dates.iloc[end_idx] - exit_dates.iloc[start_idx]).days
-        trades = end_idx - start_idx + 1
-        max_days = max(max_days, days)
-        max_trades = max(max_trades, trades)
+    starts = np.flatnonzero(underwater & np.r_[True, ~underwater[:-1]])
+    ends = np.flatnonzero(underwater & np.r_[~underwater[1:], True])
+    exit_values = pd.to_datetime(exit_dates).to_numpy(dtype="datetime64[ns]")
+    underwater_days = ((exit_values[ends] - exit_values[starts]) / np.timedelta64(1, "D")).astype(int)
+    underwater_trades = ends - starts + 1
 
     return {
-        "max_underwater_days": int(max_days),
-        "max_underwater_trades": int(max_trades),
-        "percent_time_underwater": float(total_underwater / len(underwater)),
+        "max_underwater_days": int(underwater_days.max()) if underwater_days.size else 0,
+        "max_underwater_trades": int(underwater_trades.max()) if underwater_trades.size else 0,
+        "percent_time_underwater": float(underwater.mean()),
     }
 
 
