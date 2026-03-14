@@ -237,7 +237,7 @@ def run_backtest_prepared_gp(
     notional: float,
     device: torch.device,
 ):
-    trades: list[dict[str, Any]] = []
+    trade_frames: list[pd.DataFrame] = []
     for split in prepared["splits"]:
         train_df = split.train.copy()
         test_df = split.test.copy()
@@ -270,23 +270,22 @@ def run_backtest_prepared_gp(
             mean_logs = preds.mean.detach().cpu().numpy()
 
         actual_simple = np.exp(test_df["target"].values) - 1.0
-        for idx, test_date in enumerate(test_df.index):
-            mean_log = float(mean_logs[idx])
-            direction = "long" if mean_log > 0.0 else "short"
-            signed_return = float(actual_simple[idx]) if direction == "long" else float(-actual_simple[idx])
-            pnl = notional * signed_return
-            trades.append(
+        directions = np.where(mean_logs > 0.0, "long", "short")
+        signed_returns = np.where(mean_logs > 0.0, actual_simple, -actual_simple)
+        trade_frames.append(
+            pd.DataFrame(
                 {
                     "symbol": prepared["ticker"],
-                    "trade_date": test_date,
-                    "direction": direction,
-                    "pnl": pnl,
-                    "return_pct": signed_return,
+                    "trade_date": test_df.index,
+                    "direction": directions,
+                    "pnl": notional * signed_returns,
+                    "return_pct": signed_returns,
                     "fold": int(split.fold),
                 }
             )
+        )
 
-    trades_df = pd.DataFrame(trades)
+    trades_df = pd.concat(trade_frames, ignore_index=True) if trade_frames else pd.DataFrame()
     if not trades_df.empty:
         trades_df = trades_df.sort_values("trade_date")
     summary = summarize_trades(trades_df)
