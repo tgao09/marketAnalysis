@@ -500,12 +500,17 @@ def fit_hmm_bundle(
     random_state: int,
     n_init: int,
 ) -> Dict[str, Any]:
-    scaler = fit_scaler(train_features)
-    train_scaled = apply_scaler(train_features, scaler)
-    train_frame = train_features.join(
-        train_targets[["forward_ret_5d", "forward_vol_5d", "vol_jump_5d", "drawdown"]],
-        how="left",
-    )
+    feature_frame = train_features.drop(columns=MARKET_NON_FEATURE_COLUMNS, errors="ignore").copy()
+    feature_frame = feature_frame.loc[:, ~feature_frame.columns.duplicated(keep="last")]
+    target_frame = train_targets.loc[
+        :,
+        ~train_targets.columns.duplicated(keep="last"),
+    ][["forward_ret_5d", "forward_vol_5d", "vol_jump_5d", "drawdown"]].copy()
+    scaler = fit_scaler(feature_frame)
+    train_scaled = apply_scaler(feature_frame, scaler)
+    train_frame = feature_frame.copy()
+    for column in target_frame.columns:
+        train_frame[column] = target_frame[column]
 
     candidates: List[Dict[str, Any]] = []
     errors: List[str] = []
@@ -537,7 +542,7 @@ def fit_hmm_bundle(
                 "model": model,
                 "seed": int(seed),
                 "scaler": scaler,
-                "feature_columns": list(train_features.columns),
+                "feature_columns": list(feature_frame.columns),
                 "raw_probs": raw_probs,
                 "state_probs": state_probs,
                 "transition_matrix": transition_matrix,
@@ -553,8 +558,8 @@ def fit_hmm_bundle(
                     log_likelihood_per_row=log_likelihood_per_row,
                     stress_state_id=stress_state_id,
                 ),
-                "train_start": train_features.index.min(),
-                "train_end": train_features.index.max(),
+                "train_start": feature_frame.index.min(),
+                "train_end": feature_frame.index.max(),
             }
             candidates.append(candidate)
         except Exception as exc:

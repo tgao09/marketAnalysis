@@ -38,6 +38,7 @@ from gp_return.train import (
     train_gp,
 )
 from hmm_regime.train import (
+    DEFAULT_TRAIN_WINDOW as HMM_DEFAULT_TRAIN_WINDOW,
     DEFAULT_N_INIT as HMM_DEFAULT_N_INIT,
     DEFAULT_N_ITER as HMM_DEFAULT_N_ITER,
     DEFAULT_MIN_TRAIN_ROWS as HMM_DEFAULT_MIN_TRAIN_ROWS,
@@ -94,11 +95,13 @@ def compute_strategy_start(
     end_date: pd.Timestamp,
     base_train_window: str,
     meta_train_window: str,
+    hmm_train_window: str = HMM_DEFAULT_TRAIN_WINDOW,
     test_years: int = DEFAULT_TEST_YEARS,
 ) -> pd.Timestamp:
-    base_offset = parse_window(base_train_window)
+    base_start = pd.Timestamp(end_date).normalize() - parse_window(base_train_window)
+    hmm_start = pd.Timestamp(end_date).normalize() - parse_window(hmm_train_window)
     meta_offset = parse_window(meta_train_window)
-    start = pd.Timestamp(end_date).normalize() - base_offset - meta_offset
+    start = min(base_start, hmm_start) - meta_offset
     start = start - pd.DateOffset(years=test_years)
     buffer_days = max(GP_FEATURE_LOOKBACK_MAX, REGIME_SCORE_WINDOW, 252) + (2 * WINDOW_RET) + 10
     start = start - pd.DateOffset(days=buffer_days)
@@ -111,9 +114,10 @@ def build_strategy_dataset(
     end_date: pd.Timestamp,
     history_cache: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
-    history_cache = history_cache or {}
+    if history_cache is None:
+        history_cache = {}
     regime_config = {
-        "enabled": True,
+        "enabled": False,
         "score_window": REGIME_SCORE_WINDOW,
         "score_clip": REGIME_SCORE_CLIP,
         "weights": REGIME_SCORE_WEIGHTS,
@@ -166,9 +170,10 @@ def latest_strategy_features(
     end_date: pd.Timestamp,
     history_cache: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
-    history_cache = history_cache or {}
+    if history_cache is None:
+        history_cache = {}
     regime_config = {
-        "enabled": True,
+        "enabled": False,
         "score_window": REGIME_SCORE_WINDOW,
         "score_clip": REGIME_SCORE_CLIP,
         "weights": REGIME_SCORE_WEIGHTS,
@@ -268,7 +273,18 @@ def compute_gp_prediction_for_date(
     train_x_df = (train_x_df - train_mean) / train_std
     if test_features is None:
         test_features = dataset.loc[test_date].drop(labels=["target"])
-    test_x = ((test_features - train_mean) / train_std).to_numpy(dtype=float, copy=False)
+    else:
+        missing_feature_cols = [col for col in train_x_df.columns if col not in test_features.index]
+        if missing_feature_cols:
+            missing_list = ", ".join(missing_feature_cols)
+            raise ValueError(f"Missing GP inference features for {test_date.date()}: {missing_list}")
+        test_features = test_features.reindex(train_x_df.columns)
+
+    test_x_series = ((test_features - train_mean) / train_std).replace([np.inf, -np.inf], np.nan)
+    if test_x_series.isna().any():
+        bad_cols = ", ".join(test_x_series.index[test_x_series.isna()])
+        raise ValueError(f"Invalid GP inference features for {test_date.date()}: {bad_cols}")
+    test_x = test_x_series.to_numpy(dtype=float, copy=False)
 
     train_x = torch.tensor(train_x_df.values, dtype=torch.float32, device=device)
     train_y = torch.tensor(train_df["target"].values, dtype=torch.float32, device=device)
@@ -294,12 +310,12 @@ def compute_gp_prediction_for_date(
 def compute_hmm_state_for_date(
     market_dataset: pd.DataFrame,
     test_date: pd.Timestamp,
-    base_train_window: str,
+    hmm_train_window: str = HMM_DEFAULT_TRAIN_WINDOW,
 ) -> dict[str, float | int | str]:
     state_features = select_training_features(
         dataset=market_dataset,
         asof_date=test_date,
-        train_window=base_train_window,
+        train_window=hmm_train_window,
         min_train_rows=HMM_DEFAULT_MIN_TRAIN_ROWS,
     )
     test_date = pd.Timestamp(test_date).normalize()
@@ -355,6 +371,7 @@ def build_base_prediction_rows(
     test_years: int = DEFAULT_TEST_YEARS,
     gp_train_iters: int = GP_DEFAULT_TRAIN_ITERS,
 ) -> pd.DataFrame:
+    end_date = pd.Timestamp(end_date).normalize()
     start_date = compute_strategy_start(
         end_date=end_date,
         base_train_window=base_train_window,
@@ -367,6 +384,8 @@ def build_base_prediction_rows(
     dataset = strategy_data["dataset"]
     close_stock = strategy_data["close"]
     candidates = build_candidate_frame(dataset, close_stock)
+    earliest_base_row_date = end_date - pd.DateOffset(years=test_years) - parse_window(meta_train_window)
+    candidates = candidates.loc[candidates.index >= earliest_base_row_date].copy()
 
     rows: list[dict[str, Any]] = []
     total = len(candidates)
@@ -382,7 +401,6 @@ def build_base_prediction_rows(
             hmm_row = compute_hmm_state_for_date(
                 market_dataset=market_dataset,
                 test_date=test_date,
-                base_train_window=base_train_window,
             )
         except Exception as exc:
             print(f"{test_date.date()} | skipped base row: {exc}")

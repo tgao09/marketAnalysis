@@ -89,7 +89,6 @@ def build_latest_base_row(
     hmm_row = compute_hmm_state_for_date(
         market_dataset=market_dataset,
         test_date=test_date,
-        base_train_window=base_train_window,
     )
 
     row: dict[str, object] = {
