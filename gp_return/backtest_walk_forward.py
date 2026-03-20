@@ -62,6 +62,7 @@ def parse_args():
         default=MIN_ABS_PRED_MEAN_LOG,
         help="Minimum absolute predicted log return required to enter a trade.",
     )
+    parser.add_argument(
         "--pca",
         action="store_true",
         help="Enable fold-local PCA features for backtest and write outputs under ticker/pca.",
