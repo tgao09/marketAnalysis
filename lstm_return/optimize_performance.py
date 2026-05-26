@@ -10,27 +10,43 @@ import numpy as np
 import optuna
 import pandas as pd
 import torch
-from linear_operator.utils.errors import NotPSDError
 from optuna.trial import TrialState
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-from common.walk_forward import walk_forward_splits
-from gp_return.backtest_walk_forward import (
-    DEFAULT_TEST_YEARS,
-    build_dataset,
-    compute_dataset_start,
-    summarize_trades,
+from common import walk_forward_splits
+from hmm_regime.train import (
+    DEFAULT_MIN_TRAIN_ROWS as HMM_DEFAULT_MIN_TRAIN_ROWS,
+    build_market_dataset,
 )
-from gp_return.train import (
+from lstm_return.backtest_walk_forward import DEFAULT_TEST_YEARS, summarize_trades
+from lstm_return.train import (
     ARTIFACT_DIR_DEFAULT,
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_DROPOUT,
+    DEFAULT_EPOCHS,
+    DEFAULT_HIDDEN_SIZE,
+    DEFAULT_HMM_N_INIT,
+    DEFAULT_HMM_N_ITER,
+    DEFAULT_HMM_TRAIN_WINDOW,
+    DEFAULT_LEARNING_RATE,
+    DEFAULT_MIN_TRAIN_SEQUENCES,
+    DEFAULT_NUM_LAYERS,
+    DEFAULT_RANDOM_STATE,
+    DEFAULT_SEQ_LEN,
+    DEFAULT_TRAIN_WINDOW,
+    DEFAULT_WEIGHT_DECAY,
+    HMM_FEATURE_COLUMNS,
     WINDOW_RET,
-    build_pca_transformer,
-    normalize_features,
+    build_model_dataset,
+    compute_dataset_start,
+    fit_lstm_model,
+    predict_sequences,
+    prepare_fold_data,
+    resolve_base_feature_columns,
     resolve_device,
-    train_gp,
 )
 
 
@@ -39,23 +55,36 @@ DEFAULT_NOTIONAL = 10000.0
 DEFAULT_TRIALS = 120
 DEFAULT_HOLDOUT_TOP_N = 20
 DEFAULT_DRAWDOWN_WORSEN_LIMIT = 0.10
-MIN_TRAIN_ROWS = 60
+MIN_TRAIN_ROWS = HMM_DEFAULT_MIN_TRAIN_ROWS
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Optimize gp_return with Optuna using backtest return.")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Optimize lstm_return with Optuna using backtest return."
+    )
     parser.add_argument("--tickers", default=",".join(DEFAULT_TICKERS))
-    parser.add_argument("--train-window", default="2y")
+    parser.add_argument("--train-window", default=DEFAULT_TRAIN_WINDOW)
     parser.add_argument("--test-window", default="1m")
     parser.add_argument("--step-window", default="1m")
-    parser.add_argument("--tune-end", default=None, help="Tune end date YYYY-MM-DD. Default: holdout_end - 3 months.")
-    parser.add_argument("--holdout-end", default=None, help="Holdout end date YYYY-MM-DD. Default: today.")
+    parser.add_argument(
+        "--tune-end",
+        default=None,
+        help="Tune end date YYYY-MM-DD. Default: holdout_end - 3 months.",
+    )
+    parser.add_argument(
+        "--holdout-end",
+        default=None,
+        help="Holdout end date YYYY-MM-DD. Default: today.",
+    )
     parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
     parser.add_argument("--holdout-top-n", type=int, default=DEFAULT_HOLDOUT_TOP_N)
-    parser.add_argument("--drawdown-worsen-limit", type=float, default=DEFAULT_DRAWDOWN_WORSEN_LIMIT)
+    parser.add_argument(
+        "--drawdown-worsen-limit",
+        type=float,
+        default=DEFAULT_DRAWDOWN_WORSEN_LIMIT,
+    )
     parser.add_argument("--notional", type=float, default=DEFAULT_NOTIONAL)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--pca", action="store_true")
+    parser.add_argument("--seed", type=int, default=DEFAULT_RANDOM_STATE)
     parser.add_argument("--output-dir", default=str(ARTIFACT_DIR_DEFAULT / "optuna_runs"))
     return parser.parse_args()
 
@@ -77,6 +106,8 @@ def json_ready(value: Any):
         return float(value)
     if isinstance(value, (np.integer,)):
         return int(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
     if isinstance(value, pd.Timestamp):
         return value.isoformat()
     if isinstance(value, Path):
@@ -88,7 +119,7 @@ def json_ready(value: Any):
     return value
 
 
-def write_json(path: Path, payload: dict[str, Any]):
+def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(json_ready(payload), indent=2))
 
@@ -190,16 +221,16 @@ def prepare_backtest_data(
     train_window: str,
     test_window: str,
     step_window: str,
-    pca_enabled: bool,
+    hmm_train_window: str,
 ):
-    dataset_start = compute_dataset_start(end_date, train_window)
+    dataset_start = compute_dataset_start(end_date, train_window, hmm_train_window)
     eval_start = end_date - pd.DateOffset(years=DEFAULT_TEST_YEARS)
-    data = build_dataset(
+    data = build_model_dataset(
         ticker=ticker,
         start_date=dataset_start,
         end_date=end_date,
+        history_cache={},
     )
-
     dataset = data["dataset"]
     all_splits = list(
         walk_forward_splits(
@@ -225,60 +256,77 @@ def prepare_backtest_data(
         "step_window": step_window,
         "eval_start": eval_start,
         "dataset": dataset,
+        "market_dataset": build_market_dataset(dataset_start, end_date),
         "splits": selected_splits,
-        "base_feature_columns": list(data["feature_columns"]),
+        "base_feature_columns": resolve_base_feature_columns(
+            dataset=dataset,
+            drop_time_index=False,
+        ),
     }
 
 
-def run_backtest_prepared_gp(
+def run_backtest_prepared_lstm(
     prepared: dict[str, Any],
     feature_columns: list[str],
     model_params: dict[str, Any],
-    pca_enabled: bool,
     notional: float,
     device: torch.device,
 ):
+    feature_cols = list(feature_columns) + list(HMM_FEATURE_COLUMNS)
+    model_kwargs = {
+        "input_size": len(feature_cols),
+        "hidden_size": int(model_params["hidden_size"]),
+        "num_layers": int(model_params["num_layers"]),
+        "dropout": float(model_params["dropout"]),
+    }
+    config = {
+        "seq_len": int(model_params["seq_len"]),
+        "hmm_train_window": model_params["hmm_train_window"],
+        "hmm_n_iter": int(model_params["hmm_n_iter"]),
+        "hmm_n_init": int(model_params["hmm_n_init"]),
+        "random_state": int(model_params["random_state"]),
+    }
+
     trade_frames: list[pd.DataFrame] = []
     for split in prepared["splits"]:
-        train_df = split.train.copy()
-        test_df = split.test.copy()
+        train_x, train_y, _, test_x, test_y, test_dates, _, _ = prepare_fold_data(
+            dataset=prepared["dataset"],
+            market_dataset=prepared["market_dataset"],
+            split_train_start=split.train_start,
+            split_train_end=split.train_end,
+            split_test_end=split.test_end,
+            split_train_dates=split.train.index,
+            split_test_dates=split.test.index,
+            base_feature_cols=feature_columns,
+            config=config,
+        )
+        if len(train_x) < DEFAULT_MIN_TRAIN_SEQUENCES or len(test_x) == 0:
+            continue
 
-        if pca_enabled:
-            fold_pca = build_pca_transformer()
-            train_x_df, test_x_df = fold_pca.transform_train_test(train_df, test_df, feature_columns)
-        else:
-            train_x_df, test_x_df, _ = normalize_features(train_df, test_df, feature_columns)
-
-        train_x = torch.tensor(train_x_df.values, dtype=torch.float32, device=device)
-        train_y = torch.tensor(train_df["target"].values, dtype=torch.float32, device=device)
-        model, likelihood = train_gp(
-            train_x,
-            train_y,
-            train_iters=int(model_params["train_iters"]),
+        model, _ = fit_lstm_model(
+            train_x=train_x,
+            train_y=train_y,
+            model_kwargs=model_kwargs,
             device=device,
+            epochs=int(model_params["epochs"]),
+            batch_size=int(model_params["batch_size"]),
             learning_rate=float(model_params["learning_rate"]),
             weight_decay=float(model_params["weight_decay"]),
-            matern_nu=float(model_params["matern_nu"]),
-            use_rq=bool(model_params["use_rq"]),
-            use_linear=bool(model_params["use_linear"]),
+            seed=int(model_params["random_state"]),
         )
+        preds = predict_sequences(model, test_x, device=device)
 
-        model.eval()
-        likelihood.eval()
-        with torch.no_grad():
-            test_x = torch.tensor(test_x_df.values, dtype=torch.float32, device=device)
-            preds = likelihood(model(test_x))
-            mean_logs = preds.mean.detach().cpu().numpy()
-
-        actual_simple = np.exp(test_df["target"].values) - 1.0
-        directions = np.where(mean_logs > 0.0, "long", "short")
-        signed_returns = np.where(mean_logs > 0.0, actual_simple, -actual_simple)
+        actual_simple = np.exp(test_y) - 1.0
+        directions = np.where(preds > 0.0, "long", "short")
+        signed_returns = np.where(preds > 0.0, actual_simple, -actual_simple)
         trade_frames.append(
             pd.DataFrame(
                 {
                     "symbol": prepared["ticker"],
-                    "trade_date": test_df.index,
+                    "trade_date": test_dates,
                     "direction": directions,
+                    "predicted_log_return": preds,
+                    "actual_log_return": test_y,
                     "pnl": notional * signed_returns,
                     "return_pct": signed_returns,
                     "fold": int(split.fold),
@@ -304,7 +352,6 @@ def run_backtest_prepared_gp(
             "notional": notional,
             "avg_return_pct": avg_return_pct,
             "feature_count": len(feature_columns),
-            "pca_enabled": bool(pca_enabled),
             "fold_count": int(len(prepared["splits"])),
         }
     )
@@ -319,10 +366,9 @@ def evaluate_candidate_on_end_date(
     step_window: str,
     selected_features: list[str],
     model_params: dict[str, Any],
-    pca_enabled: bool,
     notional: float,
     device: torch.device,
-    prepared_cache: dict[tuple[str, str, str, str, bool], dict[str, Any]],
+    prepared_cache: dict[tuple[str, str, str, str, str], dict[str, Any]],
     on_ticker_done=None,
 ):
     ticker_summaries: dict[str, dict[str, Any]] = {}
@@ -332,7 +378,7 @@ def evaluate_candidate_on_end_date(
             str(end_date.date()),
             train_window,
             f"{test_window}|{step_window}",
-            bool(pca_enabled),
+            str(model_params["hmm_train_window"]),
         )
         if cache_key not in prepared_cache:
             prepared_cache[cache_key] = prepare_backtest_data(
@@ -341,10 +387,14 @@ def evaluate_candidate_on_end_date(
                 train_window=train_window,
                 test_window=test_window,
                 step_window=step_window,
-                pca_enabled=pca_enabled,
+                hmm_train_window=str(model_params["hmm_train_window"]),
             )
         prepared = prepared_cache[cache_key]
-        feature_columns = [col for col in selected_features if col in prepared["base_feature_columns"]]
+        available_feature_columns = resolve_base_feature_columns(
+            dataset=prepared["dataset"],
+            drop_time_index=bool(model_params["drop_time_index"]),
+        )
+        feature_columns = [col for col in selected_features if col in available_feature_columns]
         if not feature_columns:
             summary = {
                 "ticker": ticker,
@@ -357,11 +407,10 @@ def evaluate_candidate_on_end_date(
                 "avg_return_pct": None,
             }
         else:
-            summary = run_backtest_prepared_gp(
+            summary = run_backtest_prepared_lstm(
                 prepared=prepared,
                 feature_columns=feature_columns,
                 model_params=model_params,
-                pca_enabled=pca_enabled,
                 notional=notional,
                 device=device,
             )
@@ -373,14 +422,22 @@ def evaluate_candidate_on_end_date(
     return {"aggregate": aggregate, "tickers": ticker_summaries}
 
 
-def sample_model_params(trial: optuna.Trial) -> dict[str, Any]:
+def sample_model_params(trial: optuna.Trial, seed: int) -> dict[str, Any]:
+    include_time_index = trial.suggest_categorical("include_time_index", [False, True])
     return {
-        "train_iters": trial.suggest_int("train_iters", 40, 180, step=20),
-        "learning_rate": trial.suggest_float("learning_rate", 1e-3, 1e-1, log=True),
-        "weight_decay": trial.suggest_float("weight_decay", 1e-8, 1e-2, log=True),
-        "matern_nu": trial.suggest_categorical("matern_nu", [0.5, 1.5, 2.5]),
-        "use_rq": trial.suggest_categorical("use_rq", [True, False]),
-        "use_linear": trial.suggest_categorical("use_linear", [True, False]),
+        "seq_len": trial.suggest_categorical("seq_len", [20, 40, 60, 80, 120]),
+        "hidden_size": trial.suggest_categorical("hidden_size", [32, 64, 128]),
+        "num_layers": trial.suggest_categorical("num_layers", [1, 2]),
+        "dropout": trial.suggest_float("dropout", 0.0, 0.4),
+        "epochs": trial.suggest_categorical("epochs", [20, 30, 40, 60]),
+        "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128]),
+        "learning_rate": trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True),
+        "weight_decay": trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
+        "drop_time_index": not include_time_index,
+        "random_state": int(seed),
+        "hmm_train_window": trial.suggest_categorical("hmm_train_window", ["2y", "3y", "4y"]),
+        "hmm_n_iter": trial.suggest_categorical("hmm_n_iter", [150, 250, 400]),
+        "hmm_n_init": trial.suggest_categorical("hmm_n_init", [2, 3, 4]),
     }
 
 
@@ -403,13 +460,15 @@ def trial_to_result(trial: optuna.trial.FrozenTrial) -> dict[str, Any]:
     }
 
 
-def main():
+def main() -> None:
     args = parse_args()
     tickers = parse_tickers(args.tickers) or list(DEFAULT_TICKERS)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     device = resolve_device()
     print(f"Using device: {device.type}")
@@ -420,25 +479,32 @@ def main():
     run_dir = Path(args.output_dir) / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    prepared_cache: dict[tuple[str, str, str, str, bool], dict[str, Any]] = {}
+    prepared_cache: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    baseline_params = {
+        "seq_len": DEFAULT_SEQ_LEN,
+        "hidden_size": DEFAULT_HIDDEN_SIZE,
+        "num_layers": DEFAULT_NUM_LAYERS,
+        "dropout": DEFAULT_DROPOUT,
+        "epochs": DEFAULT_EPOCHS,
+        "batch_size": DEFAULT_BATCH_SIZE,
+        "learning_rate": DEFAULT_LEARNING_RATE,
+        "weight_decay": DEFAULT_WEIGHT_DECAY,
+        "drop_time_index": True,
+        "random_state": int(args.seed),
+        "hmm_train_window": DEFAULT_HMM_TRAIN_WINDOW,
+        "hmm_n_iter": DEFAULT_HMM_N_ITER,
+        "hmm_n_init": DEFAULT_HMM_N_INIT,
+    }
     base_prepared = prepare_backtest_data(
         ticker=tickers[0],
         end_date=tune_end,
         train_window=args.train_window,
         test_window=args.test_window,
         step_window=args.step_window,
-        pca_enabled=args.pca,
+        hmm_train_window=baseline_params["hmm_train_window"],
     )
     base_feature_columns = list(base_prepared["base_feature_columns"])
     baseline_features = list(base_feature_columns)
-    baseline_params = {
-        "train_iters": 160,
-        "learning_rate": 0.05,
-        "weight_decay": 0.0,
-        "matern_nu": 0.5,
-        "use_rq": True,
-        "use_linear": True,
-    }
 
     baseline_tune = evaluate_candidate_on_end_date(
         tickers=tickers,
@@ -448,7 +514,6 @@ def main():
         step_window=args.step_window,
         selected_features=baseline_features,
         model_params=baseline_params,
-        pca_enabled=args.pca,
         notional=args.notional,
         device=device,
         prepared_cache=prepared_cache,
@@ -461,7 +526,6 @@ def main():
         step_window=args.step_window,
         selected_features=baseline_features,
         model_params=baseline_params,
-        pca_enabled=args.pca,
         notional=args.notional,
         device=device,
         prepared_cache=prepared_cache,
@@ -475,7 +539,7 @@ def main():
     study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
 
     def objective(trial: optuna.Trial) -> float:
-        model_params = sample_model_params(trial)
+        model_params = sample_model_params(trial, args.seed)
         selected_features = sample_selected_features(trial, base_feature_columns)
         trial.set_user_attr("model_params", model_params)
         trial.set_user_attr("selected_features", selected_features)
@@ -494,25 +558,19 @@ def main():
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
-        try:
-            result = evaluate_candidate_on_end_date(
-                tickers=tickers,
-                end_date=tune_end,
-                train_window=args.train_window,
-                test_window=args.test_window,
-                step_window=args.step_window,
-                selected_features=selected_features,
-                model_params=model_params,
-                pca_enabled=args.pca,
-                notional=args.notional,
-                device=device,
-                prepared_cache=prepared_cache,
-                on_ticker_done=on_ticker_done,
-            )
-        except NotPSDError as exc:
-            trial.set_user_attr("guardrail_pass", False)
-            trial.set_user_attr("guardrail_violations", [{"reason": "not_psd", "detail": str(exc)}])
-            raise optuna.TrialPruned(str(exc)) from exc
+        result = evaluate_candidate_on_end_date(
+            tickers=tickers,
+            end_date=tune_end,
+            train_window=args.train_window,
+            test_window=args.test_window,
+            step_window=args.step_window,
+            selected_features=selected_features,
+            model_params=model_params,
+            notional=args.notional,
+            device=device,
+            prepared_cache=prepared_cache,
+            on_ticker_done=on_ticker_done,
+        )
         violations = drawdown_guardrail_violations(
             candidate_summaries=result["tickers"],
             baseline_summaries=baseline_tune["tickers"],
@@ -544,41 +602,18 @@ def main():
     for trial in finalists:
         model_params = dict(trial.user_attrs.get("model_params", {}))
         selected_features = list(trial.user_attrs.get("selected_features", []))
-        try:
-            holdout_result = evaluate_candidate_on_end_date(
-                tickers=tickers,
-                end_date=holdout_end,
-                train_window=args.train_window,
-                test_window=args.test_window,
-                step_window=args.step_window,
-                selected_features=selected_features,
-                model_params=model_params,
-                pca_enabled=args.pca,
-                notional=args.notional,
-                device=device,
-                prepared_cache=prepared_cache,
-            )
-        except NotPSDError as exc:
-            holdout_validations.append(
-                {
-                    "trial_number": trial.number,
-                    "trial_value": trial.value,
-                    "selected_features": selected_features,
-                    "model_params": model_params,
-                    "tune": {
-                        "aggregate": trial.user_attrs.get("aggregate"),
-                        "tickers": trial.user_attrs.get("tickers"),
-                        "guardrail_pass": trial.user_attrs.get("guardrail_pass"),
-                        "guardrail_violations": trial.user_attrs.get("guardrail_violations"),
-                    },
-                    "holdout": None,
-                    "holdout_score": None,
-                    "holdout_guardrail_pass": False,
-                    "holdout_guardrail_violations": [{"reason": "not_psd", "detail": str(exc)}],
-                    "beats_holdout_baseline": False,
-                }
-            )
-            continue
+        holdout_result = evaluate_candidate_on_end_date(
+            tickers=tickers,
+            end_date=holdout_end,
+            train_window=args.train_window,
+            test_window=args.test_window,
+            step_window=args.step_window,
+            selected_features=selected_features,
+            model_params=model_params,
+            notional=args.notional,
+            device=device,
+            prepared_cache=prepared_cache,
+        )
         holdout_violations = drawdown_guardrail_violations(
             candidate_summaries=holdout_result["tickers"],
             baseline_summaries=baseline_holdout["tickers"],
@@ -637,7 +672,6 @@ def main():
             "holdout_top_n": args.holdout_top_n,
             "notional": args.notional,
             "seed": args.seed,
-            "pca": bool(args.pca),
         },
         "baseline_tune": baseline_tune,
         "baseline_holdout": baseline_holdout,
@@ -660,7 +694,6 @@ def main():
         "holdout_top_n": args.holdout_top_n,
         "notional": args.notional,
         "seed": args.seed,
-        "pca": bool(args.pca),
         "output_dir": str(run_dir),
         "base_feature_columns": base_feature_columns,
         "baseline_features": baseline_features,
