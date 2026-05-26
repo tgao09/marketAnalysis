@@ -245,30 +245,30 @@ def build_features(
     log_ret_spy = compute_log_return(price_spy, 1)
 
     features = pd.DataFrame(index=price_stock.index)
-    # features["time_index"] = (features.index - features.index[0]).days.astype(int)
+    features["time_index"] = (features.index - features.index[0]).days.astype(int)
 
     # Stock returns (log) and summary stats
     # features["ret_1d"] = log_ret_stock
-    features["ret_5d"] = compute_log_return(price_stock, WINDOW_RET)
+    # features["ret_5d"] = compute_log_return(price_stock, WINDOW_RET)
     # features["ret_10d"] = compute_log_return(price_stock, 10)
-    # ret_20d = compute_log_return(price_stock, 20)
-    # features["ret_20d"] = ret_20d
+    ret_20d = compute_log_return(price_stock, 20)
+    features["ret_20d"] = ret_20d
     # features["ret_60d"] = compute_log_return(price_stock, 60)
 
     # Stock volatility and standardized returns
     vol_5d = log_ret_stock.rolling(WINDOW_RET).std()
     vol_20d = log_ret_stock.rolling(20).std()
-    # features["vol_5d"] = vol_5d
+    features["vol_5d"] = vol_5d
     # features["vol_10d"] = log_ret_stock.rolling(10).std()
     # features["vol_20d"] = vol_20d
     # features["vol_60d"] = log_ret_stock.rolling(60).std()
 
     # Volume and distribution shape
-    # features["vol_chg_1d"] = volume_stock.pct_change()
+    features["vol_chg_1d"] = volume_stock.pct_change()
     # features["skew_20d"] = log_ret_stock.rolling(20).skew()
 
     # Trend, range, and volatility structure
-    # features["stock_ma20_gap"] = (price_stock / price_stock.rolling(20).mean()) - 1.0
+    features["stock_ma20_gap"] = (price_stock / price_stock.rolling(20).mean()) - 1.0
     # features["stock_ma60_gap"] = (price_stock / price_stock.rolling(60).mean()) - 1.0
     # roll_min_60 = price_stock.rolling(60).min()
     # roll_max_60 = price_stock.rolling(60).max()
@@ -280,29 +280,29 @@ def build_features(
 
     # Sector ETF features
     # features["sector_ret_1d"] = log_ret_sector
-    # features["sector_ret_5d"] = compute_log_return(price_sector, WINDOW_RET)
-    # features["sector_vol_5d"] = log_ret_sector.rolling(WINDOW_RET).std()
-    # features["rel_strength_sector_20d"] = ret_20d - compute_log_return(price_sector, 20)
+    features["sector_ret_5d"] = compute_log_return(price_sector, WINDOW_RET)
+    features["sector_vol_5d"] = log_ret_sector.rolling(WINDOW_RET).std()
+    features["rel_strength_sector_20d"] = ret_20d - compute_log_return(price_sector, 20)
 
     # GLD features
     # features["gld_ret_1d"] = log_ret_gld
-    # features["gld_ret_5d"] = compute_log_return(price_gld, WINDOW_RET)
+    features["gld_ret_5d"] = compute_log_return(price_gld, WINDOW_RET)
     # features["gld_vol_5d"] = log_ret_gld.rolling(WINDOW_RET).std()
 
     # Market regime (SPY + VIX)
-    features["spy_ret_5d"] = compute_log_return(price_spy, WINDOW_RET)
+    # features["spy_ret_5d"] = compute_log_return(price_spy, WINDOW_RET)
     # features["spy_vol_20d"] = log_ret_spy.rolling(20).std()
-    # features["spy_ma20_gap"] = (price_spy / price_spy.rolling(20).mean()) - 1.0
-    # features["vix_level"] = price_vix
-    features["vix_chg_1d"] = compute_log_return(price_vix, 1)
-    # features["corr_spy_60d"] = log_ret_stock.rolling(60).corr(log_ret_spy)
+    features["spy_ma20_gap"] = (price_spy / price_spy.rolling(20).mean()) - 1.0
+    features["vix_level"] = price_vix
+    # features["vix_chg_1d"] = compute_log_return(price_vix, 1)
+    features["corr_spy_60d"] = log_ret_stock.rolling(60).corr(log_ret_spy)
 
     # Calendar features
-    # day_in_quarter, quarter_len = trading_day_in_quarter(features.index)
-    # quarter_len = quarter_len.replace(0, 1)
-    # phase = (2.0 * np.pi * day_in_quarter) / quarter_len
+    day_in_quarter, quarter_len = trading_day_in_quarter(features.index)
+    quarter_len = quarter_len.replace(0, 1)
+    phase = (2.0 * np.pi * day_in_quarter) / quarter_len
     # features["q_phase_sin"] = np.sin(phase)
-    # features["q_phase_cos"] = np.cos(phase)
+    features["q_phase_cos"] = np.cos(phase)
 
     if regime_config.get("enabled", True):
         features["regime_score"] = compute_regime_score(
