@@ -14,6 +14,13 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from common import parse_window
+from common.backtesting import BacktestConfig, CalendarWalkForwardConfig, LogReturnTarget
+from gbm_return.backtester import (
+    GBMAdapterConfig,
+    gbm_feature_columns,
+    load_gbm_market_data,
+    run_gbm_backtest,
+)
 from gbm_return.configuration import (
     apply_feature_set,
     FEATURE_SET_CHOICES,
@@ -214,38 +221,20 @@ def prepare_backtest_data(
     history_cache: dict[str, pd.DataFrame] | None = None,
 ):
     dataset_start = compute_dataset_start(end_date, train_window)
+    end_exclusive = end_date + pd.Timedelta(days=1)
+    market_data, sector_etf, sector_name = load_gbm_market_data(ticker, dataset_start, end_exclusive)
     test_start = end_date - pd.DateOffset(years=DEFAULT_TEST_YEARS)
-    data = build_dataset(
-        ticker=ticker,
-        start_date=dataset_start,
-        end_date=end_date,
-        history_cache=history_cache,
-    )
-    dataset = data["dataset"]
-    close_stock = data["close"]
-
-    index_series = pd.Series(dataset.index, index=dataset.index)
-    exit_date = index_series.shift(-WINDOW_RET)
-    exit_close = close_stock.shift(-WINDOW_RET)
-    candidates = pd.DataFrame(
-        {"entry_close": close_stock, "exit_date": exit_date, "exit_close": exit_close}
-    )
-    candidates = candidates.loc[test_start:end_date]
-    candidates = candidates.dropna(subset=["entry_close", "exit_date", "exit_close"])
-    test_dates = candidates.index
+    if market_data.bars.index.tz is not None:
+        test_start = test_start.tz_localize(market_data.bars.index.tz)
     return {
         "ticker": ticker,
         "end_date": end_date,
         "test_start": test_start,
         "train_window": train_window,
-        "dataset": dataset,
-        "close_stock": close_stock,
-        "candidates": candidates,
-        "test_dates": test_dates,
-        "dataset_index": dataset.index,
-        "feature_columns": data["feature_columns"],
-        "sector_etf": data["sector_etf"],
-        "sector_name": data["sector_name"],
+        "market_data": market_data,
+        "dataset_index": market_data.bars.index,
+        "sector_etf": sector_etf,
+        "sector_name": sector_name,
     }
 
 
@@ -260,51 +249,47 @@ def run_backtest_prepared(
     direction_mode: str | None = None,
     verbose: bool = True,
 ):
-    dataset = prepared["dataset"]
-    candidates = prepared["candidates"]
-    test_dates = prepared["test_dates"]
-    dataset_index = prepared["dataset_index"]
-    train_offset = parse_window(prepared["train_window"])
-
-    feature_cols = list(prepared["feature_columns"])
-    if not include_time_index:
-        feature_cols = [col for col in feature_cols if col != "time_index"]
-    feature_cols, missing = apply_feature_set(
-        feature_cols=feature_cols,
+    market_data = prepared["market_data"]
+    resolved_direction_mode = resolve_direction_mode(direction_mode)
+    adapter_config = GBMAdapterConfig(
+        lgbm_params=lgbm_params,
+        training_policy=training_policy,
+        drop_time_index=not include_time_index,
         feature_set=feature_set,
         feature_set_file=feature_set_file,
     )
-    if missing:
-        print(
-            f"feature_set={feature_set}: ignoring drop features not present in current columns: "
-            f"{', '.join(missing)}"
-        )
-    resolved_direction_mode = resolve_direction_mode(direction_mode)
+    result = run_gbm_backtest(
+        market_data,
+        BacktestConfig(
+            target=LogReturnTarget(horizon_bars=WINDOW_RET),
+            walk_forward=CalendarWalkForwardConfig(
+                train_window=prepared["train_window"],
+                test_window="1d",
+                test_rows=1,
+                step_window="1d",
+                min_train_rows=MIN_TRAIN_ROWS,
+                pre_test_gap_rows=WINDOW_RET,
+            ),
+            target_column="target_log_return",
+            prediction_column="pred_mean_log",
+        ),
+        adapter_config,
+    )
+    scored = result.predictions.loc[result.predictions.index >= prepared["test_start"]]
+    feature_cols = gbm_feature_columns(market_data.bars, adapter_config)
+    actual = scored["target_log_return"]
+    predicted = scored["pred_mean_log"]
+    backtest_metrics = {
+        "count": int(len(scored)),
+        "mae": float((predicted - actual).abs().mean()),
+        "rmse": float(np.sqrt(((predicted - actual) ** 2).mean())),
+        "correlation": float(predicted.corr(actual)) if len(scored) > 1 else None,
+        "directional_hit_rate": float((np.sign(predicted) == np.sign(actual)).mean()),
+    }
 
     trades = []
-    for test_date in test_dates:
-        test_pos = int(dataset_index.searchsorted(test_date, side="left"))
-
-        train_end_pos = test_pos - WINDOW_RET - 1
-        if train_end_pos < 0:
-            continue
-        train_end = dataset_index[train_end_pos]
-        train_start = test_date - train_offset - pd.offsets.BDay(WINDOW_RET)
-        train_df = dataset.loc[(dataset.index > train_start) & (dataset.index <= train_end)]
-        if len(train_df) < MIN_TRAIN_ROWS:
-            continue
-
-        test_df = dataset.loc[[test_date]]
-        fold_start = train_df.index.min()
-        train_df = set_time_index(train_df.copy(), fold_start)
-        test_df = set_time_index(test_df.copy(), fold_start)
-        train_x, train_y, sample_weight, _ = prepare_lgbm_training_data(
-            train_df,
-            feature_cols,
-            training_policy,
-        )
-        model = train_lgbm(train_x, train_y, lgbm_params, sample_weight=sample_weight)
-        mean_log = float(model.predict(test_df[feature_cols])[0])
+    for test_date, row in scored.iterrows():
+        mean_log = float(row["pred_mean_log"])
         if resolved_direction_mode == "long_only":
             direction = "long"
         elif resolved_direction_mode == "short_only":
@@ -312,16 +297,17 @@ def run_backtest_prepared(
         else:
             direction = "long" if mean_log >= 0.0 else "short"
 
-        entry_close = float(candidates.at[test_date, "entry_close"])
-        exit_dt = candidates.at[test_date, "exit_date"]
-        exit_close = float(candidates.at[test_date, "exit_close"])
+        entry_close = float(row["close"])
+        exit_dt = row["target_end"]
+        actual_log = float(row["target_log_return"])
+        exit_close = entry_close * math.exp(actual_log)
 
         shares = notional / entry_close
         pnl_per_share = (exit_close - entry_close) if direction == "long" else (entry_close - exit_close)
         pnl = shares * pnl_per_share
         return_pct = pnl / notional
         mean_simple = math.exp(mean_log) - 1.0
-        actual_simple = (exit_close / entry_close) - 1.0
+        actual_simple = math.exp(actual_log) - 1.0
 
         trades.append(
             {
@@ -344,7 +330,7 @@ def run_backtest_prepared(
 
         if verbose:
             print(
-                f"{test_date.date()} | Train: {train_df.index.min().date()} -> {train_df.index.max().date()} | "
+                f"{test_date.date()} | "
                 f"Pred: {mean_simple:+.2%} | PnL: {pnl:+.2f}"
             )
 
@@ -362,12 +348,15 @@ def run_backtest_prepared(
             "test_years": DEFAULT_TEST_YEARS,
             "window_ret": WINDOW_RET,
             "notional": notional,
-            "candidate_trade_days": int(len(test_dates)),
-            "trade_rate": float(len(trades_df) / len(test_dates)) if len(test_dates) else 0.0,
+            "candidate_trade_days": int(len(scored)),
+            "trade_rate": float(len(trades_df) / len(scored)) if len(scored) else 0.0,
             "feature_set": feature_set,
             "feature_count": len(feature_cols),
             "lgbm_params": dict(lgbm_params),
             "direction_mode": resolved_direction_mode,
+            "backtest_metrics": backtest_metrics,
+            "sector_etf": prepared["sector_etf"],
+            "sector": prepared["sector_name"],
         }
     )
     return trades_df, summary, feature_cols

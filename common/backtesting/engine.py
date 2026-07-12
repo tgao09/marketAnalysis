@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol
 
 import numpy as np
 import pandas as pd
 
-from .config import BacktestConfig
+from ..walk_forward import parse_window
+from .config import BacktestConfig, CalendarWalkForwardConfig
 from .data import MarketData, YFinanceSource, canonical_column_name, fingerprint_bars, normalize_bars
 
 
@@ -96,21 +97,18 @@ class BacktestEngine:
         config = self.config
         splitter = config.walk_forward
         horizon = config.target.horizon_bars
-        first_test_start = splitter.min_train_rows + horizon + splitter.extra_purge_bars
-
         frames: list[pd.DataFrame] = []
         summaries: list[FoldSummary] = []
         prior_tests: list[tuple[int, int]] = []
         model_instances: list[object] = []
         model_ids: set[int] = set()
-        last_test_end = first_test_start
+        last_test_end = 0
 
-        test_start = first_test_start
-        while test_start + splitter.test_rows + horizon <= len(raw):
-            test_end = test_start + splitter.test_rows
-            train_positions, embargoed_rows, prior_oos_excluded_rows = self._training_positions(
+        for test_start, test_end, candidate_positions in self._fold_plans(raw.index):
+            train_positions, embargoed_rows, prior_oos_excluded_rows, purged_rows = self._training_positions(
                 test_start,
                 prior_tests,
+                candidate_positions,
             )
             if len(train_positions) >= splitter.min_train_rows:
                 fold = len(summaries) + 1
@@ -146,12 +144,14 @@ class BacktestEngine:
                 elif predictor is not model:
                     raise ValueError("fit() must not return a predictor reused from an earlier fold.")
                 output = predictor.predict(test.copy(deep=True), context)
-                prediction = self._extract_prediction(output, test.index)
+                prediction, adapter_output = self._extract_prediction(output, test.index, test.columns)
 
                 actual = target.iloc[test_start:test_end].to_numpy(dtype=float)
                 scored = test.copy(deep=True)
                 scored[config.target_column] = actual
                 scored[config.prediction_column] = prediction.to_numpy(dtype=float)
+                for column in adapter_output.columns:
+                    scored[column] = adapter_output[column].to_numpy()
                 scored["target_end"] = target_end.iloc[test_start:test_end].to_numpy()
                 scored["fold"] = fold
                 scored["error"] = scored[config.prediction_column] - scored[config.target_column]
@@ -168,14 +168,13 @@ class BacktestEngine:
                         test_end=test.index[-1],
                         train_rows=len(train),
                         test_rows=len(test),
-                        purged_rows=horizon + splitter.extra_purge_bars,
+                        purged_rows=purged_rows,
                         embargoed_rows=embargoed_rows,
                         prior_oos_excluded_rows=prior_oos_excluded_rows,
                     )
                 )
                 prior_tests.append((test_start, test_end))
                 last_test_end = test_end
-            test_start += splitter.effective_step_rows
 
         if not frames:
             raise ValueError("No complete walk-forward folds. Supply more bars or reduce split settings.")
@@ -218,12 +217,63 @@ class BacktestEngine:
         target_end = pd.Series(raw.index, index=raw.index).shift(-horizon)
         return target, target_end
 
-    def _training_positions(self, test_start: int, prior_tests: list[tuple[int, int]]) -> tuple[np.ndarray, int, int]:
+    def _fold_plans(self, index: pd.DatetimeIndex) -> Iterator[tuple[int, int, np.ndarray]]:
+        splitter = self.config.walk_forward
+        horizon = self.config.target.horizon_bars
+        if not isinstance(splitter, CalendarWalkForwardConfig):
+            test_start = splitter.min_train_rows + horizon + splitter.extra_purge_bars
+            while test_start + splitter.test_rows + horizon <= len(index):
+                test_end = test_start + splitter.test_rows
+                yield test_start, test_end, np.arange(test_start, dtype=int)
+                test_start += splitter.effective_step_rows
+            return
+
+        train_offset = parse_window(splitter.train_window)
+        test_offset = parse_window(splitter.test_window)
+        step_offset = parse_window(splitter.effective_step_window)
+        train_end = index.min() + train_offset
+        previous_test_end = 0
+        while True:
+            train_start = train_end - train_offset
+            candidates = np.flatnonzero((index > train_start) & (index <= train_end))
+            if candidates.size:
+                test_start = int(candidates[-1]) + splitter.pre_test_gap_rows + 1
+                if test_start >= len(index):
+                    break
+                if splitter.test_rows is None:
+                    test_end_date = index[test_start] + test_offset
+                    if test_end_date > index[-1]:
+                        break
+                    test_positions = np.flatnonzero((index >= index[test_start]) & (index <= test_end_date))
+                else:
+                    test_positions = np.arange(test_start, test_start + splitter.test_rows, dtype=int)
+                if not test_positions.size or int(test_positions[-1]) >= len(index) or int(test_positions[-1]) + horizon >= len(index):
+                    break
+                test_end = int(test_positions[-1]) + 1
+                if test_start < previous_test_end:
+                    train_end = train_end + step_offset
+                    continue
+                yield test_start, test_end, candidates
+                previous_test_end = test_end
+            train_end = train_end + step_offset
+            if train_end >= index[-1]:
+                break
+
+    def _training_positions(
+        self,
+        test_start: int,
+        prior_tests: list[tuple[int, int]],
+        candidate_positions: np.ndarray,
+    ) -> tuple[np.ndarray, int, int, int]:
         splitter = self.config.walk_forward
         boundary = test_start - self.config.target.horizon_bars - splitter.extra_purge_bars
         if boundary <= 0:
-            return np.array([], dtype=int), 0, 0
+            return np.array([], dtype=int), 0, 0, len(candidate_positions)
 
+        candidates = np.asarray(candidate_positions, dtype=int)
+        candidates = candidates[candidates < test_start]
+        before_purge = len(candidates)
+        candidates = candidates[candidates < boundary]
         embargo_mask = np.zeros(boundary, dtype=bool)
         prior_oos_mask = np.zeros(boundary, dtype=bool)
         for prior_start, prior_end in prior_tests:
@@ -232,18 +282,46 @@ class BacktestEngine:
             embargo_start = min(prior_end, boundary)
             embargo_end = min(prior_end + splitter.embargo_rows, boundary)
             embargo_mask[embargo_start:embargo_end] = True
-        eligible = np.flatnonzero(~(embargo_mask | prior_oos_mask))
-        if splitter.max_train_rows is not None:
-            eligible = eligible[-splitter.max_train_rows :]
-        return eligible, int(embargo_mask.sum()), int(prior_oos_mask.sum())
+        eligible = candidates[~(embargo_mask[candidates] | prior_oos_mask[candidates])]
+        max_train_rows = getattr(splitter, "max_train_rows", None)
+        if max_train_rows is not None:
+            eligible = eligible[-max_train_rows:]
+        return (
+            eligible,
+            int(embargo_mask[candidates].sum()),
+            int(prior_oos_mask[candidates].sum()),
+            before_purge - len(candidates),
+        )
 
-    def _extract_prediction(self, output: object, expected_index: pd.DatetimeIndex) -> pd.Series:
+    def _extract_prediction(
+        self,
+        output: object,
+        expected_index: pd.DatetimeIndex,
+        raw_columns: pd.Index,
+    ) -> tuple[pd.Series, pd.DataFrame]:
+        adapter_output = pd.DataFrame(index=expected_index)
         if isinstance(output, pd.DataFrame):
             if not output.index.equals(expected_index):
                 raise ValueError("Returned prediction frame index must exactly match the test index.")
             if self.config.prediction_column not in output.columns:
                 raise ValueError(f"Returned prediction frame lacks {self.config.prediction_column!r}.")
             prediction = output[self.config.prediction_column]
+            reserved = {
+                self.config.target_column,
+                "target_end",
+                "fold",
+                "error",
+                "direction_correct",
+            }
+            extras = [
+                column
+                for column in output.columns
+                if column not in raw_columns and column != self.config.prediction_column
+            ]
+            collisions = reserved.intersection(extras)
+            if collisions:
+                raise ValueError(f"Adapter output uses reserved result columns: {', '.join(sorted(collisions))}.")
+            adapter_output = output.loc[:, extras].copy()
         elif isinstance(output, pd.Series):
             if not output.index.equals(expected_index):
                 raise ValueError("Returned prediction series index must exactly match the test index.")
@@ -255,7 +333,7 @@ class BacktestEngine:
         values = prediction.to_numpy(dtype=float, na_value=np.nan)
         if not np.isfinite(values).all():
             raise ValueError("Predictions must be finite numeric values for every test row.")
-        return pd.Series(values, index=expected_index, name=self.config.prediction_column)
+        return pd.Series(values, index=expected_index, name=self.config.prediction_column), adapter_output
 
     def _metrics(self, predictions: pd.DataFrame) -> Mapping[str, float | int | None]:
         actual = predictions[self.config.target_column].to_numpy(dtype=float)

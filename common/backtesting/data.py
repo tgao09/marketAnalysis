@@ -12,6 +12,11 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from ..yfinance_utils import configure_yfinance_cache
+
+
+configure_yfinance_cache()
+
 
 HistoryFetcher = Callable[..., pd.DataFrame]
 
@@ -106,11 +111,18 @@ class YFinanceSource:
             if self.end is not None:
                 kwargs["end"] = self.end
 
-        if self.history_fetcher is None:
-            raw = yf.Ticker(self.symbol).history(**kwargs)
-        else:
-            raw = self.history_fetcher(self.symbol, **kwargs)
-        bars = normalize_bars(raw)
+        try:
+            if self.history_fetcher is None:
+                raw = yf.Ticker(self.symbol).history(**kwargs)
+            else:
+                raw = self.history_fetcher(self.symbol, **kwargs)
+            bars = normalize_bars(raw)
+        except Exception as exc:
+            request = ", ".join(f"{key}={value}" for key, value in kwargs.items())
+            raise RuntimeError(
+                f"Unable to fetch usable yfinance bars for {self.symbol} ({request}). "
+                "Check network/DNS access, Yahoo availability, and requested date range."
+            ) from exc
         metadata = {
             "source": "yfinance",
             "symbol": self.symbol,
@@ -123,4 +135,73 @@ class YFinanceSource:
             "yfinance_version": getattr(yf, "__version__", "unknown"),
             "data_hash": fingerprint_bars(bars),
         }
+        return MarketData(bars=bars, metadata=metadata)
+
+
+@dataclass(frozen=True)
+class YFinancePanelSource:
+    """One primary ticker plus auxiliary adjusted-close series."""
+
+    primary_symbol: str
+    auxiliaries: Mapping[str, str]
+    period: str | None = "5y"
+    interval: str = "1d"
+    start: str | pd.Timestamp | None = None
+    end: str | pd.Timestamp | None = None
+    history_fetcher: HistoryFetcher | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not self.auxiliaries:
+            raise ValueError("auxiliaries must contain at least one named symbol.")
+        reserved = {"close", "open", "high", "low", "volume"}
+        names = [canonical_column_name(name) for name in self.auxiliaries]
+        if len(names) != len(set(names)) or any(name in reserved or not name for name in names):
+            raise ValueError("auxiliary names must be unique and cannot replace primary OHLCV columns.")
+
+    def load(self) -> MarketData:
+        source_args = {
+            "period": self.period,
+            "interval": self.interval,
+            "start": self.start,
+            "end": self.end,
+            "history_fetcher": self.history_fetcher,
+        }
+        primary = YFinanceSource(self.primary_symbol, **source_args).load()
+        bars = primary.bars.copy(deep=True)
+        symbols = {"primary": primary.metadata["symbol"]}
+        hashes = {"primary": primary.metadata["data_hash"]}
+        for name, symbol in self.auxiliaries.items():
+            try:
+                auxiliary = YFinanceSource(symbol, **source_args).load()
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"Unable to fetch auxiliary {symbol} ({name}) for {self.primary_symbol}."
+                ) from exc
+            column = canonical_column_name(name)
+            if self.interval.endswith("d"):
+                primary_dates = bars.index.tz_localize(None).normalize() if bars.index.tz is not None else bars.index.normalize()
+                auxiliary_dates = (
+                    auxiliary.bars.index.tz_localize(None).normalize()
+                    if auxiliary.bars.index.tz is not None
+                    else auxiliary.bars.index.normalize()
+                )
+                auxiliary_close = pd.Series(
+                    auxiliary.bars["close"].to_numpy(),
+                    index=auxiliary_dates,
+                )
+                auxiliary_close = auxiliary_close.loc[~auxiliary_close.index.duplicated(keep="last")]
+                bars[column] = auxiliary_close.reindex(primary_dates).ffill().to_numpy()
+            else:
+                bars[column] = auxiliary.bars["close"].reindex(bars.index).ffill()
+            symbols[column] = auxiliary.metadata["symbol"]
+            hashes[column] = auxiliary.metadata["data_hash"]
+        metadata = dict(primary.metadata)
+        metadata.update(
+            {
+                "source": "yfinance_panel",
+                "symbols": symbols,
+                "component_data_hashes": hashes,
+                "data_hash": fingerprint_bars(bars),
+            }
+        )
         return MarketData(bars=bars, metadata=metadata)

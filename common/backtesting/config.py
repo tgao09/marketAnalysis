@@ -4,6 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from numbers import Integral
+import re
+
+
+def _parse_window(value: str, name: str) -> None:
+    if not isinstance(value, str) or not re.fullmatch(r"\s*\d+\s*[dwmyDWMY]\s*", value):
+        raise ValueError(f"{name} must be a positive window like '21d', '1m', or '2y'.")
+    if int(re.search(r"\d+", value).group()) <= 0:
+        raise ValueError(f"{name} must be positive.")
 
 
 def _validate_int(value: int, name: str, *, allow_zero: bool = False) -> None:
@@ -66,11 +74,44 @@ class WalkForwardConfig:
 
 
 @dataclass(frozen=True)
+class CalendarWalkForwardConfig:
+    """Calendar-window walk-forward settings for parity with legacy research."""
+
+    train_window: str = "2y"
+    test_window: str = "1m"
+    test_rows: int | None = None
+    step_window: str | None = None
+    min_train_rows: int = 252
+    pre_test_gap_rows: int = 0
+    extra_purge_bars: int = 0
+    embargo_rows: int = 0
+    reuse_prior_oos: bool = True
+
+    def __post_init__(self) -> None:
+        _parse_window(self.train_window, "train_window")
+        _parse_window(self.test_window, "test_window")
+        if self.test_rows is not None:
+            _validate_int(self.test_rows, "test_rows")
+        if self.step_window is not None:
+            _parse_window(self.step_window, "step_window")
+        _validate_int(self.min_train_rows, "min_train_rows")
+        _validate_int(self.pre_test_gap_rows, "pre_test_gap_rows", allow_zero=True)
+        _validate_int(self.extra_purge_bars, "extra_purge_bars", allow_zero=True)
+        _validate_int(self.embargo_rows, "embargo_rows", allow_zero=True)
+        if not isinstance(self.reuse_prior_oos, bool):
+            raise TypeError("reuse_prior_oos must be a bool.")
+
+    @property
+    def effective_step_window(self) -> str:
+        return self.test_window if self.step_window is None else self.step_window
+
+
+@dataclass(frozen=True)
 class BacktestConfig:
     """Universal backtester settings for one single-asset forecast target."""
 
     target: LogReturnTarget = field(default_factory=LogReturnTarget)
-    walk_forward: WalkForwardConfig = field(default_factory=WalkForwardConfig)
+    walk_forward: WalkForwardConfig | CalendarWalkForwardConfig = field(default_factory=WalkForwardConfig)
     target_column: str = "target_log_return"
     prediction_column: str = "prediction"
 

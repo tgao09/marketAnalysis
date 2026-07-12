@@ -15,11 +15,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from common import (
-    DEFAULT_SECTOR_ETF_MAP,
-    canonicalize_sector_name,
     get_history,
-    get_info,
     parse_window,
+    resolve_sector_etf_for_symbol,
     walk_forward_splits,
 )
 from gbm_return.configuration import (
@@ -97,6 +95,11 @@ def parse_args():
         default=DEFAULT_TRAIN_WINDOW,
         help="Rolling train window like '2y', '18m', or '260d'.",
     )
+    parser.add_argument("--test-window", default=DEFAULT_TEST_WINDOW)
+    parser.add_argument("--step-window", default=DEFAULT_STEP_WINDOW)
+    parser.add_argument("--data-years", type=int, default=DATA_YEARS)
+    parser.add_argument("--end", default=None, help="Inclusive historical end date (YYYY-MM-DD).")
+    parser.add_argument("--artifact-dir", default=str(ARTIFACT_DIR_DEFAULT))
     parser.add_argument(
         "--drop-time-index",
         action="store_true",
@@ -145,27 +148,7 @@ def prompt_tickers():
 
 
 def resolve_sector_etf(ticker):
-    sector = None
-    etf = None
-    error = None
-    try:
-        info = get_info(ticker)
-        sector_raw = info.get("sector") or info.get("sectorKey")
-        if sector_raw:
-            sector_key = canonicalize_sector_name(sector_raw) or sector_raw.strip()
-            if sector_key in DEFAULT_SECTOR_ETF_MAP:
-                etf = DEFAULT_SECTOR_ETF_MAP[sector_key]
-                sector = sector_key
-            else:
-                error = f"Sector '{sector_raw}' resolved to '{sector_key}' not in DEFAULT_SECTOR_ETF_MAP."
-        else:
-            error = "Sector missing from ticker info."
-    except Exception as exc:
-        error = str(exc)
-
-    if etf is None:
-        return TICKER_SPY, sector, error
-    return etf, sector, None
+    return resolve_sector_etf_for_symbol(ticker)
 
 
 def fetch_history_cached(symbol, start_date, end_date, cache):
@@ -246,12 +229,16 @@ def compute_regime_score(price_vix, price_spy, window, clip, weights):
 
 
 def trading_day_in_quarter(index):
-    positions = pd.Series(np.arange(len(index)), index=index)
-    quarters = index.to_period("Q")
-    first_pos = positions.groupby(quarters).transform("min")
-    last_pos = positions.groupby(quarters).transform("max")
-    day_in_quarter = (positions - first_pos).astype(int)
-    quarter_len = (last_pos - first_pos + 1).astype(int)
+    dates = pd.DatetimeIndex(index)
+    if dates.tz is not None:
+        dates = dates.tz_localize(None)
+    dates = dates.normalize()
+    quarters = dates.to_period("Q")
+    quarter_start = quarters.start_time.to_numpy(dtype="datetime64[D]")
+    quarter_end = (quarters.end_time.normalize() + pd.Timedelta(days=1)).to_numpy(dtype="datetime64[D]")
+    observed_dates = dates.to_numpy(dtype="datetime64[D]")
+    day_in_quarter = pd.Series(np.busday_count(quarter_start, observed_dates), index=index, dtype=int)
+    quarter_len = pd.Series(np.busday_count(quarter_start, quarter_end), index=index, dtype=int)
     return day_in_quarter, quarter_len
 
 
@@ -482,11 +469,21 @@ def compute_recency_weights(index: pd.Index, min_weight: float) -> pd.Series:
 
 def prepare_lgbm_training_data(
     train_df: pd.DataFrame,
+    *,
+    feature_columns: list[str] | None = None,
+    target_column: str = "target",
     training_policy: dict | None = None,
 ):
     policy = resolve_training_policy(training_policy)
-    train_x = train_df.drop(columns=["target"])
-    clipped_target, clip_info = clip_target_series(train_df["target"], policy)
+    if target_column not in train_df.columns:
+        raise KeyError(f"Missing target column: {target_column}.")
+    if feature_columns is None:
+        feature_columns = [column for column in train_df.columns if column != target_column]
+    missing = [column for column in feature_columns if column not in train_df.columns]
+    if missing:
+        raise KeyError(f"Missing feature columns: {', '.join(missing)}.")
+    train_x = train_df.loc[:, feature_columns].copy()
+    clipped_target, clip_info = clip_target_series(train_df[target_column], policy)
     sample_weight = compute_recency_weights(train_df.index, policy["recency_min_weight"])
     metadata = {
         "target_clip": clip_info,
@@ -606,8 +603,8 @@ def compute_start_date(end_date, data_years, train_window, test_window, regime_s
     return start_date
 
 
-def build_model_dataset(ticker, config, history_cache):
-    end_date = pd.Timestamp.today().normalize()
+def build_model_dataset(ticker, config, history_cache, end_date: pd.Timestamp | None = None):
+    end_date = pd.Timestamp.today().normalize() if end_date is None else pd.Timestamp(end_date).normalize()
     start_date = compute_start_date(
         end_date,
         config["data_years"],
@@ -691,60 +688,84 @@ def train_for_ticker(ticker, config, history_cache):
         ticker,
         config,
         history_cache,
+        end_date=config.get("end_date"),
     )
 
-    splits = list(
-        walk_forward_splits(
-            dataset,
-            train_window=config["train_window"],
-            test_window=config["test_window"],
-            embargo=config["window_ret"],
-            step=config["step_window"],
-            min_train_rows=MIN_TRAIN_ROWS,
-        )
+    from common.backtesting import BacktestConfig, CalendarWalkForwardConfig, LogReturnTarget
+    from gbm_return.backtester import GBMAdapterConfig, load_gbm_market_data, run_gbm_backtest
+
+    end_date = pd.Timestamp.today().normalize() if config.get("end_date") is None else pd.Timestamp(config["end_date"]).normalize()
+    start_date = compute_start_date(
+        end_date,
+        config["data_years"],
+        config["train_window"],
+        config["test_window"],
+        config["regime_score"]["score_window"],
+    )
+    market_data, _, _ = load_gbm_market_data(ticker, start_date, end_date + pd.Timedelta(days=1))
+    adapter_config = GBMAdapterConfig(
+        lgbm_params=config["lgbm_params"],
+        training_policy=config.get("training_policy"),
+        drop_time_index=bool(config.get("drop_time_index", True)),
+        feature_set=str(config.get("feature_set", FEATURE_SET_F0)),
+        feature_set_file=config.get("feature_set_file"),
+        regime_score_enabled=bool(config["regime_score"].get("enabled", True)),
+        regime_score_window=int(config["regime_score"]["score_window"]),
+        regime_score_clip=float(config["regime_score"]["score_clip"]),
+        regime_score_weights=config["regime_score"].get("weights"),
+    )
+    result = run_gbm_backtest(
+        market_data,
+        BacktestConfig(
+            target=LogReturnTarget(horizon_bars=config["window_ret"]),
+            walk_forward=CalendarWalkForwardConfig(
+                train_window=config["train_window"],
+                test_window=config["test_window"],
+                step_window=config["step_window"],
+                min_train_rows=MIN_TRAIN_ROWS,
+                pre_test_gap_rows=config["window_ret"],
+            ),
+            target_column="target_log_return",
+            prediction_column="pred_mean_log",
+        ),
+        adapter_config,
     )
     fold_metrics = []
     print(f"\nTraining {ticker} (sector ETF: {sector_etf})")
-    for split in splits:
-        train_df = set_time_index(split.train.copy(), split.train_start)
-        test_df = set_time_index(split.test.copy(), split.train_start)
-        train_x, train_y, sample_weight, train_meta = prepare_lgbm_training_data(
-            train_df,
-            config.get("training_policy"),
-        )
-        test_x = test_df.drop(columns=["target"])
-        test_y = test_df["target"]
-
-        model = train_lgbm(
-            train_x,
-            train_y,
-            config["lgbm_params"],
-            sample_weight=sample_weight,
-        )
-        metrics = evaluate(model, test_x, test_y)
+    for fold in result.folds:
+        scored = result.predictions.loc[result.predictions["fold"] == fold.fold]
+        actual = scored["target_log_return"]
+        predicted = scored["pred_mean_log"]
+        metrics = {
+            "mae": float((predicted - actual).abs().mean()),
+            "mse": float(((predicted - actual) ** 2).mean()),
+            "mae_simple": float((np.exp(predicted) - np.exp(actual)).abs().mean()),
+            "directional": float((np.sign(predicted) == np.sign(actual)).mean()),
+            "corr": float(predicted.corr(actual)) if len(scored) > 1 else None,
+        }
         print(
-            f"Fold {split.fold} | Train: {split.train_start.date()} -> {split.train_end.date()} | "
-            f"Test: {split.test_start.date()} -> {split.test_end.date()} | "
+            f"Fold {fold.fold} | Train: {fold.train_start.date()} -> {fold.train_end.date()} | "
+            f"Test: {fold.test_start.date()} -> {fold.test_end.date()} | "
             f"MAE(log): {metrics['mae']:.6f} | MAE(simple): {metrics['mae_simple']:.4%} | "
             f"MSE: {metrics['mse']:.6f} | Dir: {metrics['directional']:.2%}"
         )
         fold_metrics.append(
             {
-                "fold": split.fold,
-                "train_start": str(split.train_start.date()),
-                "train_end": str(split.train_end.date()),
-                "test_start": str(split.test_start.date()),
-                "test_end": str(split.test_end.date()),
-                "train_rows": int(len(train_df)),
-                "test_rows": int(len(test_df)),
+                "fold": fold.fold,
+                "train_start": str(fold.train_start.date()),
+                "train_end": str(fold.train_end.date()),
+                "test_start": str(fold.test_start.date()),
+                "test_end": str(fold.test_end.date()),
+                "train_rows": fold.train_rows,
+                "test_rows": fold.test_rows,
                 "mae": metrics["mae"],
                 "mse": metrics["mse"],
                 "mae_simple": metrics["mae_simple"],
                 "directional": metrics["directional"],
                 "corr": metrics["corr"],
-                "coverage_95": metrics["coverage_95"],
-                "avg_interval_width": metrics["avg_interval_width"],
-                "train_target_clip": train_meta["target_clip"],
+                "coverage_95": None,
+                "avg_interval_width": None,
+                "train_target_clip": None,
             }
         )
 
@@ -759,10 +780,13 @@ def train_for_ticker(ticker, config, history_cache):
     )
 
     final_train_raw = latest_train_window(dataset, config["train_window"], min_train_rows=MIN_TRAIN_ROWS)
-    final_train_df = set_time_index(final_train_raw.copy(), final_train_raw.index.min())
+    final_train_df = final_train_raw.copy()
+    if not bool(config.get("drop_time_index", True)):
+        final_train_df = set_time_index(final_train_df, final_train_raw.index.min())
     final_train_x, final_train_y, final_sample_weight, final_train_meta = prepare_lgbm_training_data(
         final_train_df,
-        config.get("training_policy"),
+        target_column="target",
+        training_policy=config.get("training_policy"),
     )
     final_model = train_lgbm(
         final_train_x,
@@ -811,6 +835,8 @@ def main():
     if args.include_time_index:
         args.drop_time_index = False
     parse_window(args.train_window)
+    parse_window(args.test_window)
+    parse_window(args.step_window)
     lgbm_params = resolve_lgbm_params(
         preset_name=args.lgbm_param_preset,
         params_json=args.lgbm_params_json,
@@ -818,12 +844,13 @@ def main():
 
     tickers = prompt_tickers()
     config = {
-        "data_years": DATA_YEARS,
+        "data_years": args.data_years,
         "window_ret": WINDOW_RET,
         "train_window": args.train_window,
-        "test_window": DEFAULT_TEST_WINDOW,
-        "step_window": DEFAULT_STEP_WINDOW,
-        "artifact_dir": str(ARTIFACT_DIR_DEFAULT),
+        "test_window": args.test_window,
+        "step_window": args.step_window,
+        "artifact_dir": args.artifact_dir,
+        "end_date": args.end,
         "drop_time_index": args.drop_time_index,
         "feature_set": args.feature_set,
         "feature_set_file": args.feature_set_file,

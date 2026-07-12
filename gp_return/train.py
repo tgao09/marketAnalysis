@@ -15,14 +15,11 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from common import (
-    DEFAULT_SECTOR_ETF_MAP,
     PCATransformer,
-    canonicalize_sector_name,
     get_history,
-    get_info,
     parse_window,
+    resolve_sector_etf_for_symbol,
     save_pca_json,
-    walk_forward_splits,
 )
 
 
@@ -68,6 +65,12 @@ def parse_args():
         default=DEFAULT_TRAIN_WINDOW,
         help="Rolling train window like '2y', '18m', or '260d'.",
     )
+    parser.add_argument("--test-window", default=DEFAULT_TEST_WINDOW)
+    parser.add_argument("--step-window", default=DEFAULT_STEP_WINDOW)
+    parser.add_argument("--data-years", type=int, default=DATA_YEARS)
+    parser.add_argument("--end", default=None, help="Inclusive historical end date (YYYY-MM-DD).")
+    parser.add_argument("--artifact-dir", default=str(ARTIFACT_DIR_DEFAULT))
+    parser.add_argument("--train-iters", type=int, default=DEFAULT_TRAIN_ITERS)
     parser.add_argument(
         "--pca",
         action="store_true",
@@ -103,27 +106,7 @@ def prompt_tickers():
 
 
 def resolve_sector_etf(ticker):
-    sector = None
-    etf = None
-    error = None
-    try:
-        info = get_info(ticker)
-        sector_raw = info.get("sector") or info.get("sectorKey")
-        if sector_raw:
-            sector_key = canonicalize_sector_name(sector_raw) or sector_raw.strip()
-            if sector_key in DEFAULT_SECTOR_ETF_MAP:
-                etf = DEFAULT_SECTOR_ETF_MAP[sector_key]
-                sector = sector_key
-            else:
-                error = f"Sector '{sector_raw}' resolved to '{sector_key}' not in DEFAULT_SECTOR_ETF_MAP."
-        else:
-            error = "Sector missing from ticker info."
-    except Exception as exc:
-        error = str(exc)
-
-    if etf is None:
-        return TICKER_SPY, sector, error
-    return etf, sector, None
+    return resolve_sector_etf_for_symbol(ticker)
 
 
 def fetch_history_cached(symbol, start_date, end_date, cache):
@@ -204,13 +187,18 @@ def compute_regime_score(price_vix, price_spy, window, clip, weights):
 
 
 def trading_day_in_quarter(index):
-    positions = pd.Series(np.arange(len(index)), index=index)
-    quarters = index.to_period("Q")
-    first_pos = positions.groupby(quarters).transform("min")
-    last_pos = positions.groupby(quarters).transform("max")
-    day_in_quarter = (positions - first_pos).astype(int)
-    quarter_len = (last_pos - first_pos + 1).astype(int)
-    return day_in_quarter, quarter_len
+    dates = pd.DatetimeIndex(index)
+    if dates.tz is not None:
+        dates = dates.tz_localize(None)
+    dates = dates.normalize()
+    quarters = dates.to_period("Q")
+    quarter_start = quarters.start_time.to_numpy(dtype="datetime64[D]")
+    quarter_end = (quarters.end_time.normalize() + pd.Timedelta(days=1)).to_numpy(dtype="datetime64[D]")
+    observed_dates = dates.to_numpy(dtype="datetime64[D]")
+    return (
+        pd.Series(np.busday_count(quarter_start, observed_dates), index=index, dtype=int),
+        pd.Series(np.busday_count(quarter_start, quarter_end), index=index, dtype=int),
+    )
 
 
 def build_features(
@@ -683,7 +671,11 @@ def compute_start_date(end_date, data_years, train_window, test_window, regime_s
 
 
 def train_for_ticker(ticker, config, history_cache, device):
-    end_date = pd.Timestamp.today().normalize()
+    end_date = (
+        pd.Timestamp.today().normalize()
+        if config.get("end_date") is None
+        else pd.Timestamp(config["end_date"]).normalize()
+    )
     start_date = compute_start_date(
         end_date,
         config["data_years"],
@@ -759,109 +751,89 @@ def train_for_ticker(ticker, config, history_cache, device):
     pca_enabled = bool(config.get("pca", {}).get("enabled", False))
     artifact_variant = resolve_artifact_variant(pca_enabled)
 
-    splits = list(
-        walk_forward_splits(
-            dataset,
-            train_window=config["train_window"],
-            test_window=config["test_window"],
-            embargo=config["window_ret"],
-            step=config["step_window"],
-            min_train_rows=60,
-        )
+    from common.backtesting import BacktestConfig, CalendarWalkForwardConfig, LogReturnTarget
+    from gp_return.backtester import GPAdapterConfig, load_gp_market_data, run_gp_backtest
+
+    market_data, _, _ = load_gp_market_data(
+        ticker,
+        start_date,
+        end_date + pd.Timedelta(days=1),
     )
-    fold_metrics = []
-    ard_bottom_sets = []
-    importance_feature_cols_ref = None
-    importance_feature_cols_unstable = False
-
-    print(f"\nTraining {ticker} (sector ETF: {sector_etf}, variant: {artifact_variant})")
-    for split in splits:
-        train_df = split.train.copy()
-        test_df = split.test.copy()
-
-        if pca_enabled:
-            fold_pca = build_pca_transformer()
-            train_x_df, test_x_df = fold_pca.transform_train_test(
-                train_df,
-                test_df,
-                list(train_df.drop(columns=["target"]).columns),
-            )
-            model_feature_cols = train_x_df.columns.tolist()
-            fold_pca_k = int(fold_pca.k_selected_ or 0)
-        else:
-            train_x_df, test_x_df, _ = normalize_features(train_df, test_df)
-            model_feature_cols = train_x_df.columns.tolist()
-            fold_pca_k = None
-
-        if split.fold == 1:
-            importance_feature_cols_ref = list(model_feature_cols)
-        elif model_feature_cols != importance_feature_cols_ref:
-            importance_feature_cols_unstable = True
-
-        train_x = torch.tensor(train_x_df.values, dtype=torch.float32, device=device)
-        train_y = torch.tensor(train_df["target"].values, dtype=torch.float32, device=device)
-        test_x = torch.tensor(test_x_df.values, dtype=torch.float32, device=device)
-        test_y = torch.tensor(test_df["target"].values, dtype=torch.float32, device=device)
-
-        print(
-            f"\nFold {split.fold} | Train: {split.train_start.date()} -> {split.train_end.date()} | "
-            f"Test: {split.test_start.date()} -> {split.test_end.date()}"
-        )
-
-        model, likelihood = train_gp(
-            train_x,
-            train_y,
-            train_iters=config["train_iters"],
+    result = run_gp_backtest(
+        market_data,
+        BacktestConfig(
+            target=LogReturnTarget(horizon_bars=config["window_ret"]),
+            walk_forward=CalendarWalkForwardConfig(
+                train_window=config["train_window"],
+                test_window=config["test_window"],
+                step_window=config["step_window"],
+                min_train_rows=60,
+                pre_test_gap_rows=config["window_ret"],
+            ),
+            target_column="target_log_return",
+            prediction_column="pred_mean_log",
+        ),
+        GPAdapterConfig(
             device=device,
+            train_iters=config["train_iters"],
             learning_rate=config["learning_rate"],
             weight_decay=config["weight_decay"],
             matern_nu=config["kernel"]["matern_nu"],
             use_rq=config["kernel"]["use_rq"],
             use_linear=config["kernel"]["use_linear"],
-        )
+            pca_enabled=pca_enabled,
+            regime_config=regime_config,
+        ),
+    )
+    fold_metrics = []
 
-        metrics = evaluate(model, likelihood, test_x, test_y)
+    print(f"\nTraining {ticker} (sector ETF: {sector_etf}, variant: {artifact_variant})")
+    for fold in result.folds:
+        scored = result.predictions.loc[result.predictions["fold"] == fold.fold]
+        actual = scored["target_log_return"]
+        predicted = scored["pred_mean_log"]
+        std = scored["pred_std_log"]
+        lower = predicted - (1.96 * std)
+        upper = predicted + (1.96 * std)
+        metrics = {
+            "mae": float((predicted - actual).abs().mean()),
+            "mse": float(((predicted - actual) ** 2).mean()),
+            "mae_simple": float((np.exp(predicted) - np.exp(actual)).abs().mean()),
+            "directional": float((np.sign(predicted) == np.sign(actual)).mean()),
+            "coverage_95": float(((actual >= lower) & (actual <= upper)).mean()),
+            "avg_interval_width": float((upper - lower).mean()),
+        }
         print(
+            f"Fold {fold.fold} | Train: {fold.train_start.date()} -> {fold.train_end.date()} | "
+            f"Test: {fold.test_start.date()} -> {fold.test_end.date()} | "
             f"MAE(log): {metrics['mae']:.6f} | MAE(simple): {metrics['mae_simple']:.4%} | "
             f"MSE: {metrics['mse']:.6f} | "
             f"Dir: {metrics['directional']:.2%} | Coverage95: {metrics['coverage_95']:.2%}"
         )
-        ard_results = collect_ard_importance(model, model_feature_cols)
-        print_ard_importance(ard_results, model_feature_cols)
-        ard_bottom_sets.extend(bottom_feature_sets(ard_results, model_feature_cols, bottom_n=10))
-
         fold_metrics.append(
             {
-                "fold": split.fold,
-                "train_start": str(split.train_start.date()),
-                "train_end": str(split.train_end.date()),
-                "test_start": str(split.test_start.date()),
-                "test_end": str(split.test_end.date()),
-                "train_rows": int(len(train_df)),
-                "test_rows": int(len(test_df)),
+                "fold": fold.fold,
+                "train_start": str(fold.train_start.date()),
+                "train_end": str(fold.train_end.date()),
+                "test_start": str(fold.test_start.date()),
+                "test_end": str(fold.test_end.date()),
+                "train_rows": fold.train_rows,
+                "test_rows": fold.test_rows,
                 "mae": metrics["mae"],
                 "mse": metrics["mse"],
                 "mae_simple": metrics["mae_simple"],
                 "directional": metrics["directional"],
                 "coverage_95": metrics["coverage_95"],
                 "avg_interval_width": metrics["avg_interval_width"],
-                "pca_k": fold_pca_k,
+                "pca_k": None,
             }
         )
 
     summary_metrics = summarize_fold_metrics(fold_metrics)
-    if ard_bottom_sets and not importance_feature_cols_unstable:
-        shared_bottom = set.intersection(*ard_bottom_sets)
-        summary_metrics["low_importance_features"] = [
-            col for col in (importance_feature_cols_ref or []) if col in shared_bottom
-        ]
-    elif ard_bottom_sets and importance_feature_cols_unstable:
-        summary_metrics["low_importance_features"] = []
-        summary_metrics["low_importance_note"] = (
-            "Skipped shared-bottom ARD summary because PCA fold component counts varied."
-        )
-    else:
-        summary_metrics["low_importance_features"] = []
+    summary_metrics["low_importance_features"] = []
+    summary_metrics["low_importance_note"] = (
+        "Fold-model ARD ranks are not retained by universal backtest results."
+    )
     print(
         f"\nSummary | {ticker} | Folds: {summary_metrics['folds']} | "
         f"MAE(log) mean: {summary_metrics['mae_mean']:.6f} | "
@@ -915,6 +887,7 @@ def train_for_ticker(ticker, config, history_cache, device):
             "sector": sector_name,
             "sector_etf": sector_etf,
             "artifact_variant": artifact_variant,
+            "backtest_metadata": dict(result.metadata),
             "kernel": dict(config["kernel"]),
             "noise_model": "gaussian",
             "final_train_window": {
@@ -951,20 +924,25 @@ def main():
     args = parse_args()
     # Validate early so invalid window strings fail before any data fetch/training.
     parse_window(args.train_window)
+    parse_window(args.test_window)
+    parse_window(args.step_window)
+    if args.data_years <= 0:
+        raise ValueError("--data-years must be positive.")
     tickers = prompt_tickers()
     device = resolve_device()
     print(f"Using device: {device.type}")
 
     config = {
-        "data_years": DATA_YEARS,
+        "data_years": args.data_years,
         "window_ret": WINDOW_RET,
         "train_window": args.train_window,
-        "test_window": DEFAULT_TEST_WINDOW,
-        "step_window": DEFAULT_STEP_WINDOW,
-        "train_iters": DEFAULT_TRAIN_ITERS,
+        "test_window": args.test_window,
+        "step_window": args.step_window,
+        "train_iters": args.train_iters,
         "learning_rate": DEFAULT_LEARNING_RATE,
         "weight_decay": DEFAULT_WEIGHT_DECAY,
-        "artifact_dir": str(ARTIFACT_DIR_DEFAULT),
+        "artifact_dir": args.artifact_dir,
+        "end_date": args.end,
         "pca": {
             "enabled": args.pca,
             "threshold": PCA_VAR_THRESHOLD,

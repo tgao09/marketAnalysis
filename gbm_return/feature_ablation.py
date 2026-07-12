@@ -179,7 +179,8 @@ def run_candidate(candidate_feature_cols, selected_splits, lgbm_params):
         test_df = set_time_index(split.test.copy(), split.train_start)
         train_x, train_y, sample_weight, _ = prepare_lgbm_training_data(
             train_df,
-            candidate_feature_cols,
+            feature_columns=candidate_feature_cols,
+            target_column="target",
         )
         test_x = test_df[candidate_feature_cols]
         test_y = test_df["target"]

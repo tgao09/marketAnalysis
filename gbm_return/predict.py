@@ -1,3 +1,4 @@
+import argparse
 import json
 import math
 import pickle
@@ -18,19 +19,20 @@ from gbm_return.train import (
     REGIME_SCORE_CLIP,
     REGIME_SCORE_WEIGHTS,
     REGIME_SCORE_WINDOW,
-    TICKER_GOLD,
-    TICKER_SPY,
-    TICKER_VIX,
     build_features,
-    build_target,
     compute_start_date,
-    extract_field,
-    fetch_history_cached,
     resolve_direction_mode,
-    resolve_sector_etf,
     resolve_artifact_variant,
     set_time_index,
 )
+from gbm_return.backtester import load_gbm_market_data
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Predict GBM return model.")
+    parser.add_argument("--artifact-dir", default=str(ARTIFACT_DIR_DEFAULT))
+    parser.add_argument("--end", default=None, help="Inclusive historical end date (YYYY-MM-DD).")
+    return parser.parse_args()
 
 
 def prompt_tickers():
@@ -69,9 +71,13 @@ def resolve_regime_config(config):
     }
 
 
-def rebuild_features(config):
+def rebuild_features(config, end_date: pd.Timestamp | None = None):
     regime_config = resolve_regime_config(config)
-    end_date = pd.Timestamp.today().normalize()
+    end_date = (
+        pd.Timestamp.today().normalize()
+        if end_date is None and not config.get("end_date")
+        else pd.Timestamp(end_date or config["end_date"]).normalize()
+    )
     start_date = compute_start_date(
         end_date,
         config["data_years"],
@@ -80,28 +86,19 @@ def rebuild_features(config):
         regime_config["score_window"],
     )
 
-    ticker = config["ticker"]
-    sector_etf = config.get("sector_etf") or resolve_sector_etf(ticker)[0]
-
-    history_cache = {}
-    stock_history = fetch_history_cached(ticker, start_date, end_date, history_cache)
-    sector_history = fetch_history_cached(sector_etf, start_date, end_date, history_cache)
-    gld_history = fetch_history_cached(TICKER_GOLD, start_date, end_date, history_cache)
-    spy_history = fetch_history_cached(TICKER_SPY, start_date, end_date, history_cache)
-    vix_history = fetch_history_cached(TICKER_VIX, start_date, end_date, history_cache)
-
-    price_stock = extract_field(stock_history, "Close", ticker)
-    price_sector = extract_field(sector_history, "Close", sector_etf)
-    price_gld = extract_field(gld_history, "Close", TICKER_GOLD)
-    price_spy = extract_field(spy_history, "Close", TICKER_SPY)
-    price_vix = extract_field(vix_history, "Close", TICKER_VIX)
+    market_data, _, _ = load_gbm_market_data(
+        config["ticker"],
+        start_date,
+        end_date + pd.Timedelta(days=1),
+    )
+    panel = market_data.bars
 
     features = build_features(
-        price_stock,
-        price_sector,
-        price_gld,
-        price_spy,
-        price_vix,
+        panel["close"],
+        panel["sector_close"],
+        panel["gld_close"],
+        panel["spy_close"],
+        panel["vix_close"],
         drop_time_index=bool(config.get("drop_time_index", True)),
         feature_set=str(config.get("feature_set", "f0")),
         feature_set_file=config.get("feature_set_file"),
@@ -111,12 +108,10 @@ def rebuild_features(config):
         regime_score_weights=regime_config.get("weights"),
     )
     if not bool(config.get("drop_time_index", True)):
-        target = build_target(price_stock)
-        dataset = features.join([target]).dropna()
         final_start_raw = (config.get("final_train_window") or {}).get("start")
         final_start = pd.Timestamp(final_start_raw) if final_start_raw else pd.NaT
         if pd.isna(final_start):
-            final_start = dataset.index.min()
+            final_start = features.index.min()
         features = set_time_index(features, final_start)
     return features
 
@@ -127,9 +122,9 @@ def get_latest_feature_row(features, feature_cols):
     return latest.name, latest[feature_cols]
 
 
-def predict_next_window(artifact_dir: Path):
+def predict_next_window(artifact_dir: Path, end_date: pd.Timestamp | None = None):
     model_str, config, model_feature_cols = load_artifacts(artifact_dir)
-    features = rebuild_features(config)
+    features = rebuild_features(config, end_date=end_date)
     asof_date, latest_features = get_latest_feature_row(features, model_feature_cols)
 
     booster = lgb.Booster(model_str=model_str)
@@ -153,6 +148,7 @@ def predict_next_window(artifact_dir: Path):
 
 
 def main():
+    args = parse_args()
     tickers = prompt_tickers()
     if not tickers:
         print("No ticker provided. Exiting.")
@@ -161,8 +157,9 @@ def main():
     for idx, ticker in enumerate(tickers):
         if idx:
             print("")
-        artifact_dir = ARTIFACT_DIR_DEFAULT / ticker / resolve_artifact_variant()
-        result = predict_next_window(artifact_dir)
+        artifact_dir = Path(args.artifact_dir) / ticker / resolve_artifact_variant()
+        end_date = pd.Timestamp(args.end).normalize() if args.end else None
+        result = predict_next_window(artifact_dir, end_date=end_date)
 
         asof = result["asof_date"]
         print(f"{ticker} 5-day forward log-return forecast")

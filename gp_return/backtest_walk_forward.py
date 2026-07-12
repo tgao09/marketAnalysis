@@ -9,6 +9,9 @@ import numpy as np
 import pandas as pd
 import torch
 
+from common.backtesting import BacktestConfig, CalendarWalkForwardConfig, LogReturnTarget
+from gp_return.backtester import GPAdapterConfig, load_gp_market_data, run_gp_backtest
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
@@ -56,6 +59,12 @@ def parse_args():
     )
     parser.add_argument("--train-iters", type=int, default=DEFAULT_TRAIN_ITERS)
     parser.add_argument("--train-window", default=DEFAULT_TRAIN_WINDOW)
+    parser.add_argument(
+        "--min-abs-pred-mean-log",
+        type=float,
+        default=MIN_ABS_PRED_MEAN_LOG,
+        help="Minimum absolute predicted log return required to trade; use 0 for every OOS day.",
+    )
     parser.add_argument(
         "--pca",
         action="store_true",
@@ -168,6 +177,8 @@ def main():
     if not ticker:
         print("No ticker provided. Exiting.")
         return
+    if args.min_abs_pred_mean_log < 0:
+        raise ValueError("min_abs_pred_mean_log must be non-negative.")
 
     end_date = pd.Timestamp(args.end).normalize() if args.end else pd.Timestamp.today().normalize()
     test_start = end_date - pd.DateOffset(years=DEFAULT_TEST_YEARS)
@@ -175,90 +186,62 @@ def main():
     dataset_start = compute_dataset_start(end_date, args.train_window)
 
     print(f"Building dataset for {ticker}...")
-    data = build_dataset(ticker, dataset_start, end_date)
-    dataset = data["dataset"]
-    close_stock = data["close"]
-
-    feature_cols = list(data["feature_columns"])
-
-    index_series = pd.Series(dataset.index, index=dataset.index)
-    exit_date = index_series.shift(-WINDOW_RET)
-    exit_close = close_stock.shift(-WINDOW_RET)
-
-    candidates = pd.DataFrame(
-        {
-            "entry_close": close_stock,
-            "exit_date": exit_date,
-            "exit_close": exit_close,
-        }
+    market_data, _, _ = load_gp_market_data(ticker, dataset_start, end_date + pd.Timedelta(days=1))
+    if market_data.bars.index.tz is not None:
+        test_start = test_start.tz_localize(market_data.bars.index.tz)
+    result = run_gp_backtest(
+        market_data,
+        BacktestConfig(
+            target=LogReturnTarget(horizon_bars=WINDOW_RET),
+            walk_forward=CalendarWalkForwardConfig(
+                train_window=args.train_window,
+                test_window="1d",
+                test_rows=1,
+                step_window="1d",
+                min_train_rows=MIN_TRAIN_ROWS,
+                pre_test_gap_rows=WINDOW_RET,
+            ),
+            target_column="target_log_return",
+            prediction_column="pred_mean_log",
+        ),
+        GPAdapterConfig(
+            device=device,
+            train_iters=args.train_iters,
+            pca_enabled=bool(args.pca),
+            regime_config={
+                "enabled": True,
+                "score_window": REGIME_SCORE_WINDOW,
+                "score_clip": REGIME_SCORE_CLIP,
+                "weights": REGIME_SCORE_WEIGHTS,
+            },
+        ),
     )
-    candidates = candidates.loc[test_start:end_date]
-    candidates = candidates.dropna(subset=["entry_close", "exit_date", "exit_close"])
-
-    test_dates = candidates.index
-    dataset_index = dataset.index
+    scored = result.predictions.loc[result.predictions.index >= test_start]
     trades = []
     filtered_out_signals = 0
-    for test_date in test_dates:
-        test_pos = int(dataset_index.searchsorted(test_date, side="left"))
-        train_end_pos = test_pos - WINDOW_RET - 1
-        if train_end_pos < 0:
-            continue
-        train_end = dataset_index[train_end_pos]
-        train_start = test_date - train_offset - pd.offsets.BDay(WINDOW_RET)
-        train_df = dataset.loc[(dataset.index > train_start) & (dataset.index <= train_end)]
-        if len(train_df) < MIN_TRAIN_ROWS:
-            continue
-        
-        test_df = dataset.loc[[test_date]]
-        
-        train_df = train_df.copy()
-        test_df = test_df.copy()
-        fold_pca_k = None
-        if args.pca:
-            fold_pca = build_pca_transformer()
-            train_x_df, test_x_df = fold_pca.transform_train_test(train_df, test_df, feature_cols)
-            fold_pca_k = int(fold_pca.k_selected_)
-        else:
-            train_x_df, test_x_df, _ = normalize_features(train_df, test_df, feature_cols)
-
-        train_x = torch.tensor(train_x_df.values, dtype=torch.float32, device=device)
-        train_y = torch.tensor(train_df["target"].values, dtype=torch.float32, device=device)
-
-        model, likelihood = train_gp(
-            train_x,
-            train_y,
-            args.train_iters,
-            device=device,
-        )
-
-        model.eval()
-        likelihood.eval()
-        with torch.no_grad():
-            test_x = torch.tensor(test_x_df.values, dtype=torch.float32, device=device)
-            preds = likelihood(model(test_x))
-            mean_log = float(preds.mean.item())
-            std_log = float(preds.variance.sqrt().item())
+    for test_date, row in scored.iterrows():
+        mean_log = float(row["pred_mean_log"])
+        std_log = float(row["pred_std_log"])
         abs_mean_log = abs(mean_log)
         mean_simple = math.exp(mean_log) - 1.0
-        if abs_mean_log < MIN_ABS_PRED_MEAN_LOG:
+        if abs_mean_log < args.min_abs_pred_mean_log:
             filtered_out_signals += 1
             print(
-                f"{test_date.date()} | Train: {train_df.index.min().date()} -> {train_df.index.max().date()} | "
-                f"Pred: {mean_simple:+.2%} | Skipped by threshold "
-                f"({abs_mean_log:.6f} < {MIN_ABS_PRED_MEAN_LOG:.6f})"
+                f"{test_date.date()} | Pred: {mean_simple:+.2%} | Skipped by threshold "
+                f"({abs_mean_log:.6f} < {args.min_abs_pred_mean_log:.6f})"
             )
             continue
 
         direction = "long" if mean_log > 0.0 else "short"
-        entry_close = float(candidates.at[test_date, "entry_close"])
-        exit_dt = candidates.at[test_date, "exit_date"]
-        exit_close = float(candidates.at[test_date, "exit_close"])
+        entry_close = float(row["close"])
+        exit_dt = row["target_end"]
+        actual_log = float(row["target_log_return"])
+        exit_close = entry_close * math.exp(actual_log)
         shares = args.notional / entry_close
         pnl_per_share = (exit_close - entry_close) if direction == "long" else (entry_close - exit_close)
         pnl = shares * pnl_per_share
         return_pct = pnl / args.notional
-        actual_simple = (exit_close / entry_close) - 1.0
+        actual_simple = math.exp(actual_log) - 1.0
 
         trades.append(
             {
@@ -279,12 +262,12 @@ def main():
                 "pnl": pnl,
                 "return_pct": return_pct,
                 "pca_enabled": bool(args.pca),
-                "pca_k": fold_pca_k,
+                "pca_k": None,
             }
         )
 
         print(
-            f"{test_date.date()} | Train: {train_df.index.min().date()} -> {train_df.index.max().date()} | "
+            f"{test_date.date()} | "
             f"Pred: {mean_simple:+.2%} | PnL: {pnl:+.2f}"
         )
 
@@ -305,9 +288,9 @@ def main():
             "avg_return_pct": (
                 float(trades_df["return_pct"].mean()) if not trades_df.empty else None
             ),
-            "candidate_trades": int(len(test_dates)),
+            "candidate_trades": int(len(scored)),
             "signals_filtered_by_threshold": int(filtered_out_signals),
-            "min_abs_pred_mean_log": float(MIN_ABS_PRED_MEAN_LOG),
+            "min_abs_pred_mean_log": float(args.min_abs_pred_mean_log),
             "pca_enabled": bool(args.pca),
             "artifact_variant": resolve_artifact_variant(args.pca),
         }

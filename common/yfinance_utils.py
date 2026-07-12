@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Dict
 
 import pandas as pd
@@ -20,6 +21,14 @@ DEFAULT_SECTOR_ETF_MAP: Dict[str, str] = {
     "Real Estate": "XLRE",
     "Technology": "XLK",
     "Utilities": "XLU",
+}
+
+DEFAULT_TICKER_SECTOR_MAP: Dict[str, str] = {
+    "AAPL": "Technology", "AMT": "Real Estate", "AMZN": "Consumer Discretionary",
+    "BRK-B": "Financials", "CAT": "Industrials", "GOOGL": "Communication Services",
+    "JNJ": "Health Care", "JPM": "Financials", "META": "Communication Services",
+    "MSFT": "Technology", "NEE": "Utilities", "NVDA": "Technology",
+    "TSLA": "Consumer Discretionary", "WMT": "Consumer Staples", "XOM": "Energy",
 }
 
 _SECTOR_ALIASES: Dict[str, str] = {
@@ -50,6 +59,18 @@ _SECTOR_ALIASES_NORMALIZED: Dict[str, str] = {
     re.sub(r"[^a-z0-9]+", " ", alias.lower()).strip(): sector
     for alias, sector in _SECTOR_ALIASES.items()
 }
+
+
+def configure_yfinance_cache() -> Path:
+    """Keep yfinance cache in writable repository directory."""
+
+    cache_dir = Path(__file__).resolve().parents[1] / ".yfinance_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    yf.set_tz_cache_location(str(cache_dir))
+    return cache_dir
+
+
+configure_yfinance_cache()
 
 
 def _normalize_sector_key(value: str) -> str:
@@ -102,6 +123,26 @@ def get_history(
 def get_info(symbol: str) -> Dict[str, Any]:
     ticker = get_ticker(symbol)
     return ticker.info
+
+
+def resolve_sector_etf_for_symbol(symbol: str) -> tuple[str, str | None, str | None]:
+    """Resolve sector proxy, preferring deterministic mappings before Yahoo info."""
+
+    ticker = _validate_symbol(symbol)
+    sector = DEFAULT_TICKER_SECTOR_MAP.get(ticker)
+    if sector:
+        return DEFAULT_SECTOR_ETF_MAP[sector], sector, None
+    try:
+        info = get_info(ticker)
+        sector_raw = info.get("sector") or info.get("sectorKey")
+        sector = canonicalize_sector_name(sector_raw) if sector_raw else None
+        if sector:
+            return DEFAULT_SECTOR_ETF_MAP[sector], sector, None
+        if sector_raw:
+            return "SPY", None, f"Sector '{sector_raw}' has no ETF mapping; using SPY."
+        return "SPY", None, "Sector missing from ticker info; using SPY."
+    except Exception as exc:
+        return "SPY", None, f"Sector lookup failed ({exc}); using SPY."
 
 
 def get_sector_etf_metrics(

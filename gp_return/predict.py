@@ -20,19 +20,13 @@ from gp_return.train import (
     REGIME_SCORE_WINDOW,
     REGIME_SCORE_CLIP,
     REGIME_SCORE_WEIGHTS,
-    TICKER_GOLD,
-    TICKER_SPY,
-    TICKER_VIX,
     ReturnGPModel,
     build_features,
-    build_target,
     compute_start_date,
-    extract_field,
-    fetch_history_cached,
     resolve_artifact_variant,
-    resolve_sector_etf,
     resolve_device,
 )
+from gp_return.backtester import load_gp_market_data
 
 
 def parse_args():
@@ -42,6 +36,8 @@ def parse_args():
         action="store_true",
         help="Use PCA artifact variant (ticker/pca). Default uses regular variant (ticker/regular).",
     )
+    parser.add_argument("--artifact-dir", default=str(ARTIFACT_DIR_DEFAULT))
+    parser.add_argument("--end", default=None, help="Inclusive historical end date (YYYY-MM-DD).")
     return parser.parse_args()
 
 
@@ -109,9 +105,14 @@ def scale_with_saved_scaler(frame, feature_cols, scaler):
 def rebuild_latest_features(
     config,
     history_cache,
+    end_date: pd.Timestamp | None = None,
 ):
     regime_config = resolve_regime_config(config)
-    end_date = pd.Timestamp.today().normalize()
+    end_date = (
+        pd.Timestamp.today().normalize()
+        if end_date is None and not config.get("end_date")
+        else pd.Timestamp(end_date or config["end_date"]).normalize()
+    )
     start_date = compute_start_date(
         end_date,
         config["data_years"],
@@ -120,29 +121,16 @@ def rebuild_latest_features(
         regime_config["score_window"],
     )
 
-    ticker = config["ticker"]
-    sector_etf = config.get("sector_etf") or resolve_sector_etf(ticker)[0]
-
-    stock_history = fetch_history_cached(ticker, start_date, end_date, history_cache)
-    sector_history = fetch_history_cached(sector_etf, start_date, end_date, history_cache)
-    gld_history = fetch_history_cached(TICKER_GOLD, start_date, end_date, history_cache)
-    spy_history = fetch_history_cached(TICKER_SPY, start_date, end_date, history_cache)
-    vix_history = fetch_history_cached(TICKER_VIX, start_date, end_date, history_cache)
-
-    price_stock = extract_field(stock_history, "Close", ticker)
-    volume_stock = extract_field(stock_history, "Volume", ticker)
-    price_sector = extract_field(sector_history, "Close", sector_etf)
-    price_gld = extract_field(gld_history, "Close", TICKER_GOLD)
-    price_spy = extract_field(spy_history, "Close", TICKER_SPY)
-    price_vix = extract_field(vix_history, "Close", TICKER_VIX)
+    market_data, _, _ = load_gp_market_data(config["ticker"], start_date, end_date + pd.Timedelta(days=1))
+    panel = market_data.bars
 
     features = build_features(
-        price_stock,
-        volume_stock,
-        price_sector,
-        price_gld,
-        price_spy,
-        price_vix,
+        panel["close"],
+        panel["volume"],
+        panel["sector_close"],
+        panel["gld_close"],
+        panel["spy_close"],
+        panel["vix_close"],
         regime_config,
     )
     return features
@@ -154,7 +142,12 @@ def get_latest_feature_row(features, feature_cols):
     return latest.name, latest[feature_cols]
 
 
-def predict_next_window(artifact_dir: Path, device: torch.device, pca_enabled: bool):
+def predict_next_window(
+    artifact_dir: Path,
+    device: torch.device,
+    pca_enabled: bool,
+    end_date: pd.Timestamp | None = None,
+):
     (
         model_blob,
         scaler,
@@ -172,6 +165,7 @@ def predict_next_window(artifact_dir: Path, device: torch.device, pca_enabled: b
     features = rebuild_latest_features(
         config,
         history_cache,
+        end_date=end_date,
     )
     if pca_enabled:
         feature_cols = list(getattr(pca_transformer, "feature_columns_", None) or features.columns)
@@ -231,8 +225,9 @@ def main():
     for idx, ticker in enumerate(tickers):
         if idx:
             print("")
-        artifact_dir = ARTIFACT_DIR_DEFAULT / ticker / artifact_variant
-        result = predict_next_window(artifact_dir, device, args.pca)
+        artifact_dir = Path(args.artifact_dir) / ticker / artifact_variant
+        end_date = pd.Timestamp(args.end).normalize() if args.end else None
+        result = predict_next_window(artifact_dir, device, args.pca, end_date=end_date)
 
         asof = result["asof_date"]
 
